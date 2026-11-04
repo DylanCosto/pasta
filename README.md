@@ -1,7 +1,7 @@
 # pasta
 
 Rust-native SAM/BAM/CRAM/VCF/BCF library, with ntools and vtools: samtools- and
-bcftools-compatible command-line tools.
+bcftools-compatible command-line tools, inspired by [noodles](https://github.com/zaeleus/noodles).
 
 - [`pasta`](pasta): the library. SAM, BAM, and CRAM; VCF and BCF (`pasta::variant`); BGZF; BAI,
   CSI, CRAI, and TBI indexes; FASTA; and an HTSlib-compatible pileup engine. It began as a fork
