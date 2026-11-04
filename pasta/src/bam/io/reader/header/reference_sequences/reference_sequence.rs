@@ -1,0 +1,136 @@
+use std::{
+    io::{self, Read},
+    num::NonZero,
+};
+
+use crate::sam::header::record::value::{Map, map::ReferenceSequence};
+use bstr::BString;
+
+use crate::bam::io::reader::{bytes_with_nul_to_bstring, num::read_u32_le};
+
+pub(super) fn read_reference_sequence<R>(
+    reader: &mut R,
+) -> io::Result<(BString, Map<ReferenceSequence>)>
+where
+    R: Read,
+{
+    let name = read_name(reader)?;
+
+    let len = read_length(reader)?;
+    let reference_sequence = Map::<ReferenceSequence>::new(len);
+
+    Ok((name, reference_sequence))
+}
+
+fn read_name<R>(reader: &mut R) -> io::Result<BString>
+where
+    R: Read,
+{
+    let len = read_u32_le_as_nonzero_usize(reader)?;
+
+    let mut c_name = vec![0; len.get()];
+    reader.read_exact(&mut c_name)?;
+
+    bytes_with_nul_to_bstring(&c_name)
+}
+
+fn read_length<R>(reader: &mut R) -> io::Result<NonZero<usize>>
+where
+    R: Read,
+{
+    read_u32_le_as_nonzero_usize(reader)
+}
+
+fn read_u32_le_as_nonzero_usize<R>(reader: &mut R) -> io::Result<NonZero<usize>>
+where
+    R: Read,
+{
+    read_u32_le(reader).and_then(|n| {
+        usize::try_from(n)
+            .and_then(NonZero::try_from)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_reference_sequence() -> io::Result<()> {
+        let src = [
+            0x04, 0x00, 0x00, 0x00, // l_name = 4
+            0x73, 0x71, 0x30, 0x00, // name = "sq0\x00"
+            0x08, 0x00, 0x00, 0x00, // l_ref = 8
+        ];
+
+        let actual = read_reference_sequence(&mut &src[..])?;
+        let expected = (
+            BString::from("sq0"),
+            Map::<ReferenceSequence>::new(const { NonZero::new(8).unwrap() }),
+        );
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_name() -> io::Result<()> {
+        let src = [
+            0x04, 0x00, 0x00, 0x00, // l_name = 4
+            0x73, 0x71, 0x30, 0x00, // name = "sq0\x00"
+        ];
+        let actual = read_name(&mut &src[..])?;
+        assert_eq!(actual, b"sq0");
+
+        assert!(matches!(
+            read_name(&mut io::empty()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let src = [
+            0x00, 0x00, 0x00, 0x00, // l_name = 0
+        ];
+        assert!(matches!(
+            read_name(&mut &src[..]),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
+
+        let src = [
+            0x03, 0x00, 0x00, 0x00, // l_name = 3
+            0x73, 0x71, 0x30, // name = "sq0"
+        ];
+        assert!(matches!(
+            read_name(&mut &src[..]),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_length() -> io::Result<()> {
+        assert_eq!(
+            read_length(&mut &[0x01, 0x00, 0x00, 0x00][..])?,
+            NonZero::<usize>::MIN
+        );
+
+        #[cfg(not(target_pointer_width = "16"))]
+        assert_eq!(
+            read_length(&mut &[0xff, 0xff, 0xff, 0xff][..])?,
+            const { NonZero::new(u32::MAX as usize).unwrap() }
+        );
+
+        assert!(matches!(
+            read_length(&mut io::empty()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        assert!(matches!(
+            read_length(&mut &[0x00, 0x00, 0x00, 0x00][..]),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
+
+        Ok(())
+    }
+}

@@ -1,0 +1,24 @@
+##fileformat=VCFv4.2
+##INFO=<ID=END,Number=1,Type=Integer,Description="End">
+##FILTER=<ID=q10,Description="Low">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##contig=<ID=chr1,length=10000>
+##contig=<ID=chr2,length=10000>
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	A
+chr1	100	.	A	G	.	PASS	.	GT	0/1
+chr1	100	.	A	T	.	PASS	.	GT	0/1
+chr1	100	.	AC	A	.	PASS	.	GT	0/1
+chr1	200	.	A	G,T	.	PASS	.	GT	1/2
+chr1	300	.	A	AT	.	PASS	.	GT	0/1
+chr1	400	.	A	.	.	PASS	.	GT	0/0
+chr1	500	rs1	C	G	.	PASS	.	GT	0/1
+chr1	600	.	G	<DEL>	.	PASS	END=700	GT	0/1
+chr1	600	.	G	<DEL>	.	PASS	END=800	GT	0/1
+chr1	700	.	T	C	.	PASS	.	GT	0/1
+chr1	700	.	T	C	.	q10	.	GT	1/1
+chr1	800	.	TA	T	.	PASS	.	GT	0/1
+chr1	900	.	GT	GA	.	PASS	.	GT	0/1
+chr1	1000	.	A	*,G	.	PASS	.	GT	1/2
+chr1	1100	.	ACG	A,AC	.	PASS	.	GT	1/2
+chr1	1200	.	C	T	.	.	.	GT	0/1
+chr1	1300	rs9	G	A	.	PASS	.	GT	0/1

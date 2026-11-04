@@ -1,0 +1,42 @@
+pasta includes or derives from the following projects.
+
+noodles (https://github.com/zaeleus/noodles)
+  Copyright (c) 2018 Michael Macias. MIT License (see LICENSE).
+  The pasta library began as a copy of the noodles-core, -bgzf, -csi, -fasta, -sam, -bam, -cram,
+  -vcf, -bcf, -tabix, and -util crates, with changes made in the DylanCosto/noodles fork.
+
+samtools and HTSlib (https://github.com/samtools)
+  Copyright (C) Genome Research Ltd. and contributors. samtools and most of HTSlib are under the
+  MIT/Expat License; HTSlib's CRAM code is under the Modified (3-clause) BSD License.
+  ntools and parts of pasta (the pileup engine, BAQ, MD/NM calculation, CRAM encoding and
+  decoding rules, and the command implementations) are Rust ports of their algorithms and
+  behavior, written from their 1.24 sources.
+
+htscodecs (https://github.com/samtools/htscodecs)
+  Copyright (C) Genome Research Ltd. Modified (3-clause) BSD License, except the range coder and
+  rANS primitives, which are in the public domain (see its licence for the exact files). pasta's
+  CRAM codecs (rANS 4x8 and Nx16, the adaptive arithmetic coder, fqzcomp, and the name
+  tokenizer) are Rust ports of the htscodecs 1.6 code bundled with HTSlib 1.24.
+
+bcftools (https://github.com/samtools/bcftools)
+  Copyright (C) Genome Research Ltd. and contributors. bcftools is under the MIT/Expat License,
+  and under the GPL when built with the GNU Scientific Library (GSL), which its `polysomy`
+  command needs; vtools has no `polysomy`, and ports nothing that uses the GSL.
+  vtools and pasta's variant module (VCF/BCF headers and records, VCF parsing and formatting,
+  BCF encoding, indexing, region handling, and the command implementations) are Rust ports of
+  the behavior of bcftools and HTSlib, written from their 1.24 sources.
+
+edlib (https://github.com/Martinsos/edlib)
+  Copyright (c) 2014 Martin Šošić. MIT License. vtools' `mpileup --indels-cns` edit distances
+  are a Rust port of the cut-down C translation of edlib that bcftools 1.24 includes (edlib.c);
+  its licence is in bcftools' LICENSE ("License for edlib.[ch]").
+
+VariantKey (https://github.com/tecnickcom/variantkey)
+  Copyright (c) 2017-2018 GENOMICS plc, Copyright (c) 2018-2023 Nicola Asuni - Tecnick.com.
+  MIT License. vtools' VariantKey conversion is a Rust port of the variantkey.h that bcftools
+  1.24 includes.
+
+Release archives also contain licenses/, with the complete samtools, HTSlib, htscodecs,
+bcftools (which includes edlib's), and VariantKey licence texts, and THIRD_PARTY_LICENSES.txt, with the licence and
+notice files of every crate compiled into the binaries (among them libdeflate, which the default
+build bundles).

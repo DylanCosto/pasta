@@ -1,0 +1,137 @@
+use std::{fs::File, io, path::Path};
+
+use crate::bgzf;
+use crate::core::Position;
+use crate::csi::{
+    self as csi,
+    binning_index::{Indexer, index::reference_sequence::bin::Chunk},
+};
+use bstr::ByteSlice;
+
+use crate::sam::{
+    Header, Record,
+    alignment::Record as _,
+    header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER},
+    io::Reader,
+};
+
+/// Indexes a bgzipped-compressed SAM file.
+///
+/// The input must be coordinate-sorted and marked as such in the SAM header, i.e.,
+/// `SO:coordinate`.
+///
+/// See also [`csi::fs::write`] to write the resulting [`csi::Index`] to a file.
+///
+/// # Examples
+///
+/// ```no_run
+/// use pasta::sam;
+/// let index = sam::fs::index("sample.sam.gz")?;
+/// # Ok::<(), std::io::Error>(())
+/// ````
+pub fn index<P>(src: P) -> io::Result<csi::Index>
+where
+    P: AsRef<Path>,
+{
+    let mut reader = File::open(src)
+        .map(bgzf::io::Reader::new)
+        .map(Reader::new)?;
+
+    index_inner(&mut reader)
+}
+
+fn index_inner<R>(reader: &mut Reader<R>) -> io::Result<csi::Index>
+where
+    R: bgzf::io::BufRead,
+{
+    let header = reader.read_header()?;
+
+    if !is_coordinate_sorted(&header) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid sort order: expected {:?}, got {:?}",
+                Some(COORDINATE.as_bstr()),
+                header
+                    .header()
+                    .and_then(|hdr| hdr.other_fields().get(&SORT_ORDER))
+            ),
+        ));
+    }
+
+    let mut indexer = Indexer::default();
+
+    let mut record = Record::default();
+    let mut start_position = reader.get_ref().virtual_position();
+
+    // Records are normalized as HTSlib's `sam_parse1` (and so `samtools index`) normalizes them.
+    while reader.read_normalized_record(&header, &mut record)? != 0 {
+        let end_position = reader.get_ref().virtual_position();
+        let chunk = Chunk::new(start_position, end_position);
+
+        let alignment_context = match alignment_context(&header, &record)? {
+            Some((id, start, end)) => {
+                let is_mapped = !record.flags()?.is_unmapped();
+                Some((id, start, end, is_mapped))
+            }
+            _ => None,
+        };
+
+        indexer
+            .add_record(alignment_context, chunk)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        start_position = end_position;
+    }
+
+    Ok(indexer.build(header.reference_sequences().len()))
+}
+
+fn is_coordinate_sorted(header: &Header) -> bool {
+    header
+        .header()
+        .and_then(|hdr| hdr.other_fields().get(&SORT_ORDER))
+        .map(|sort_order| sort_order == COORDINATE)
+        .unwrap_or_default()
+}
+
+fn alignment_context(
+    header: &Header,
+    record: &Record,
+) -> io::Result<Option<(usize, Position, Position)>> {
+    match (
+        record.reference_sequence_id(header).transpose()?,
+        record.alignment_start().transpose()?,
+        record.alignment_end().transpose()?,
+    ) {
+        (Some(id), Some(start), Some(end)) => Ok(Some((id, start, end))),
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sam::header::record::value::{
+        Map,
+        map::{self, builder::BuildError},
+    };
+
+    #[test]
+    fn test_is_coordinate_sorted() -> Result<(), BuildError> {
+        let header = Header::default();
+        assert!(!is_coordinate_sorted(&header));
+
+        let header = Header::builder()
+            .set_header(
+                Map::<map::Header>::builder()
+                    .insert(SORT_ORDER, COORDINATE)
+                    .build()?,
+            )
+            .build();
+
+        assert!(is_coordinate_sorted(&header));
+
+        Ok(())
+    }
+}

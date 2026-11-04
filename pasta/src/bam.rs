@@ -1,0 +1,53 @@
+//! Handles the reading and writing of the BAM (Binary Alignment/Map) file format.
+//!
+//! The BAM format contains the same information as SAM (Sequence Alignment/Map), namely a SAM
+//! header and a list of records.
+//!
+//! # Examples
+//!
+//! ## Read all records
+//!
+//! ```no_run
+//! # use std::{fs::File, io};
+//! use pasta::bam;
+//!
+//! let mut reader = File::open("sample.bam").map(bam::io::Reader::new)?;
+//! let header = reader.read_header()?;
+//!
+//! for result in reader.records() {
+//!     let record = result?;
+//!     // ...
+//! }
+//! # Ok::<_, io::Error>(())
+//! ```
+//!
+//! ## Query records
+//!
+//! Querying allows filtering records by region. It requires an associated BAM index (BAI or CSI).
+//!
+//! ```no_run
+//! # use std::fs::File;
+//! use pasta::bam;
+//!
+//! let mut reader = File::open("sample.bam").map(bam::io::Reader::new)?;
+//! let header = reader.read_header()?;
+//!
+//! let index = bam::fs::read_associated_index("sample.bam")?;
+//! let region = "sq0:5-8".parse()?;
+//! let query = reader.query(&header, &index, &region)?;
+//!
+//! for result in query.records() {
+//!     let record = result?;
+//!     // ...
+//! }
+//! # Ok::<_, Box<dyn std::error::Error>>(())
+//! ```
+
+pub mod bai;
+pub mod fs;
+pub mod index;
+pub mod io;
+pub mod record;
+mod record_ref;
+
+pub use self::{index::Index, record::Record, record_ref::RecordRef};

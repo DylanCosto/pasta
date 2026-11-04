@@ -1,0 +1,385 @@
+//! BGZF writer.
+
+mod builder;
+mod compression_level;
+mod frame;
+
+pub use self::{builder::Builder, compression_level::CompressionLevel};
+
+use std::io::{self, Write};
+
+pub(crate) use self::frame::write_frame;
+use crate::bgzf::{BGZF_HEADER_SIZE, BGZF_MAX_ISIZE, VirtualPosition, gz};
+
+// The max DEFLATE overhead for 65536 bytes of data at compression level 0.
+//
+// For zlib (and derivatives) and libdeflate, this is 10 bytes; and for miniz_oxide, 15 bytes.
+pub(crate) const COMPRESSION_LEVEL_0_OVERHEAD: usize = 15;
+
+// The max size of the write buffer.
+//
+// The buffer that uses this size is the uncompressed data that is staged to be written as a BGZF
+// block. It is slightly smaller than the max allowed ISIZE to compensate for the gzip format and
+// DEFLATE overheads.
+pub(crate) const MAX_BUF_SIZE: usize =
+    BGZF_MAX_ISIZE - BGZF_HEADER_SIZE - gz::TRAILER_SIZE - COMPRESSION_LEVEL_0_OVERHEAD;
+
+// § 4.1.2 End-of-file marker (2020-12-03)
+pub(crate) const BGZF_EOF: [u8; 28] = [
+    0x1f, 0x8b, // ID1, ID2
+    0x08, // CM = DEFLATE
+    0x04, // FLG = FEXTRA
+    0x00, 0x00, 0x00, 0x00, // MTIME = 0
+    0x00, // XFL = 0
+    0xff, // OS = 255 (unknown)
+    0x06, 0x00, // XLEN = 6
+    0x42, 0x43, // SI1, SI2
+    0x02, 0x00, // SLEN = 2
+    0x1b, 0x00, // BSIZE = 27
+    0x03, 0x00, // CDATA
+    0x00, 0x00, 0x00, 0x00, // CRC32 = 0x00000000
+    0x00, 0x00, 0x00, 0x00, // ISIZE = 0
+];
+
+#[cfg(feature = "libdeflate")]
+pub(crate) type CompressionLevelImpl = libdeflater::CompressionLvl;
+#[cfg(not(feature = "libdeflate"))]
+pub(crate) type CompressionLevelImpl = i32;
+
+/// A BZGF writer.
+///
+/// This implements [`std::io::Write`], consuming uncompressed data and emitting compressed data.
+///
+/// # Examples
+///
+/// ```
+/// # use std::io::{self, Write};
+/// use pasta::bgzf;
+///
+/// let mut writer = bgzf::io::Writer::new(Vec::new());
+/// writer.write_all(b"noodles-bgzf")?;
+///
+/// let data = writer.finish()?;
+/// # Ok::<(), io::Error>(())
+/// ```
+#[derive(Debug)]
+pub struct Writer<W>
+where
+    W: Write,
+{
+    inner: Option<W>,
+    position: u64,
+    staging_buf: Vec<u8>,
+    compression_buf: Vec<u8>,
+    compression_level: CompressionLevelImpl,
+    is_done: bool,
+}
+
+impl<W> Writer<W>
+where
+    W: Write,
+{
+    /// Creates a writer with a default compression level.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io;
+    /// use pasta::bgzf;
+    /// let writer = bgzf::io::Writer::new(io::sink());
+    /// ```
+    pub fn new(inner: W) -> Self {
+        Builder::default().build_from_writer(inner)
+    }
+
+    /// Returns a reference to the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io;
+    /// use pasta::bgzf;
+    /// let writer = bgzf::io::Writer::new(io::sink());
+    /// let _inner = writer.get_ref();
+    /// ```
+    pub fn get_ref(&self) -> &W {
+        self.inner.as_ref().unwrap()
+    }
+
+    /// Returns the underlying writer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io;
+    /// use pasta::bgzf;
+    /// let writer = bgzf::io::Writer::new(io::sink());
+    /// let _inner = writer.into_inner();
+    /// ```
+    pub fn into_inner(mut self) -> W {
+        self.inner.take().unwrap()
+    }
+
+    /// Returns the current position of the stream.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io;
+    /// use pasta::bgzf;
+    /// let writer = bgzf::io::Writer::new(io::sink());
+    /// assert_eq!(writer.position(), 0);
+    /// ```
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Returns the current virtual position of the stream.
+    ///
+    /// # Panics
+    ///
+    /// This panics if the stream flushed >= 256 TiB of compressed data.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io;
+    /// use pasta::bgzf;
+    /// let writer = bgzf::io::Writer::new(io::sink());
+    /// assert_eq!(writer.virtual_position(), bgzf::VirtualPosition::from(0));
+    /// ```
+    pub fn virtual_position(&self) -> VirtualPosition {
+        // SAFETY: The uncompressed buffer is guaranteed to be <= `MAX_UNCOMPRESSED_POSITION`.
+        let uncompressed_position = self.staging_buf.len() as u16;
+        VirtualPosition::try_from((self.position, uncompressed_position)).unwrap()
+    }
+
+    fn flush_block(&mut self) -> io::Result<()> {
+        use crate::bgzf::deflate;
+
+        let compressed_data = &mut self.compression_buf;
+        let crc32 = deflate::encode(&self.staging_buf, self.compression_level, compressed_data)?;
+
+        let inner = self.inner.as_mut().unwrap();
+        let uncompressed_size = self.staging_buf.len();
+        let block_size = write_frame(inner, compressed_data, crc32, uncompressed_size)?;
+
+        self.position += block_size as u64;
+
+        self.staging_buf.clear();
+
+        Ok(())
+    }
+
+    /// Attempts to finish the output stream by flushing any remaining buffers.
+    ///
+    /// This then appends the final BGZF EOF block and flushes the underlying writer, so that a
+    /// failure to write the end of the stream is returned rather than lost when it is dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io::{self, Write};
+    /// use pasta::bgzf;
+    ///
+    /// let mut writer = bgzf::io::Writer::new(io::sink());
+    /// writer.write_all(b"noodles-bgzf")?;
+    ///
+    /// writer.try_finish()?;
+    /// # Ok::<(), io::Error>(())
+    /// ```
+    pub fn try_finish(&mut self) -> io::Result<()> {
+        if self.is_done {
+            return Ok(());
+        }
+
+        self.flush()?;
+
+        let inner = self.inner.as_mut().unwrap();
+        inner.write_all(&BGZF_EOF)?;
+
+        self.position += BGZF_EOF.len() as u64;
+        self.is_done = true;
+
+        inner.flush()
+    }
+
+    /// Returns the underlying writer after finishing the output stream.
+    ///
+    /// This method can only be called once. Any further usage of the writer may result in a panic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::io::{self, Write};
+    /// use pasta::bgzf;
+    ///
+    /// let mut writer = bgzf::io::Writer::new(io::sink());
+    /// writer.write_all(b"noodles-bgzf")?;
+    ///
+    /// let data = writer.finish()?;
+    /// # Ok::<(), io::Error>(())
+    /// ```
+    pub fn finish(mut self) -> io::Result<W> {
+        self.try_finish()?;
+        let inner = self.inner.take().unwrap();
+        Ok(inner)
+    }
+
+    fn remaining(&self) -> usize {
+        MAX_BUF_SIZE - self.staging_buf.len()
+    }
+
+    fn has_remaining(&self) -> bool {
+        self.staging_buf.len() < MAX_BUF_SIZE
+    }
+}
+
+impl<W> Drop for Writer<W>
+where
+    W: Write,
+{
+    fn drop(&mut self) {
+        if self.inner.is_some() && !self.is_done {
+            let _ = self.try_finish();
+        }
+    }
+}
+
+impl<W> Write for Writer<W>
+where
+    W: Write,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let amt = self.remaining().min(buf.len());
+        self.staging_buf.extend(&buf[..amt]);
+
+        if !self.has_remaining() {
+            self.flush()?;
+        }
+
+        Ok(amt)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.staging_buf.is_empty() {
+            Ok(())
+        } else {
+            self.flush_block()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_virtual_position() -> Result<(), Box<dyn std::error::Error>> {
+        let mut writer = Writer::new(Vec::new());
+
+        assert_eq!(writer.virtual_position(), VirtualPosition::from(0));
+
+        writer.write_all(b"noodles")?;
+
+        assert_eq!(
+            writer.virtual_position(),
+            VirtualPosition::try_from((0, 7))?
+        );
+
+        writer.flush()?;
+
+        assert_eq!(
+            writer.virtual_position(),
+            VirtualPosition::try_from((writer.get_ref().len() as u64, 0))?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_finish() -> io::Result<()> {
+        let mut buf = Vec::new();
+
+        let mut writer = Writer::new(&mut buf);
+        writer.write_all(b"noodles")?;
+        writer.try_finish()?;
+
+        let expected = writer.get_ref().len();
+
+        drop(writer);
+
+        let actual = buf.len();
+
+        assert_eq!(expected, actual);
+
+        Ok(())
+    }
+
+    /// A writer that fails with `StorageFull` once it has taken `left` bytes, and on flush when
+    /// `fail_flush` is set.
+    struct Cramped {
+        left: usize,
+        fail_flush: bool,
+    }
+
+    impl Write for Cramped {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.left == 0 {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::ErrorKind::StorageFull.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_finish_reports_each_failure_at_the_end_of_the_stream() -> io::Result<()> {
+        let mut block = Writer::new(Vec::new());
+        block.write_all(b"noodles")?;
+        block.flush()?;
+        let block_len = block.get_ref().len();
+
+        for (left, fail_flush, what) in [
+            (0, false, "the last data block"),
+            (block_len, false, "the EOF block"),
+            (block_len + BGZF_EOF.len() - 1, false, "the EOF block tail"),
+            (usize::MAX, true, "the final flush"),
+        ] {
+            let mut writer = Writer::new(Cramped { left, fail_flush });
+            writer.write_all(b"noodles")?;
+            let result = writer.finish().map(drop).map_err(|e| e.kind());
+            assert_eq!(result, Err(io::ErrorKind::StorageFull), "{what}");
+        }
+
+        let writer = Writer::new(Cramped {
+            left: usize::MAX,
+            fail_flush: false,
+        });
+        assert!(writer.finish().is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finish() -> io::Result<()> {
+        let mut writer = Writer::new(Vec::new());
+        writer.write_all(b"noodles")?;
+
+        let data = writer.finish()?;
+        let eof_start = data.len() - BGZF_EOF.len();
+
+        assert_eq!(&data[eof_start..], BGZF_EOF);
+
+        Ok(())
+    }
+}

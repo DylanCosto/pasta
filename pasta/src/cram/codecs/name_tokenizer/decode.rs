@@ -1,0 +1,639 @@
+mod header;
+
+use std::{io, ops::Range};
+
+use self::header::{CompressionMethod, read_header};
+use super::Type;
+use crate::cram::{
+    codecs::{aac, rans_nx16},
+    io::reader::num::{read_u8, read_uint7_as},
+};
+
+const NUL: u8 = 0x00;
+
+pub fn decode(mut src: &[u8]) -> io::Result<Vec<u8>> {
+    // Bounds up-front reservations; the declared sizes are not trusted for allocation.
+    const MAX_INITIAL_CAPACITY: usize = 1 << 20;
+
+    let (uncompressed_size, name_count, compression_method) = read_header(&mut src)?;
+
+    // As in htscodecs, a block holds at least one name.
+    if name_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid tok3 name count",
+        ));
+    }
+
+    let mut b = decode_token_byte_streams(&mut src, compression_method, name_count)?;
+
+    let mut decoder = NameDecoder {
+        dst: Vec::with_capacity(uncompressed_size.min(MAX_INITIAL_CAPACITY)),
+        names: Vec::with_capacity(name_count.min(MAX_INITIAL_CAPACITY)),
+        tokens: Vec::new(),
+    };
+
+    for n in 0..name_count {
+        decoder.decode_name(&mut b, n)?;
+    }
+
+    Ok(decoder.dst)
+}
+
+/// A decoded token.
+///
+/// Strings are ranges of the output, so tokens are small and copied rather than cloned.
+#[derive(Clone, Copy, Debug)]
+enum Token {
+    Char(u8),
+    String(usize, usize),
+    Digits(u32),
+    PaddedDigits(u32, u8),
+    Nop,
+}
+
+/// A decoded name: its bytes in the output (excluding the NUL), and its tokens in the token
+/// arena. Token `t` (1-based) of the name is `tokens[t - 1]`; later positions have no token.
+#[derive(Clone, Debug)]
+struct Name {
+    bytes: Range<usize>,
+    tokens: Range<usize>,
+}
+
+struct NameDecoder {
+    dst: Vec<u8>,
+    names: Vec<Name>,
+    tokens: Vec<Token>,
+}
+
+impl NameDecoder {
+    fn decode_name(&mut self, b: &mut [TokenReader], n: usize) -> io::Result<()> {
+        let b0 = b
+            .first_mut()
+            .ok_or_else(|| invalid_data("missing token streams"))?;
+        let ty = b0.read_type()?;
+        let dist = b0.read_distance(ty)?;
+        let m = n
+            .checked_sub(dist)
+            .ok_or_else(|| invalid_data("invalid name distance"))?;
+
+        let start = self.dst.len();
+
+        // A name can reference itself (distance 0), in which case it has no previous tokens.
+        let prev = self.names.get(m).cloned().unwrap_or(Name {
+            bytes: 0..0,
+            tokens: 0..0,
+        });
+
+        let tokens = if ty == Type::Dup {
+            self.dst.extend_from_within(prev.bytes);
+            prev.tokens
+        } else {
+            let tokens_start = self.tokens.len();
+            let prev_tokens = &prev.tokens;
+
+            for (t, streams) in b.iter_mut().enumerate().skip(1) {
+                let i = prev_tokens.start + t - 1;
+                let prev_token = (i < prev_tokens.end).then(|| self.tokens[i]);
+
+                let Some(token) = streams.read_token(prev_token, &mut self.dst)? else {
+                    break;
+                };
+
+                self.tokens.push(token);
+            }
+
+            // Every name ends with an end token. Running out of token positions first is an error.
+            if self.tokens.len() - tokens_start == b.len().saturating_sub(1) {
+                return Err(invalid_data("missing name end token"));
+            }
+
+            tokens_start..self.tokens.len()
+        };
+
+        self.names.push(Name {
+            bytes: start..self.dst.len(),
+            tokens,
+        });
+
+        self.dst.push(NUL);
+
+        Ok(())
+    }
+}
+
+/// A token byte stream.
+///
+/// Bytes past `buf` up to `len` read as `fill`. This represents the implicit type stream of a new
+/// token position (its type, then a match for every other name) without allocating a byte per
+/// name. Invariant: `len >= buf.len()`, and `len > buf.len()` only for an implicit type stream in
+/// its own position (explicit streams come from [`Stream::new`], and duplicates are
+/// materialized), which is why only `read_u8` reads `fill`.
+#[derive(Clone, Debug, Default)]
+struct Stream {
+    buf: Vec<u8>,
+    len: usize,
+    fill: u8,
+    pos: usize,
+}
+
+impl Stream {
+    fn new(buf: Vec<u8>) -> Self {
+        Self {
+            len: buf.len(),
+            buf,
+            fill: 0,
+            pos: 0,
+        }
+    }
+
+    fn read_u8(&mut self) -> io::Result<u8> {
+        let n = match self.buf.get(self.pos) {
+            Some(&n) => n,
+            None if self.pos < self.len => self.fill,
+            None => return Err(unexpected_eof()),
+        };
+
+        self.pos += 1;
+
+        Ok(n)
+    }
+
+    // Implicit streams are only read as types, so multi-byte reads use `buf` directly.
+    fn read_u32_le(&mut self) -> io::Result<u32> {
+        let buf = self
+            .buf
+            .get(self.pos..)
+            .and_then(|buf| buf.first_chunk())
+            .ok_or_else(unexpected_eof)?;
+
+        self.pos += 4;
+
+        Ok(u32::from_le_bytes(*buf))
+    }
+
+    /// Reads a NUL-terminated string, without the NUL.
+    ///
+    /// Unterminated input at the end of the stream drops its last byte, as the delimiter would
+    /// have been.
+    fn read_string(&mut self) -> &[u8] {
+        let rest = self.buf.get(self.pos..).unwrap_or_default();
+
+        match rest.iter().position(|&b| b == NUL) {
+            Some(i) => {
+                self.pos += i + 1;
+                &rest[..i]
+            }
+            None => {
+                self.pos = self.buf.len();
+                rest.split_last().map(|(_, s)| s).unwrap_or_default()
+            }
+        }
+    }
+}
+
+/// The streams of one token position, indexed by type (`Type::Type` through `Type::Delta0`).
+#[derive(Debug, Default)]
+struct TokenReader {
+    streams: [Stream; STREAM_TYPE_COUNT],
+}
+
+const STREAM_TYPE_COUNT: usize = Type::Delta0 as usize + 1;
+
+impl TokenReader {
+    fn get_mut(&mut self, ty: Type) -> io::Result<&mut Stream> {
+        self.streams
+            .get_mut(usize::from(ty))
+            .ok_or_else(|| invalid_data(format!("invalid token stream type: {ty:?}")))
+    }
+
+    /// Returns the stream of `ty`, which must be a stream type. For a constant `ty`, this is a
+    /// fixed offset with no bounds check.
+    #[inline(always)]
+    fn stream(&mut self, ty: Type) -> &mut Stream {
+        &mut self.streams[usize::from(ty)]
+    }
+
+    fn read_type(&mut self) -> io::Result<Type> {
+        self.stream(Type::Type)
+            .read_u8()
+            .and_then(|n| Type::try_from(n).map_err(invalid_data))
+    }
+
+    fn read_distance(&mut self, ty: Type) -> io::Result<usize> {
+        let reader = match ty {
+            Type::Dup | Type::Diff => self.stream(ty),
+            _ => return Err(invalid_data(format!("invalid name type: {ty:?}"))),
+        };
+
+        reader
+            .read_u32_le()
+            .and_then(|n| usize::try_from(n).map_err(invalid_data))
+    }
+
+    /// Reads the next token at this position, appending its bytes to `dst`.
+    ///
+    /// Returns `None` at the end of the name.
+    fn read_token(
+        &mut self,
+        prev_token: Option<Token>,
+        dst: &mut Vec<u8>,
+    ) -> io::Result<Option<Token>> {
+        let token = match self.read_type()? {
+            Type::Char => Token::Char(self.stream(Type::Char).read_u8()?),
+            Type::String => {
+                let start = dst.len();
+                dst.extend_from_slice(self.stream(Type::String).read_string());
+                return Ok(Some(Token::String(start, dst.len())));
+            }
+            Type::Digits => Token::Digits(self.stream(Type::Digits).read_u32_le()?),
+            Type::Digits0 => {
+                let d = self.stream(Type::Digits0).read_u32_le()?;
+                let l = self.stream(Type::DZLen).read_u8()?;
+                Token::PaddedDigits(d, l)
+            }
+            Type::Delta => {
+                let delta = self.stream(Type::Delta).read_u8().map(u32::from)?;
+
+                match prev_token {
+                    Some(Token::Digits(n)) => Token::Digits(n.wrapping_add(delta)),
+                    _ => return Err(invalid_previous_token(prev_token)),
+                }
+            }
+            Type::Delta0 => {
+                let delta = self.stream(Type::Delta0).read_u8().map(u32::from)?;
+
+                match prev_token {
+                    Some(Token::PaddedDigits(n, width)) => {
+                        Token::PaddedDigits(n.wrapping_add(delta), width)
+                    }
+                    _ => return Err(invalid_previous_token(prev_token)),
+                }
+            }
+            Type::Match => match prev_token {
+                Some(token) => token,
+                None => return Ok(None),
+            },
+            Type::End => return Ok(None),
+            _ => Token::Nop,
+        };
+
+        match token {
+            Token::Char(c) => dst.push(c),
+            Token::String(start, end) => dst.extend_from_within(start..end),
+            Token::Digits(d) => write_digits(dst, d, 0),
+            Token::PaddedDigits(d, width) => write_digits(dst, d, usize::from(width)),
+            Token::Nop => {}
+        }
+
+        Ok(Some(token))
+    }
+}
+
+/// Writes `n` in decimal, left-padded with zeros to at least `width` digits.
+fn write_digits(dst: &mut Vec<u8>, mut n: u32, width: usize) {
+    let mut buf = [0; 10];
+    let mut i = buf.len();
+
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+
+        if n == 0 {
+            break;
+        }
+    }
+
+    let digits = &buf[i..];
+
+    if width > digits.len() {
+        dst.resize(dst.len() + width - digits.len(), b'0');
+    }
+
+    dst.extend_from_slice(digits);
+}
+
+fn decode_token_byte_streams(
+    src: &mut &[u8],
+    compression_method: CompressionMethod,
+    n_names: usize,
+) -> io::Result<Vec<TokenReader>> {
+    let mut b: Vec<TokenReader> = Vec::new();
+
+    while !src.is_empty() {
+        let ttype = read_u8(src)?;
+
+        let tok_new = ttype & 0x80 != 0;
+        let tok_dup = ttype & 0x40 != 0;
+
+        let ty = Type::try_from(ttype).map_err(invalid_data)?;
+
+        if tok_new {
+            let mut reader = TokenReader::default();
+
+            if ty != Type::Type && n_names > 0 {
+                *reader.stream(Type::Type) = Stream {
+                    buf: vec![u8::from(ty)],
+                    len: n_names,
+                    fill: u8::from(Type::Match),
+                    pos: 0,
+                };
+            }
+
+            b.push(reader);
+        }
+
+        let stream = if tok_dup {
+            let dup_pos = read_u8(src).map(usize::from)?;
+
+            let dup_type = read_u8(src).and_then(|n| Type::try_from(n).map_err(invalid_data))?;
+
+            let mut stream = b
+                .get_mut(dup_pos)
+                .ok_or_else(|| invalid_data("invalid duplicate token stream position"))?
+                .get_mut(dup_type)?
+                .clone();
+
+            // The duplicate can be read as any type, so an implicit stream is materialized.
+            stream.buf.resize(stream.len, stream.fill);
+
+            stream
+        } else {
+            let compressed_size = read_uint7_as(src)?;
+            let buf = split_off(src, compressed_size)?;
+
+            Stream::new(match compression_method {
+                CompressionMethod::RansNx16 => rans_nx16::decode(buf, 0)?,
+                CompressionMethod::AdaptiveArithmeticCoder => aac::decode(buf, 0)?,
+            })
+        };
+
+        *b.last_mut()
+            .ok_or_else(|| invalid_data("token stream before first token position"))?
+            .get_mut(ty)? = stream;
+    }
+
+    Ok(b)
+}
+
+fn split_off<'a>(src: &mut &'a [u8], len: usize) -> io::Result<&'a [u8]> {
+    src.split_off(..len)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+}
+
+fn invalid_data<E>(e: E) -> io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+fn invalid_previous_token(prev_token: Option<Token>) -> io::Error {
+    invalid_data(format!("invalid previous token: {prev_token:?}"))
+}
+
+fn unexpected_eof() -> io::Error {
+    io::Error::from(io::ErrorKind::UnexpectedEof)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cram::codecs::name_tokenizer::encode;
+
+    fn build_header(name_count: u32) -> Vec<u8> {
+        let mut dst = 0u32.to_le_bytes().to_vec(); // uncompressed size
+        dst.extend(name_count.to_le_bytes());
+        dst.push(0x00); // rANS Nx16
+        dst
+    }
+
+    /// Builds an uncompressed (rANS Nx16 CAT) token byte stream.
+    fn build_stream(ttype: u8, data: &[u8]) -> Vec<u8> {
+        let len = u8::try_from(data.len()).unwrap();
+        let mut dst = vec![ttype, len + 2, 0x20, len];
+        dst.extend(data);
+        dst
+    }
+
+    // `names.bin` holds 35 NUL-terminated read names. `tok3-rans.bin` and `tok3-arith.bin` are
+    // `names.bin` encoded by htscodecs 1.6.7 `tok3_encode_names` at level 9, with rANS Nx16 and
+    // the adaptive arithmetic coder, respectively, as the inner codec.
+    #[test]
+    fn test_decode_htscodecs_fixtures() -> io::Result<()> {
+        let expected = include_bytes!("../fixtures/names.bin");
+
+        for src in [
+            &include_bytes!("../fixtures/tok3-rans.bin")[..],
+            &include_bytes!("../fixtures/tok3-arith.bin")[..],
+        ] {
+            assert_eq!(decode(src)?, expected);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_more_than_127_token_positions() -> io::Result<()> {
+        let mut expected = b"a:".repeat(80);
+        expected.push(0);
+        let src = encode(&expected)?;
+        assert_eq!(decode(&src)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_with_duplicate_of_implicit_type_stream() -> io::Result<()> {
+        let src = [
+            build_header(3),
+            // token 0: types = [diff; 3], distances = [0, 1, 1]
+            build_stream(0x80, &[0x06, 0x06, 0x06]),
+            build_stream(0x06, &[0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]),
+            // token 1: types = [string, match, match] (implicit), strings = dup(1, type)
+            vec![0xc1, 0x01, 0x00],
+            // token 2: types = [end; 3]
+            build_stream(0x80, &[0x0c, 0x0c, 0x0c]),
+        ]
+        .concat();
+
+        assert_eq!(decode(&src)?, b"\x01\x0a\0\x01\x0a\0\x01\x0a\0");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_with_no_names() {
+        let src = [build_header(0), build_stream(0x86, &[])].concat();
+        assert!(matches!(
+            decode(&src),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[test]
+    fn test_decode_with_duplicate_of_dz_len_stream() -> io::Result<()> {
+        let src = [
+            build_header(2),
+            // token 0: types = [diff; 2], distances = [0, 1]
+            build_stream(0x80, &[0x06, 0x06]),
+            build_stream(0x06, &[0, 0, 0, 0, 1, 0, 0, 0]),
+            // token 1: types = [digits0, match] (implicit), digits = [7], lengths = [3]
+            build_stream(0x83, &[7, 0, 0, 0]),
+            build_stream(0x04, &[3]),
+            // token 2: types = [digits0, match] (implicit), digits = [8], lengths = dup(1, dzlen)
+            build_stream(0x83, &[8, 0, 0, 0]),
+            vec![0x44, 0x01, 0x04],
+            // token 3: types = [end; 2]
+            build_stream(0x80, &[0x0c, 0x0c]),
+        ]
+        .concat();
+
+        assert_eq!(decode(&src)?, b"007008\x00007008\x00");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_with_invalid_names() {
+        fn t(streams: &[Vec<u8>]) {
+            let mut src = build_header(1);
+            src.extend(streams.concat());
+            assert!(matches!(decode(&src), Err(e) if e.kind() == io::ErrorKind::InvalidData));
+        }
+
+        // token 0: types = [diff] (implicit), distances = [0]
+        let token_0 = build_stream(0x86, &[0, 0, 0, 0]);
+        // token 1: types = [end]
+        let token_1 = build_stream(0x80, &[0x0c]);
+
+        // missing end token (token 1: types = [char] (implicit), chars = [n])
+        t(&[token_0.clone(), build_stream(0x82, b"n")]);
+        // distance out of range (token 0: distances = [1])
+        t(&[build_stream(0x86, &[1, 0, 0, 0]), token_1.clone()]);
+        // duplicate position out of range (token 1: strings = dup(9, string))
+        t(&[token_0, token_1, vec![0x41, 0x09, 0x01]]);
+    }
+
+    #[test]
+    fn test_decode() -> io::Result<()> {
+        let src = [
+            0x58, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x80, 0x15, 0x00, 0x03, 0x06,
+            0x00, 0x04, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
+            0x00, 0x80, 0x00, 0x00, 0x06, 0x18, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x02,
+            0x00, 0x22, 0x25, 0x00, 0x00, 0xbc, 0x00, 0x00, 0x00, 0xbc, 0x00, 0x00, 0x00, 0xbc,
+            0x00, 0x00, 0x80, 0x17, 0x00, 0x03, 0x01, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01,
+            0x1b, 0x00, 0x04, 0x00, 0x31, 0x37, 0x49, 0x00, 0x01, 0x01, 0x01, 0x01, 0x00, 0x0c,
+            0x02, 0x00, 0x00, 0x04, 0x02, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x80, 0x17, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0xac, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02, 0x15, 0x00,
+            0x01, 0x5f, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x80, 0x17, 0x00, 0x03, 0x03, 0x0a, 0x00, 0x01,
+            0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00,
+            0x80, 0x00, 0x00, 0x03, 0x19, 0x00, 0x04, 0x00, 0x22, 0x3d, 0x00, 0x02, 0x01, 0x01,
+            0x00, 0x0c, 0x02, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x04, 0x15, 0x00, 0x01, 0x05, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x80, 0x17, 0x00,
+            0x03, 0x02, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0xac, 0x00, 0x00,
+            0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02, 0x15, 0x00, 0x01, 0x3a, 0x00,
+            0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x80, 0x00, 0x00, 0x80, 0x17, 0x00, 0x03, 0x07, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
+            0x07, 0x17, 0x00, 0x04, 0x00, 0x02, 0x00, 0x03, 0x01, 0x00, 0x0c, 0x02, 0x00, 0x00,
+            0xa8, 0x00, 0x00, 0x00, 0xa8, 0x00, 0x00, 0x00, 0xa8, 0x00, 0x00, 0x80, 0x17, 0x00,
+            0x03, 0x02, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0xac, 0x00, 0x00,
+            0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02, 0x15, 0x00, 0x01, 0x3a, 0x00,
+            0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+            0x80, 0x00, 0x00, 0x80, 0x17, 0x00, 0x03, 0x07, 0x0a, 0x00, 0x03, 0x01, 0x00, 0xa8,
+            0x00, 0x00, 0x00, 0x0c, 0x02, 0x00, 0x00, 0xa8, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
+            0x07, 0x1a, 0x00, 0x08, 0x00, 0x7b, 0x7c, 0x00, 0x00, 0x06, 0x01, 0x01, 0x00, 0x7c,
+            0x20, 0x00, 0x00, 0xe0, 0x00, 0x00, 0x00, 0xe0, 0x00, 0x00, 0x00, 0xe0, 0x00, 0x00,
+            0x80, 0x17, 0x00, 0x03, 0x02, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00,
+            0xac, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02, 0x15, 0x00,
+            0x01, 0x3a, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x80, 0x15, 0x00, 0x03, 0x07, 0x00, 0x04, 0x00,
+            0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00,
+            0x00, 0x07, 0x22, 0x00, 0x0c, 0x00, 0x06, 0x2d, 0x64, 0x65, 0x00, 0xb2, 0xf0, 0x00,
+            0x0a, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0xcd, 0x0b, 0x08, 0x00, 0xaf, 0x0e,
+            0x08, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x80, 0x17, 0x00, 0x03, 0x02,
+            0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0xac,
+            0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02, 0x15, 0x00, 0x01, 0x3a, 0x00, 0x01, 0x00,
+            0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00,
+            0x00, 0x80, 0x17, 0x00, 0x03, 0x03, 0x07, 0x00, 0x03, 0x01, 0x00, 0xa8, 0x00, 0x00,
+            0x00, 0xa8, 0x00, 0x00, 0x00, 0x0c, 0x02, 0x00, 0x00, 0x80, 0x00, 0x00, 0x03, 0x1d,
+            0x00, 0x08, 0x00, 0x06, 0x21, 0xa3, 0xe3, 0x00, 0x04, 0x01, 0x01, 0x01, 0x01, 0x00,
+            0x6e, 0x20, 0x00, 0x00, 0x58, 0x20, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
+            0x00, 0x04, 0x15, 0x00, 0x02, 0x05, 0x00, 0x02, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80,
+            0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x07, 0x19, 0x00, 0x04,
+            0x00, 0x21, 0x3f, 0x00, 0x02, 0x01, 0x01, 0x00, 0x08, 0x02, 0x00, 0x00, 0x0c, 0x02,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x80, 0x17, 0x00, 0x03, 0x02,
+            0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0xac,
+            0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02, 0x15, 0x00, 0x01, 0x23, 0x00, 0x01, 0x00,
+            0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00,
+            0x00, 0x80, 0x17, 0x00, 0x03, 0x07, 0x0a, 0x00, 0x01, 0x03, 0x00, 0x00, 0x02, 0x00,
+            0x00, 0xac, 0x00, 0x00, 0x00, 0xac, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x07, 0x17,
+            0x00, 0x04, 0x00, 0x09, 0x00, 0x03, 0x01, 0x00, 0x0c, 0x02, 0x00, 0x00, 0xa8, 0x00,
+            0x00, 0x00, 0xa8, 0x00, 0x00, 0x00, 0xa8, 0x00, 0x00, 0x80, 0x15, 0x00, 0x03, 0x0c,
+            0x00, 0x04, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00,
+            0x00, 0x80, 0x00, 0x00,
+        ];
+
+        let actual = decode(&src)?;
+
+        let expected = b"\
+I17_08765:2:123:61541:01763#9\0\
+I17_08765:2:123:1636:08611#9\0\
+I17_08765:2:124:45613:16161#9\0\
+";
+
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_with_arithmetic_coder() -> io::Result<()> {
+        let src = [
+            0x58, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x80, 0x08, 0x00, 0x03, 0x07,
+            0x00, 0xe6, 0x26, 0xbb, 0x6f, 0x06, 0x09, 0x00, 0x0c, 0x02, 0x00, 0x72, 0x16, 0xb3,
+            0x22, 0x06, 0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0x2e, 0x2f, 0x44, 0x56, 0x59, 0x01,
+            0x0b, 0x00, 0x04, 0x4a, 0x00, 0xfe, 0x73, 0x23, 0xcc, 0xbd, 0x00, 0x00, 0x80, 0x09,
+            0x00, 0x03, 0x0b, 0x00, 0x45, 0x75, 0x15, 0xca, 0x59, 0x02, 0x08, 0x00, 0x01, 0x60,
+            0x00, 0xfd, 0x55, 0x55, 0x16, 0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0x5c, 0xba, 0xe7,
+            0x3e, 0x59, 0x03, 0x0a, 0x00, 0x04, 0x3e, 0x00, 0xfd, 0xab, 0xb9, 0x90, 0x00, 0x00,
+            0x04, 0x08, 0x00, 0x01, 0x06, 0x00, 0xd5, 0x55, 0x55, 0x52, 0x80, 0x09, 0x00, 0x03,
+            0x0b, 0x00, 0x45, 0x75, 0x15, 0xca, 0x59, 0x02, 0x08, 0x00, 0x01, 0x3b, 0x00, 0xfb,
+            0xa9, 0x38, 0x36, 0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0xb9, 0xd2, 0x2d, 0x0e, 0x59,
+            0x07, 0x08, 0x00, 0x04, 0x03, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0x80, 0x09, 0x00, 0x03,
+            0x0b, 0x00, 0x45, 0x75, 0x15, 0xca, 0x59, 0x02, 0x08, 0x00, 0x01, 0x3b, 0x00, 0xfb,
+            0xa9, 0x38, 0x36, 0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0xb9, 0x70, 0xac, 0xd3, 0x86,
+            0x07, 0x0b, 0x40, 0x08, 0x7d, 0x00, 0xfb, 0xe8, 0x1e, 0x78, 0x3e, 0xe5, 0x26, 0x80,
+            0x09, 0x00, 0x03, 0x0b, 0x00, 0x45, 0x75, 0x15, 0xca, 0x59, 0x02, 0x08, 0x00, 0x01,
+            0x3b, 0x00, 0xfb, 0xa9, 0x38, 0x36, 0x80, 0x08, 0x00, 0x03, 0x08, 0x00, 0xea, 0xd5,
+            0x55, 0x47, 0x07, 0x11, 0x00, 0x0c, 0xf1, 0x00, 0x6c, 0x58, 0x2b, 0x6c, 0x4e, 0x16,
+            0xdb, 0x8f, 0x4b, 0x06, 0x96, 0x00, 0x00, 0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0x45,
+            0x75, 0x15, 0xca, 0x59, 0x02, 0x08, 0x00, 0x01, 0x3b, 0x00, 0xfb, 0xa9, 0x38, 0x36,
+            0x80, 0x09, 0x00, 0x03, 0x08, 0x00, 0x78, 0xc4, 0x44, 0x17, 0x00, 0x03, 0x0e, 0x00,
+            0x08, 0xe4, 0x00, 0xfe, 0xe7, 0xa0, 0x74, 0x3b, 0x78, 0x79, 0x48, 0x00, 0x00, 0x04,
+            0x08, 0x00, 0x02, 0x06, 0x00, 0xdd, 0x17, 0x45, 0xce, 0x07, 0x0a, 0x00, 0x04, 0x40,
+            0x00, 0x87, 0xf3, 0x32, 0xd3, 0x00, 0x00, 0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0x45,
+            0x75, 0x15, 0xca, 0x59, 0x02, 0x08, 0x00, 0x01, 0x24, 0x00, 0xf8, 0xe3, 0x8e, 0x35,
+            0x80, 0x09, 0x00, 0x03, 0x0b, 0x00, 0xb9, 0xd2, 0x2d, 0x0e, 0x59, 0x07, 0x09, 0x00,
+            0x04, 0x0a, 0x00, 0xe6, 0x66, 0x66, 0x61, 0x00, 0x80, 0x08, 0x00, 0x03, 0x0d, 0x00,
+            0xf6, 0x57, 0xac, 0x0e,
+        ];
+
+        let actual = decode(&src)?;
+
+        let expected = b"\
+I17_08765:2:123:61541:01763#9\0\
+I17_08765:2:123:1636:08611#9\0\
+I17_08765:2:124:45613:16161#9\0\
+";
+
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+}

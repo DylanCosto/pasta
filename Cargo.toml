@@ -1,0 +1,28 @@
+[workspace]
+members = ["ntools", "pasta", "vtools"]
+resolver = "3"
+
+[workspace.package]
+license = "MIT"
+edition = "2024"
+rust-version = "1.91.0"
+repository = "https://github.com/DylanCosto/pasta"
+
+[workspace.dependencies]
+bitflags = "2.0.2"
+bstr = { version = "1.9.0", default-features = false, features = ["std"] }
+flate2 = { version = "1.1.0", default-features = false, features = ["zlib-rs"] }
+indexmap = "2.0.0"
+lexical-core = "1.0.0"
+md-5 = "0.11.0"
+memchr = "2.3.3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+# One codegen unit with fat LTO: hot loops inline across modules and crates regardless of how
+# code is split into units, which keeps timings stable across unrelated edits (and is 1-8%
+# faster than the default on most commands).
+[profile.release]
+codegen-units = 1
+lto = "fat"

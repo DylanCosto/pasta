@@ -1,0 +1,31 @@
+[package]
+name = "vtools"
+version = "0.2.0"
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "A bcftools-compatible command-line toolkit built on pasta"
+publish = false
+
+[[bin]]
+name = "vtools"
+path = "src/main.rs"
+
+[features]
+default = ["libdeflate"]
+libdeflate = ["pasta/libdeflate"]
+
+[dependencies]
+anyhow = "1.0.86"
+clap = { version = "4.5.0", features = ["derive", "wrap_help"] }
+crossbeam-channel = "0.5.6"
+flate2.workspace = true
+libc = "0.2.150"
+memchr.workspace = true
+pasta = { path = "../pasta" }
+regex = { version = "1.10.0", default-features = false, features = ["std", "perf"] }
+regex-syntax = { version = "0.8.5", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

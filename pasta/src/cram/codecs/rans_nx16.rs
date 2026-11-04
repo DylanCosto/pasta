@@ -1,0 +1,147 @@
+//! rANS Nx16 codec.
+
+pub(crate) mod decode;
+pub(crate) mod encode;
+mod flags;
+
+pub use self::flags::Flags;
+pub(crate) use self::{decode::decode, encode::encode};
+
+const ALPHABET_SIZE: usize = 256;
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+    use crate::cram::codecs::test_utils::sparse;
+    use crate::cram::io::reader::num::read_uint7;
+
+    #[test]
+    fn test_decode_htscodecs_fixtures() -> io::Result<()> {
+        macro_rules! r4x16 {
+            ($name:literal) => {
+                (
+                    $name,
+                    &include_bytes!(concat!("fixtures/r4x16-", $name, ".bin"))[..],
+                )
+            };
+        }
+
+        let qual = include_bytes!("fixtures/qual.bin").to_vec();
+        // `mid` has 12-bit order-1 frequencies.
+        let (mid, big) = (sparse(8000, 1024, 8), sparse(70001, 2048, 4));
+        let wide = sparse(4099, 16, 32);
+
+        // Named by flags: ORDER = 0x01, N32 = 0x04, STRIPE = 0x08, CAT = 0x20, RLE = 0x40 and
+        // PACK = 0x80.
+        for (name, src) in [
+            r4x16!("qual-00"),
+            r4x16!("qual-01"),
+            r4x16!("qual-04"),
+            r4x16!("qual-05"),
+            r4x16!("qual-41"),
+            r4x16!("qual-49"),
+            r4x16!("qual-64"),
+            r4x16!("qual-80"),
+            r4x16!("qual-c0"),
+            r4x16!("mid-01"),
+            r4x16!("big-05"),
+            r4x16!("wide-00"),
+            r4x16!("wide-04"),
+        ] {
+            let expected = match &name[..3] {
+                "qua" => &qual,
+                "mid" => &mid,
+                "wid" => &wide,
+                _ => &big,
+            };
+
+            assert!(decode(src, expected.len())? == *expected, "{name}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_order_1_renormalization_round_trip() -> io::Result<()> {
+        let mut state = 1u32;
+        let src: Vec<_> = (0..4097)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect();
+        for flags in [Flags::ORDER, Flags::ORDER | Flags::N32] {
+            assert_eq!(decode(&encode(flags, &src)?, src.len())?, src);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_rle_round_trip_with_compressed_metadata() -> io::Result<()> {
+        // Quality-score-like data: a few symbols, one of them in long runs.
+        let mut state = 1u32;
+        let mut src = Vec::new();
+
+        while src.len() < 50000 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let (sym, len) = if state >> 31 == 0 {
+                (40, 10 * (1 + (state >> 20) % 3))
+            } else {
+                ((state >> 16) as u8 % 6, 1)
+            };
+            src.extend((0..len).map(|_| sym));
+        }
+
+        for flags in [
+            Flags::RLE,
+            Flags::ORDER | Flags::RLE,
+            Flags::ORDER | Flags::N32 | Flags::RLE,
+            Flags::ORDER | Flags::N32 | Flags::RLE | Flags::PACK,
+            Flags::N32 | Flags::RLE | Flags::PACK,
+        ] {
+            let compressed_data = encode(flags, &src)?;
+            assert_eq!(decode(&compressed_data, src.len())?, src, "{flags:?}");
+
+            if !flags.contains(Flags::PACK) {
+                // The run-length metadata follows the flags and the size, with its low bit clear
+                // when it is compressed.
+                let mut buf = &compressed_data[1..];
+                read_uint7(&mut buf)?;
+                assert_eq!(read_uint7(&mut buf)? & 1, 0, "{flags:?}");
+            }
+        }
+
+        // Without runs, RLE is left out.
+        let src: Vec<_> = (0..1000).map(|i| (i % 7) as u8).collect();
+        let compressed_data = encode(Flags::RLE, &src)?;
+        assert!(!Flags::from_bits_truncate(compressed_data[0]).contains(Flags::RLE));
+        assert_eq!(decode(&compressed_data, src.len())?, src);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_self() -> io::Result<()> {
+        let src = b"noodles";
+
+        let options = [
+            Flags::empty(),
+            Flags::ORDER,
+            Flags::N32,
+            Flags::STRIPE,
+            Flags::CAT,
+            Flags::RLE,
+            Flags::PACK,
+        ];
+
+        for flags in options {
+            let compressed_data = encode(flags, src)?;
+            let uncompressed_data = decode(&compressed_data, src.len())?;
+            assert_eq!(uncompressed_data, src);
+        }
+
+        Ok(())
+    }
+}

@@ -1,0 +1,77 @@
+name: Release
+
+# Pushing an annotated tag vX.Y.Z tests the commit, builds ntools and vtools on Rocky Linux 8
+# (glibc 2.28, so the Linux binaries run on RHEL 8 and later) and on macOS (Apple silicon), and
+# publishes the archives from scripts/package-release.sh, with their SHA-256 checksums, as a
+# GitHub release.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - name: Check that the tag matches the crate versions
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#v}
+          for crate in pasta ntools vtools; do
+            version=$(cargo pkgid -p "$crate" | sed 's/.*[#@]//')
+            if [ "$version" != "$tag" ]; then
+              echo "$crate is version $version, but the tag is $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+          done
+      - run: cargo test --workspace --all-features --locked
+
+  linux:
+    needs: test
+    runs-on: ubuntu-24.04
+    container: rockylinux:8
+    steps:
+      - name: Install build tools
+        run: dnf install -y --setopt=install_weak_deps=False gcc binutils git tar bzip2 curl findutils python39
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - run: cargo build --release --locked -p ntools -p vtools
+      - run: PYTHON=python3.9 scripts/package-release.sh "$GITHUB_REF_NAME"
+      # Creates the release; the macOS job adds its archive to it.
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  macos:
+    needs: linux
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - run: cargo build --release --locked -p ntools -p vtools
+      - run: scripts/package-release.sh "$GITHUB_REF_NAME"
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          fail_on_unmatched_files: true
