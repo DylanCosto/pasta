@@ -1,7 +1,7 @@
 # pasta
 
 Rust-native SAM/BAM/CRAM/VCF/BCF library, with ntools and vtools: samtools- and
-bcftools-compatible command-line tools that put correct output first.
+bcftools-compatible command-line tools.
 
 - [`pasta`](pasta): the library. SAM, BAM, and CRAM; VCF and BCF (`pasta::variant`); BGZF; BAI,
   CSI, CRAI, and TBI indexes; FASTA; and an HTSlib-compatible pileup engine. It began as a fork
@@ -33,18 +33,6 @@ cargo install --locked --path vtools
 The default build links libdeflate, which is C. `cargo build --release --no-default-features -p
 ntools -p vtools` builds without any C code; deflate then uses zlib-rs, which gives the same
 decompressed data but other compressed bytes.
-
-## Policy
-
-- Output must be right by the format specifications (SAM, BAM, CRAM, VCF, BCF, BGZF, and the
-  index formats) and by what each command documents. A wrong result is a bug, whatever samtools
-  or bcftools gives.
-- Commands, options, output formats, and exit statuses follow samtools, bcftools, and HTSlib
-  1.24, so that scripts keep working. Where those tools have a bug (a crash, a read of unset
-  memory, a wrong result), ntools and vtools do the right thing rather than copy it; each tool's
-  README lists these and the other intentional differences.
-- Compressed bytes can differ from samtools' and bcftools', since they depend on the deflate
-  library and on how blocks are cut.
 
 ## Commands
 
