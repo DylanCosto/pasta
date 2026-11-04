@@ -34,6 +34,26 @@ The default build links libdeflate, which is C. `cargo build --release --no-defa
 ntools -p vtools` builds without any C code; deflate then uses zlib-rs, which gives the same
 decompressed data but other compressed bytes.
 
+## Performance
+
+The largest speedups, as wall time on a 24-vCPU Intel Xeon VM against samtools and bcftools 1.24
+(both with libdeflate), with the same threads in both tools:
+
+| Tool | Command | Input | samtools/bcftools | ntools/vtools | Speedup |
+|---|---|---|---:|---:|---:|
+| ntools | `stats -@ 16` | HG002 PacBio Revio, whole genome (63 GB BAM) | 2,170 s | 294 s | 7.38x |
+| ntools | `view -c -@ 16` | HG003 35x Illumina, whole genome (14 GB CRAM 3.1) | 23.5 s | 5.1 s | 4.64x |
+| ntools | `flagstat -@ 16` | HG003 35x Illumina, whole genome (14 GB CRAM 3.1) | 30.4 s | 7.6 s | 4.02x |
+| ntools | `stats -@ 16` | HG003 35x Illumina, whole genome (44 GB BAM) | 1,441 s | 554 s | 2.60x |
+| ntools | `view` CRAM to BAM `-@ 16` | HG003 ONT R10.4.1, whole genome (69 GB CRAM) | 746 s | 445 s | 1.67x |
+| vtools | `view` VCF.gz to VCF `--threads 4` | 1000 Genomes chr22, 500 samples | 19.6 s | 1.6 s | 12.23x |
+| vtools | `concat` 4 chunks `-Ob` | 1000 Genomes chr22, 500 samples | 8.2 s | 0.7 s | 11.94x |
+| vtools | `view` VCF.gz to BCF `--threads 4` | 1000 Genomes chr22, 3,202 samples | 67.3 s | 13.2 s | 5.09x |
+| vtools | `merge -Ob --threads 4` | 1000 Genomes chr22, 3,202 samples (sample halves) | 72.4 s | 29.9 s | 2.43x |
+
+More rows, and the cases where samtools or bcftools is faster, are in the
+[ntools](ntools/README.md#performance) and [vtools](vtools/README.md#performance) READMEs.
+
 ## Commands
 
 Each tool's README lists every option: [ntools](ntools/README.md#commands) and

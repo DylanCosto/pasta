@@ -1108,6 +1108,7 @@ calls (4.0 M records), and the cohort rows use chr22 of the 3,202-sample 1000 Ge
 | Operation | bcftools (s) | vtools (s) | Speedup |
 |---|---:|---:|---:|
 | view VCF.gz to VCF, kg | 20.520 | 7.710 | 2.66x |
+| view VCF.gz to VCF, kg, --threads 4 | 19.570 | 1.600 | 12.23x |
 | view VCF.gz to BCF, kg, --threads 4 | 11.390 | 1.900 | 5.99x |
 | view -f PASS -i 'FMT/DP>40', giab | 4.290 | 4.500 | 0.95x |
 | query -f '%CHROM %POS[ %GT]', kg | 13.810 | 6.870 | 2.01x |

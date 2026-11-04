@@ -400,9 +400,12 @@ reads, "long" 9,784 nanopore reads with MM/ML tags) are medians of 5 warm runs; 
 | stats, short | 1.650 | 1.010 | 1.63x |
 | mpileup -f (BAQ), short, -@8 (samtools mpileup has no threads) | 27.770 | 3.810 | 7.29x |
 | flagstat, 35x HG003 short reads (BAM) | 92.150 | 70.360 | 1.31x |
+| view -c, 35x HG003 short reads (CRAM 3.1) | 23.460 | 5.060 | 4.64x |
+| flagstat, 35x HG003 short reads (CRAM 3.1) | 30.420 | 7.560 | 4.02x |
 | stats, 35x HG003 short reads (BAM) | 1440.650 | 553.840 | 2.60x |
 | view BAM->CRAM 3.1, 35x HG003 short reads | 224.750 | 473.130 | 0.48x |
 | collate, fixmate -m, sort, markdup (piped), 35x HG003 short reads | 2869.200 | 2909.910 | 0.99x |
+| stats, HG002 Revio (BAM) | 2169.500 | 293.970 | 7.38x |
 | sort -n, HG002 Revio (BAM) | 1011.740 | 646.610 | 1.56x |
 | view CRAM->BAM, HG003 ONT (CRAM) | 745.710 | 445.340 | 1.67x |
 
