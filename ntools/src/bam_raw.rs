@@ -2,6 +2,8 @@
 
 use std::{io, ops::Range};
 
+use pasta::bam::record::codec::decoder::decode_bases;
+
 /// Offsets of the fixed-length fields.
 pub mod field {
     use std::ops::Range;
@@ -21,17 +23,6 @@ pub mod field {
 
 /// SAM's bases by their 4-bit BAM codes (HTSlib's `seq_nt16_str`).
 pub const BASES: &[u8; 16] = b"=ACMGRSVTWYHKDBN";
-
-/// Decodes a byte of two 4-bit bases to its two characters.
-pub static BASE_PAIRS: [[u8; 2]; 256] = {
-    let mut table = [[0; 2]; 256];
-    let mut i = 0;
-    while i < 256 {
-        table[i] = [BASES[i >> 4], BASES[i & 0x0f]];
-        i += 1;
-    }
-    table
-};
 
 /// A view of an encoded BAM record whose variable-length sections were checked to fit.
 #[derive(Clone, Copy, Debug)]
@@ -224,21 +215,9 @@ impl<'a> Record<'a> {
 
     /// Appends the bases, decoded to characters, to `dst`.
     pub fn decode_sequence(&self, dst: &mut Vec<u8>) {
-        let len = self.sequence_len();
-        let packed = self.packed_sequence();
-
-        // Writing into a presized slice avoids a capacity check per base pair.
         let start = dst.len();
-        dst.resize(start + len, 0);
-        let (pairs, rest) = dst[start..].as_chunks_mut::<2>();
-
-        for (pair, &byte) in pairs.iter_mut().zip(packed) {
-            *pair = BASE_PAIRS[usize::from(byte)];
-        }
-
-        if let [last] = rest {
-            *last = BASE_PAIRS[usize::from(packed[len / 2])][0];
-        }
+        dst.resize(start + self.sequence_len(), 0);
+        decode_bases(self.packed_sequence(), &mut dst[start..]);
     }
 
     #[inline]

@@ -1,5 +1,6 @@
 //! BAM record decoder.
 
+mod bases;
 mod bin;
 pub(crate) mod cigar;
 pub mod data;
@@ -16,6 +17,7 @@ use std::{error, fmt};
 
 use crate::sam::alignment::RecordBuf;
 
+pub use self::bases::decode_bases;
 pub(crate) use self::data::read_data;
 use self::{
     bin::consume_bin, cigar::read_cigar, flags::read_flags, mapping_quality::read_mapping_quality,

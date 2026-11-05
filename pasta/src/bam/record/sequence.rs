@@ -3,6 +3,7 @@ mod subsequence;
 
 use std::fmt::{self, Write};
 
+use super::codec;
 use crate::sam;
 
 use self::iter::Iter;
@@ -89,19 +90,9 @@ impl sam::alignment::record::Sequence for Sequence<'_> {
     }
 
     fn append_to(&self, dst: &mut Vec<u8>) {
-        // Two bases a byte; the last byte of an odd count holds one.
-        let (pairs, rest) = self.src.split_at(self.len() / 2);
-
-        dst.reserve(self.len());
-
-        for &n in pairs {
-            dst.extend_from_slice(&decode_bases(n));
-        }
-
-        if self.len() % 2 == 1 {
-            let [base, _] = decode_bases(rest[0]);
-            dst.push(base);
-        }
+        let start = dst.len();
+        dst.resize(start + self.len(), 0);
+        codec::decoder::decode_bases(self.src, &mut dst[start..]);
     }
 }
 
@@ -137,7 +128,9 @@ impl fmt::Debug for Sequence<'_> {
 
 impl<'a> From<Sequence<'a>> for sam::alignment::record_buf::Sequence {
     fn from(sequence: Sequence<'a>) -> Self {
-        sequence.iter().collect()
+        let mut bases = vec![0; sequence.len()];
+        codec::decoder::decode_bases(sequence.src, &mut bases);
+        Self::from(bases)
     }
 }
 

@@ -33,20 +33,6 @@ pub(super) fn read_length(src: &mut &[u8]) -> Result<usize, DecodeError> {
     read_u32_le(src).and_then(|n| usize::try_from(n).map_err(DecodeError::InvalidLength))
 }
 
-const NIBBLE_PAIRS: [[u8; 2]; 256] = {
-    const BASES: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
-
-    let mut table = [[0u8; 2]; 256];
-    let mut i = 0;
-
-    while i < 256 {
-        table[i] = [BASES[i >> 4], BASES[i & 0xf]];
-        i += 1;
-    }
-
-    table
-};
-
 pub(super) fn read_sequence(
     src: &mut &[u8],
     sequence: &mut Sequence,
@@ -60,12 +46,10 @@ pub(super) fn read_sequence(
 
     *src = rest;
 
-    let bases = buf.iter().flat_map(|&b| NIBBLE_PAIRS[b as usize]);
-
     let dst = sequence.as_mut();
     dst.clear();
-    dst.extend(bases);
-    dst.truncate(base_count);
+    dst.resize(base_count, 0);
+    super::decode_bases(buf, dst);
 
     Ok(())
 }
@@ -112,15 +96,5 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn test_nibble_pairs() {
-        let expected = *b"=ACMGRSVTWYHKDBN";
-
-        for (code, base) in expected.iter().enumerate() {
-            assert_eq!(NIBBLE_PAIRS[code << 4][0], *base, "high nibble {code}");
-            assert_eq!(NIBBLE_PAIRS[code][1], *base, "low nibble {code}");
-        }
     }
 }

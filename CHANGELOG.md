@@ -5,6 +5,17 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- pasta: `bam::record::codec::decoder::decode_bases`, which decodes 4-bit BAM bases to their
+  characters 32 at a time with SSSE3 (x86-64, chosen at run time) or NEON (aarch64).
+
+### Changed
+
+- pasta decodes BAM sequences with `decode_bases`: `bam::record::Sequence`'s `append_to` and
+  conversion to a `RecordBuf` sequence, decoding to `RecordBuf`, and the SAM writer. So do
+  ntools' SAM output (`view`), `fastq`/`fasta` and filter expressions.
+
 ## [0.2.0] - 2026-11-04
 
 The first public release.

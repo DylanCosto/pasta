@@ -4,7 +4,9 @@
 //! string, out-of-range qualities, or a long CIGAR stored in a `CG` tag) is declined, and the
 //! caller formats it with pasta's SAM writer instead, so output and errors are unchanged.
 
-use crate::bam_raw::{BASE_PAIRS, field, le_u16, le_u32};
+use pasta::bam::record::codec::decoder::decode_bases;
+
+use crate::bam_raw::{field, le_u16, le_u32};
 
 /// SAM CIGAR operations by BAM code, with `B` (backward), which HTSlib also prints.
 const CIGAR_OPS: &[u8; 10] = b"MIDNSHP=XB";
@@ -168,21 +170,9 @@ fn try_format(names: &Names, record: &[u8], dst: &mut Vec<u8>) -> Option<()> {
     if base_count == 0 {
         dst.push(b'*');
     } else {
-        let packed = &record[cigar_end..sequence_end];
-
-        // Writing into a presized slice avoids a capacity check per base pair.
         let start = dst.len();
         dst.resize(start + base_count, 0);
-        let out = &mut dst[start..];
-
-        let (pairs, rest) = out.as_chunks_mut::<2>();
-        for (pair, &byte) in pairs.iter_mut().zip(packed) {
-            *pair = BASE_PAIRS[usize::from(byte)];
-        }
-
-        if let [last] = rest {
-            *last = BASE_PAIRS[usize::from(packed[base_count / 2])][0];
-        }
+        decode_bases(&record[cigar_end..sequence_end], &mut dst[start..]);
     }
 
     // QUAL

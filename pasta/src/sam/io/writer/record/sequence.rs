@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use super::MISSING;
+use crate::bam::record::codec::decoder::decode_bases;
 use crate::sam::alignment::record::{Sequence, SequenceRef, sequence_ref::FourBitPacked};
 
 pub(super) fn write_sequence<W>(
@@ -39,53 +40,21 @@ fn write_four_bit_packed_sequence<W>(writer: &mut W, sequence: &FourBitPacked) -
 where
     W: Write,
 {
-    const CHUNK_SIZE: usize = 128;
+    // An even number of bases, so that each chunk starts on a byte.
+    const CHUNK_SIZE: usize = 256;
 
     let src = sequence.as_ref();
-    let base_count = sequence.len();
+    let base_count = sequence.len().min(src.len() * 2);
 
-    let pair_count = base_count / 2;
-    let (pairs, rest) = src.split_at(src.len().min(pair_count));
+    let mut buf = [0; CHUNK_SIZE];
 
-    let mut buf = [0; CHUNK_SIZE * 2];
-
-    for chunk in pairs.chunks(CHUNK_SIZE) {
-        for (&s, d) in chunk.iter().zip(buf.as_chunks_mut().0) {
-            *d = decode_bases(s);
-        }
-
-        let len = chunk.len() * 2;
+    for start in (0..base_count).step_by(CHUNK_SIZE) {
+        let len = (base_count - start).min(CHUNK_SIZE);
+        decode_bases(&src[start / 2..], &mut buf[..len]);
         writer.write_all(&buf[..len])?;
     }
 
-    if !base_count.is_multiple_of(2)
-        && let Some(&n) = rest.first()
-    {
-        let [b, _] = decode_bases(n);
-        writer.write_all(&[b])?;
-    }
-
     Ok(())
-}
-
-const CODES: [[u8; 2]; 256] = build_codes();
-
-const fn build_codes() -> [[u8; 2]; 256] {
-    const BASES: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
-
-    let mut table = [[0u8; 2]; 256];
-    let mut i = 0;
-
-    while i < 256 {
-        table[i] = [BASES[i >> 4], BASES[i & 0xf]];
-        i += 1;
-    }
-
-    table
-}
-
-fn decode_bases(n: u8) -> [u8; 2] {
-    CODES[usize::from(n)]
 }
 
 fn write_raw_sequence<W>(writer: &mut W, sequence: &[u8]) -> io::Result<()>
