@@ -34,6 +34,45 @@ The default build links libdeflate, which is C. `cargo build --release --no-defa
 ntools -p vtools` builds without any C code; deflate then uses zlib-rs, which gives the same
 decompressed data but other compressed bytes.
 
+## Usage
+
+`ntools` takes samtools' commands and options, and `vtools` takes bcftools', so existing
+commands and scripts work with the name changed. `ntools --help` lists the commands and
+`ntools COMMAND --help` gives a command's options; `vtools` alone lists its commands, and
+`vtools COMMAND` without arguments prints the command's usage, as bcftools does.
+
+Alignments:
+
+```sh
+ntools faidx ref.fa                                      # index the reference
+ntools sort -@ 8 -o sample.bam sample.sam                # sort by coordinate, to BAM
+ntools index sample.bam
+ntools view -C -T ref.fa -@ 8 -o sample.cram sample.bam  # BAM to CRAM
+ntools view -b -T ref.fa -@ 8 -o copy.bam sample.cram    # CRAM to BAM
+ntools view -c -q 30 sample.bam chr1:1000-2000           # count reads in a region
+ntools flagstat -@ 8 sample.cram
+ntools stats -@ 8 sample.bam > sample.stats
+ntools collate -O -u sample.bam | ntools fixmate -m -u - - |
+    ntools sort -u - | ntools markdup - marked.bam       # mark duplicates
+```
+
+Variants:
+
+```sh
+vtools mpileup -f ref.fa -Ou sample.bam |
+    vtools call -mv -Oz -o calls.vcf.gz -W               # call variants, with an index
+vtools view -i 'QUAL>=30 && INFO/DP>=10' calls.vcf.gz
+vtools filter -s LowQual -e 'QUAL<30' -Oz -o filtered.vcf.gz calls.vcf.gz
+vtools query -f '%CHROM\t%POS\t%REF\t%ALT[\t%GT]\n' -r chr1:1-5000 calls.vcf.gz
+vtools norm -f ref.fa -m -any -Ob -o norm.bcf -W calls.vcf.gz
+vtools view --threads 4 -Ob -o calls.bcf calls.vcf.gz    # VCF to BCF
+vtools stats calls.vcf.gz
+```
+
+Reading CRAM, ntools adds the `MD` and `NM` tags that CRAM writers leave out, as samtools does
+(`--input-fmt-option decode_md=0` turns this off). The [Formats](#formats) section says where
+CRAM references come from.
+
 ## Performance
 
 The largest speedups, as wall time on a 24-vCPU Intel Xeon VM against samtools and bcftools 1.24
