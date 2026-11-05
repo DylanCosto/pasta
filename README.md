@@ -16,12 +16,12 @@ binaries, with SHA-256 checksums, for Linux x86_64 (`x86_64-linux`; glibc 2.28 o
 Ubuntu 18.10 and later) and macOS on Apple silicon (`aarch64-macos`):
 
 ```sh
-tar -xzf pasta-v0.2.0-x86_64-linux.tar.gz
-pasta-v0.2.0-x86_64-linux/ntools --version
+tar -xzf pasta-v0.2.1-x86_64-linux.tar.gz
+pasta-v0.2.1-x86_64-linux/ntools --version
 ```
 
 The macOS binaries are not signed: after downloading the archive with a browser, run
-`xattr -d com.apple.quarantine pasta-v0.2.0-aarch64-macos.tar.gz` before unpacking it.
+`xattr -d com.apple.quarantine pasta-v0.2.1-aarch64-macos.tar.gz` before unpacking it.
 
 To build from source, with Rust 1.91 or newer and a C compiler:
 

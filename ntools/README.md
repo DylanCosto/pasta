@@ -387,13 +387,14 @@ Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) on 2026-11-04 against
 1.24, both with libdeflate, as wall time. Corpus rows ("short" is 1M synthetic 150 bp paired
 reads, "long" 9,784 nanopore reads with MM/ML tags) are medians of 5 warm runs; whole-genome rows
 (GIAB HG003 35x Illumina, HG002 PacBio Revio, HG003 ONT R10.4.1) are one run each, at `-@ 16`.
-`-@ N` adds N threads in both tools.
+`-@ N` adds N threads in both tools. The three `view ... ->SAM` rows were re-timed for ntools 0.2.1
+on 2026-11-05 against the same samtools times; no other row's code path changed.
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, long | 2.120 | 1.750 | 1.21x |
-| view CRAM->SAM, short | 0.870 | 0.930 | 0.94x |
-| view CRAM->SAM, long, -@8 | 0.550 | 0.340 | 1.62x |
+| view BAM->SAM, long | 2.120 | 1.700 | 1.25x |
+| view CRAM->SAM, short | 0.870 | 0.940 | 0.93x |
+| view CRAM->SAM, long, -@8 | 0.550 | 0.330 | 1.67x |
 | sort, short, -@4 | 0.980 | 0.570 | 1.72x |
 | index, long, -@4 | 0.330 | 0.300 | 1.10x |
 | markdup, short | 3.790 | 2.090 | 1.81x |
@@ -420,7 +421,7 @@ threads.
 - Writing CRAM (`view -C`) takes more CPU time than HTSlib: 1.5x samtools' time single-threaded
   on the corpus, close at `-@ 8`, and faster at `-@ 16`; on whole genomes, 2.1x samtools' time
   on the 35x short reads and 1.05x on the Revio long reads.
-- `view` CRAM to SAM of the short reads (0.94x) and `depth` (0.90x) are slightly slower
+- `view` CRAM to SAM of the short reads (0.93x) and `depth` (0.90x) are slightly slower
   single-threaded. On the 69 GB ONT CRAM, `view -c` and `flagstat` (0.86x and 0.89x) mostly wait
   for the file to be read and use less CPU time than samtools.
 - The whole-genome `collate | fixmate -m | sort | markdup` pipeline is level (0.99x) and its
