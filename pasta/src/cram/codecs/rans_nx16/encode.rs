@@ -16,6 +16,11 @@ use crate::cram::io::writer::num::{write_u8, write_u32_le, write_uint7};
 const LOWER_BOUND: u32 = 0x8000;
 
 pub fn encode(mut flags: Flags, src: &[u8]) -> io::Result<Vec<u8>> {
+    // As htscodecs does, inputs of 20 bytes or fewer are not striped.
+    if src.len() <= 20 {
+        flags.remove(Flags::STRIPE);
+    }
+
     let mut src = Cow::from(src);
     let mut dst = Vec::new();
 
@@ -278,22 +283,18 @@ mod tests {
         Ok(())
     }
 
+    /// As in htscodecs, inputs of 20 bytes or fewer are not striped: the stream is the one the
+    /// flags give without STRIPE.
     #[test]
-    fn test_encode_stripe() -> io::Result<()> {
-        let actual = encode(Flags::STRIPE, b"noodles")?;
-
-        let expected = [
-            0x08, // flags = STRIPE
-            0x07, // uncompressed len = 7
-            0x04, // chunk count = 4
-            0x03, 0x03, 0x03, 0x02, // compressed sizes = [3, 3, 3, 2]
-            0x30, 0x6e, 0x6c, // chunks[0]
-            0x30, 0x6f, 0x65, // chunks[1]
-            0x30, 0x6f, 0x73, // chunks[2]
-            0x30, 0x64, // chunks[3]
-        ];
-
-        assert_eq!(actual, expected);
+    fn test_encode_stripe_skips_short_inputs() -> io::Result<()> {
+        assert_eq!(
+            encode(Flags::STRIPE, b"noodles")?,
+            encode(Flags::empty(), b"noodles")?
+        );
+        assert_eq!(
+            encode(Flags::STRIPE | Flags::RLE, b"noodles")?,
+            encode(Flags::RLE, b"noodles")?
+        );
 
         Ok(())
     }

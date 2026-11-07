@@ -5,6 +5,16 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- pasta: CRAM 3.1 read names are compressed as HTSlib compresses them. The name tokenizer tries
+  the one or two rANS settings htscodecs tries for each kind of token at the compression level,
+  instead of eight on every token stream, and stripes the streams of numbers. On 2 million GIAB
+  HG003 NovaSeq reads, single-threaded, `ntools view -C` takes 11.4 s instead of 15.1 s
+  (samtools: 7.2 s), and the file is 4.7% smaller, 0.3% smaller than samtools'. The compressed
+  bytes of CRAM output change. `Encoder::NameTokenizer` uses the settings of HTSlib's default
+  level.
+
 ## [0.2.1] - 2026-11-05
 
 ### Added

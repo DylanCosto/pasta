@@ -438,7 +438,7 @@ mod tests {
     fn test_more_than_127_token_positions() -> io::Result<()> {
         let mut expected = b"a:".repeat(80);
         expected.push(0);
-        let src = encode(&expected)?;
+        let src = encode(&expected, 5)?;
         assert_eq!(decode(&src)?, expected);
         Ok(())
     }

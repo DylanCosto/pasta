@@ -84,10 +84,12 @@ I17_08765:2:123:1636:08611#9\0\
 I17_08765:2:124:45613:16161#9\0\
 ";
 
-        let input = encode(src)?;
-        let output = decode(&input)?;
+        for level in [1, 5] {
+            let input = encode(src, level)?;
+            let output = decode(&input)?;
 
-        assert_eq!(output, src);
+            assert_eq!(output, src, "level {level}");
+        }
 
         Ok(())
     }

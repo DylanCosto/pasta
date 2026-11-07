@@ -70,7 +70,7 @@ pub struct Options {
 }
 
 /// HTSlib's default compression level (`CRAM_DEFAULT_LEVEL`).
-const DEFAULT_LEVEL: u8 = 5;
+pub(crate) const DEFAULT_LEVEL: u8 = 5;
 
 /// HTSlib's default records per slice (`SEQS_PER_SLICE`).
 const DEFAULT_RECORDS_PER_SLICE: usize = 10_000;
@@ -771,13 +771,11 @@ fn encode(
     src: &[u8],
     quality_layout: &QualityLayout<'_>,
 ) -> Option<Vec<u8>> {
-    let level = u32::from(level);
-
     let result = match method {
-        GZIP => gzip::encode(flate2::Compression::new(level), src),
+        GZIP => gzip::encode(flate2::Compression::new(u32::from(level)), src),
         GZIP_1 => gzip::encode(flate2::Compression::new(1), src),
-        BZIP2 => bzip2::encode(::bzip2::Compression::new(level.clamp(1, 9)), src),
-        LZMA => lzma::encode(level, src),
+        BZIP2 => bzip2::encode(::bzip2::Compression::new(u32::from(level).clamp(1, 9)), src),
+        LZMA => lzma::encode(u32::from(level), src),
         RANS0 => rans_4x8::encode(rans_4x8::Order::Zero, src),
         RANS1 => rans_4x8::encode(rans_4x8::Order::One, src),
         RANS_PR0 | RANS_PR1..=RANS_PR193 => {
@@ -794,7 +792,7 @@ fn encode(
             aac::Flags::from_bits_truncate(pr_flags(method, ARITH_PR0, ARITH_PR1)),
             src,
         ),
-        TOK3 => name_tokenizer::encode(src),
+        TOK3 => name_tokenizer::encode(src, level),
         FQZ => match quality_layout.read_lengths {
             Some(lens) if options.is_3_1() => fqzcomp::encode(lens, src),
             _ => return None,

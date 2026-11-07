@@ -63,6 +63,37 @@ mod tests {
         Ok(())
     }
 
+    /// Striped streams round-trip whatever other flags they carry, and inputs of 20 bytes or
+    /// fewer are not striped, as in htscodecs.
+    #[test]
+    fn test_striped_round_trips() -> io::Result<()> {
+        let qual = include_bytes!("fixtures/qual.bin").to_vec();
+        let inputs = [
+            qual,
+            sparse(4099, 16, 32),
+            sparse(21, 8, 4),
+            sparse(20, 8, 4),
+        ];
+
+        for src in &inputs {
+            for flags in [0x08, 0x09, 0x48, 0x88, 0xc8, 0xc9, 0x0c] {
+                let flags = Flags::from_bits_truncate(flags);
+                let encoded = encode(flags, src)?;
+                assert_eq!(
+                    decode(&encoded, src.len())?,
+                    *src,
+                    "{flags:?}, {} bytes",
+                    src.len()
+                );
+
+                let striped = Flags::from_bits_truncate(encoded[0]).contains(Flags::STRIPE);
+                assert_eq!(striped, src.len() > 20, "{flags:?}, {} bytes", src.len());
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn test_order_1_renormalization_round_trip() -> io::Result<()> {
         let mut state = 1u32;

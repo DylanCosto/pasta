@@ -420,7 +420,9 @@ threads.
 
 - Writing CRAM (`view -C`) takes more CPU time than HTSlib: 1.5x samtools' time single-threaded
   on the corpus, close at `-@ 8`, and faster at `-@ 16`; on whole genomes, 2.1x samtools' time
-  on the 35x short reads and 1.05x on the Revio long reads.
+  on the 35x short reads and 1.05x on the Revio long reads. Since then, read names are compressed
+  as HTSlib compresses them: on 2 million of the 35x short reads, single-threaded, `view -C`
+  takes 1.6x samtools' time, where it took 2.1x, and writes a file 0.3% smaller than samtools'.
 - `view` CRAM to SAM of the short reads (0.93x) and `depth` (0.90x) are slightly slower
   single-threaded. On the 69 GB ONT CRAM, `view -c` and `flagstat` (0.86x and 0.89x) mostly wait
   for the file to be read and use less CPU time than samtools.

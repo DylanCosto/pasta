@@ -30,7 +30,10 @@ impl Block {
         encoder: Option<&Encoder>,
         src: &[u8],
     ) -> io::Result<Self> {
-        use crate::cram::codecs::{aac, bzip2, gzip, lzma, name_tokenizer, rans_4x8, rans_nx16};
+        use crate::cram::{
+            codecs::{aac, bzip2, gzip, lzma, name_tokenizer, rans_4x8, rans_nx16},
+            io::writer::compression,
+        };
 
         let (compression_method, buf) = match encoder {
             None => (CompressionMethod::None, src.to_vec()),
@@ -56,9 +59,10 @@ impl Block {
                 CompressionMethod::AdaptiveArithmeticCoding,
                 aac::encode(*flags, src)?,
             ),
+            // An encoder chosen by the caller carries no level: HTSlib's default.
             Some(Encoder::NameTokenizer) => (
                 CompressionMethod::NameTokenizer,
-                name_tokenizer::encode(src)?,
+                name_tokenizer::encode(src, compression::DEFAULT_LEVEL)?,
             ),
             // fqzcomp needs record boundaries; the slice writer encodes quality scores with it.
             Some(Encoder::Fqzcomp) => {

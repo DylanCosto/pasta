@@ -24,7 +24,8 @@ pub enum Encoder {
     RansNx16(rans_nx16::Flags),
     /// adaptive arithmetic coder
     AdaptiveArithmeticCoding(aac::Flags),
-    /// name tokenizer
+    /// name tokenizer, with the rANS settings htscodecs uses at HTSlib's default compression
+    /// level (5)
     NameTokenizer,
     /// fqzcomp
     Fqzcomp,
