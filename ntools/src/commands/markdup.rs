@@ -585,7 +585,7 @@ fn open_output(args: &Args, header: &sam::Header) -> anyhow::Result<Output> {
         level: output::parse_level(if args.uncompressed {
             0
         } else {
-            args.output_format_options.level(6)?
+            args.output_format_options.level(output::default_level())?
         })?,
         threads: args.threads,
         reference: args.reference.clone(),

@@ -746,7 +746,13 @@ pub fn raw_stdout() -> anyhow::Result<Sink> {
     Ok(Box::new(io::stdout()))
 }
 
-/// Parses a samtools compression level (`0`–`9`).
+/// The BGZF compression level when none is given: pasta's default, zflate's fast level 5, for
+/// pipelines (samtools writes at HTSlib's 6, which libdeflate builds of HTSlib compress at 7).
+pub fn default_level() -> u8 {
+    CompressionLevel::default().get()
+}
+
+/// Parses a compression level, 0 to 12 on libdeflate's scale, which zflate keeps.
 pub fn parse_level(level: u8) -> anyhow::Result<CompressionLevel> {
     CompressionLevel::new(level).with_context(|| format!("invalid compression level: {level}"))
 }

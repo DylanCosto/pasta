@@ -29,12 +29,27 @@ const NON_WORKER_COUNT: usize = 2;
 /// Blocks in flight per worker.
 const BLOCKS_PER_WORKER: usize = 4;
 
+/// The most blocks one job decompresses. On 64-bit Arm, zflate's batch decoder decodes two
+/// blocks at a time on one thread, overlapping their work (on an Apple M4 Pro, long-read BAMs
+/// inflate about 25% faster, and batches of 8 do as well as larger ones); elsewhere a job takes
+/// one block. Jobs take the blocks queued when they run (see [`spawn_reader`]), so batches form
+/// only while the workers are behind.
+const MAX_BATCH: usize = if cfg!(target_arch = "aarch64") { 8 } else { 1 };
+
+/// The blocks in flight: enough for a batch per worker.
+fn buffer_count(worker_count: usize, max_batch: usize) -> usize {
+    worker_count * BLOCKS_PER_WORKER.max(max_batch) + NON_WORKER_COUNT
+}
+
 enum State<R> {
     Paused((R, threads::Pool)),
     Running {
         reader_handle: JoinHandle<(R, threads::Pool)>,
         read_rx: ReadRx,
         recycle_tx: RecycleTx,
+        /// The buffers the reader thread has not taken, drained on pausing so that it reads no
+        /// further than it has.
+        recycle_rx: RecycleRx,
     },
     Done,
 }
@@ -66,6 +81,8 @@ pub struct MultithreadedReader<R> {
     /// Whether the reader thread could not be started, so that blocks are read and inflated on
     /// the calling thread from then on.
     serial: bool,
+    /// The most blocks one decompression job takes: [`MAX_BATCH`], or more in tests.
+    max_batch: usize,
 }
 
 impl<R> MultithreadedReader<R> {
@@ -126,8 +143,10 @@ impl<R> MultithreadedReader<R> {
                 reader_handle,
                 read_rx,
                 recycle_tx,
+                recycle_rx,
             } => {
                 drop(recycle_tx);
+                recycle_rx.try_iter().for_each(drop);
 
                 let err = read_rx_drain(&read_rx);
                 let (inner, _) = reader_handle
@@ -222,6 +241,7 @@ where
             buffer: Buffer::default(),
             read_ahead: VecDeque::new(),
             serial: false,
+            max_batch: MAX_BATCH,
         })
     }
 
@@ -265,8 +285,7 @@ where
             panic!("invalid state");
         };
 
-        let worker_count = self.worker_count.get();
-        let buffer_count = worker_count * BLOCKS_PER_WORKER + NON_WORKER_COUNT;
+        let buffer_count = buffer_count(self.worker_count.get(), self.max_batch);
 
         let (read_tx, read_rx) = crossbeam_channel::bounded(buffer_count);
         let (recycle_tx, recycle_rx) = crossbeam_channel::bounded(buffer_count);
@@ -278,13 +297,14 @@ where
         // The reader and the pool go to the thread once it runs, so that they stay here when it
         // cannot be started.
         let (start_tx, start_rx) = crossbeam_channel::bounded(1);
-        let reader_handle = match spawn_reader(start_rx, read_tx, recycle_rx) {
-            Ok(handle) => handle,
-            Err(e) => {
-                self.state = State::Paused((inner, pool));
-                return Err(e);
-            }
-        };
+        let reader_handle =
+            match spawn_reader(start_rx, read_tx, recycle_rx.clone(), self.max_batch) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    self.state = State::Paused((inner, pool));
+                    return Err(e);
+                }
+            };
         start_tx
             .send((inner, pool))
             .expect("the reader thread waits for its reader");
@@ -293,6 +313,7 @@ where
             reader_handle,
             read_rx,
             recycle_tx,
+            recycle_rx,
         };
 
         Ok(())
@@ -309,12 +330,15 @@ where
             reader_handle,
             read_rx,
             recycle_tx,
+            recycle_rx,
         } = state
         else {
             panic!("invalid state");
         };
 
+        // Without buffers, the reader thread reads no more frames and ends.
         drop(recycle_tx);
+        recycle_rx.try_iter().for_each(drop);
 
         // The blocks read ahead (and their errors and panics) are kept, to be read in order.
         while let Ok(buffered_rx) = read_rx.recv() {
@@ -575,22 +599,30 @@ fn read_ahead_error(read_ahead: VecDeque<Buffered>) -> Option<io::Error> {
     err
 }
 
+/// A frame read, and the channel for its block (or its error, or the panic of its job).
+type Work = (Buffer, Sender<Buffered>);
+
 /// Starts the thread that reads frames and hands them to the pool, once it is sent the reader and
-/// the pool on `start_rx`.
+/// the pool on `start_rx`. Every frame goes to a queue as soon as it is read, and a job is
+/// started for it; a job decodes the frames queued when it runs, up to `max_batch` of them,
+/// together. Frames are thus decoded in batches only while the workers are behind, and a frame
+/// never waits for the next to be read (from a pipe, say).
 fn spawn_reader<R>(
     start_rx: Receiver<(R, threads::Pool)>,
     read_tx: ReadTx,
     recycle_rx: RecycleRx,
+    max_batch: usize,
 ) -> io::Result<JoinHandle<(R, threads::Pool)>>
 where
     R: Read + Send + 'static,
 {
-    use super::reader::frame::{parse_block, read_frame_into};
+    use super::reader::frame::read_frame_into;
 
     threads::spawn(move || {
         let (mut reader, pool) = start_rx
             .recv()
             .expect("the reader and the pool are sent once the thread runs");
+        let (work_tx, work_rx) = crossbeam_channel::unbounded::<Work>();
         while let Ok(mut buffer) = recycle_rx.recv() {
             // A panic of the inner reader is sent like a read error, and ends reading.
             let error = match worker::catch(|| read_frame_into(&mut reader, &mut buffer.buf)) {
@@ -608,15 +640,13 @@ where
             }
 
             let (buffered_tx, buffered_rx) = crossbeam_channel::bounded(1);
-
-            pool.spawn(move || {
-                let result = worker::catch(|| {
-                    parse_block(&buffer.buf, &mut buffer.block)?;
-                    worker::panic_if_marked(buffer.block.data().as_ref());
-                    Ok(buffer)
-                });
-                let _ = buffered_tx.send(result);
-            });
+            work_tx
+                .send((buffer, buffered_tx))
+                .expect("the queue's receiver lives on this thread");
+            // This job runs after the frame was queued, so the frame is decoded by it or by a
+            // job that ran before it.
+            let work_rx = work_rx.clone();
+            pool.spawn(move || decode_queued(&work_rx, max_batch));
 
             if read_tx.send(buffered_rx).is_err() {
                 break;
@@ -625,6 +655,53 @@ where
 
         (reader, pool)
     })
+}
+
+/// A pool job: decodes the frames queued for decoding, up to `max_batch` of them, together, and
+/// sends each its block (or its error, or the job's panic). It finds none when jobs before it
+/// took them.
+fn decode_queued(work_rx: &Receiver<Work>, max_batch: usize) {
+    use super::reader::frame::{parse_block, parse_blocks};
+
+    let mut batch: Vec<Work> = work_rx.try_iter().take(max_batch).collect();
+    if batch.is_empty() {
+        return;
+    }
+
+    let results = worker::catch(|| {
+        if let [(buffer, _)] = &mut batch[..] {
+            return vec![parse_block(&buffer.buf, &mut buffer.block)];
+        }
+        let (srcs, mut blocks): (Vec<&[u8]>, Vec<&mut Block>) = batch
+            .iter_mut()
+            .map(|(b, _)| (&b.buf[..], &mut b.block))
+            .unzip();
+        parse_blocks(&srcs, &mut blocks)
+    });
+
+    match results {
+        Ok(results) => {
+            for ((buffer, tx), result) in batch.into_iter().zip(results) {
+                let buffered = worker::catch(|| {
+                    result?;
+                    worker::panic_if_marked(buffer.block.data().as_ref());
+                    Ok(buffer)
+                });
+                let _ = tx.send(buffered);
+            }
+        }
+        // The decompression itself panicked: the first block re-raises it, and the others,
+        // which would be read after it, end with an error.
+        Err(p) => {
+            let mut txs = batch.into_iter().map(|(_, tx)| tx);
+            if let Some(tx) = txs.next() {
+                let _ = tx.send(Err(p));
+            }
+            for tx in txs {
+                let _ = tx.send(Ok(Err(job_ended_error())));
+            }
+        }
+    }
 }
 
 /// Waits for the blocks still being read and returns the first read error, or the first panic of
@@ -718,6 +795,141 @@ mod tests {
             });
         }
         Ok(())
+    }
+
+    #[test]
+    fn batches_read_as_single_blocks_do() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::bgzf::io::{Seek, raw};
+
+        // Many blocks, each of distinct data.
+        let data: Vec<u8> = (0..(1u32 << 19)).flat_map(u32::to_le_bytes).collect();
+        let mut writer = crate::bgzf::io::Writer::new(Vec::new());
+        writer.write_all(&data)?;
+        let good = writer.finish()?;
+
+        // Each frame's compressed and uncompressed start.
+        let mut starts = Vec::new();
+        let (mut cpos, mut upos) = (0, 0);
+        let mut src = &good[..];
+        let (mut frame, mut out) = (Vec::new(), Vec::new());
+        while raw::read_frame(&mut src, &mut frame)? {
+            raw::inflate_frame(&frame, &mut out)?;
+            starts.push((cpos, upos));
+            cpos += frame.len();
+            upos += out.len();
+        }
+        assert!(starts.len() > 20, "{} blocks", starts.len());
+
+        // A block whose data no longer matches its CRC, after ten good ones.
+        let (bad_cpos, bad_upos) = starts[10];
+        let mut bad = good.clone();
+        let crc_at = starts[11].0 - 8;
+        bad[crc_at] ^= 1;
+        assert!(bad_cpos < crc_at);
+
+        for workers in [1, 2, 4] {
+            for max_batch in [1, 3, 8] {
+                let what = format!("{workers} workers, batches of {max_batch}");
+                let workers = NonZero::new(workers).unwrap();
+                let reader = |data: &[u8]| {
+                    let mut r =
+                        MultithreadedReader::with_worker_count(workers, Cursor::new(data.to_vec()));
+                    r.max_batch = max_batch;
+                    r
+                };
+
+                let mut r = reader(&good);
+                let mut buf = Vec::new();
+                r.read_to_end(&mut buf)?;
+                assert!(buf == data, "{what}: read whole");
+
+                // Seeks to every other block, each followed by a short read, then a read
+                // across the rest of the stream.
+                for &(cpos, upos) in starts.iter().step_by(2) {
+                    let pos = VirtualPosition::try_from((cpos as u64, 0))?;
+                    r.seek_to_virtual_position(pos)?;
+                    let mut buf = vec![0; 1000];
+                    r.read_exact(&mut buf)?;
+                    assert!(buf == data[upos..upos + 1000], "{what}: at {cpos}");
+                }
+                let mut rest = Vec::new();
+                r.read_to_end(&mut rest)?;
+                let last = starts[starts.len() - 2].1 + 1000;
+                assert!(rest == data[last..], "{what}: the rest");
+
+                // The blocks before the damaged one, then its error.
+                let mut r = reader(&bad);
+                let mut buf = Vec::new();
+                let err = r
+                    .read_to_end(&mut buf)
+                    .expect_err("the damaged block fails");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}");
+                assert!(buf == data[..bad_upos], "{what}: the blocks before it");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A reader of the chunks sent to it, which waits for the next, as a pipe does, until the
+    /// sender is dropped.
+    struct Pipe {
+        rx: Receiver<Vec<u8>>,
+        chunk: Cursor<Vec<u8>>,
+    }
+
+    impl Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            loop {
+                let n = self.chunk.read(buf)?;
+                if n > 0 || buf.is_empty() {
+                    return Ok(n);
+                }
+                match self.rx.recv() {
+                    Ok(chunk) => self.chunk = Cursor::new(chunk),
+                    Err(_) => return Ok(0),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_read_do_not_wait_for_more_input() -> io::Result<()> {
+        use crate::bgzf::io::raw;
+
+        let mut writer = crate::bgzf::io::Writer::new(Vec::new());
+        writer.write_all(b"first")?;
+        writer.flush()?;
+        writer.write_all(b"second")?;
+        writer.flush()?;
+        let mut data = writer.finish()?;
+
+        // The first two blocks, then the end of the stream only once their data has been read.
+        let mut src = &data[..];
+        let mut frame = Vec::new();
+        assert!(raw::read_frame(&mut src, &mut frame)?);
+        assert!(raw::read_frame(&mut src, &mut frame)?);
+        let tail = data.split_off(data.len() - src.len());
+
+        within_timeout(move || -> io::Result<()> {
+            let (tx, rx) = crossbeam_channel::unbounded();
+            tx.send(data).expect("the pipe is open");
+            let pipe = Pipe {
+                rx,
+                chunk: Cursor::new(Vec::new()),
+            };
+            let mut reader = MultithreadedReader::with_worker_count(NonZero::new(2).unwrap(), pipe);
+            reader.max_batch = 8;
+            let mut buf = [0; 11];
+            reader.read_exact(&mut buf)?;
+            assert_eq!(&buf, b"firstsecond");
+            tx.send(tail).expect("the pipe is open");
+            drop(tx);
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest)?;
+            assert!(rest.is_empty());
+            Ok(())
+        })
     }
 
     #[test]

@@ -5,6 +5,10 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- pasta: `bgzf::io::writer::CompressionLevel::VARIANTS`, level 6, the default for VCF and BCF.
+
 ### Changed
 
 - pasta: CRAM 3.1 read names are compressed as HTSlib compresses them. The name tokenizer tries
@@ -14,6 +18,33 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   (samtools: 7.2 s), and the file is 4.7% smaller, 0.3% smaller than samtools'. The compressed
   bytes of CRAM output change. `Encoder::NameTokenizer` uses the settings of HTSlib's default
   level.
+- pasta compresses and decompresses DEFLATE (BGZF blocks, CRAM's gzip blocks) and computes CRC32
+  with zflate 1.0, a Rust port of libdeflate, in place of libdeflate: the build has no C code, and
+  the `libdeflate` feature is gone. On x86-64 (Xeon Gold 5418Y), reading BAM is 7–13% faster end
+  to end (`view`, `flagstat`, `index`).
+- BAM and compressed SAM are written at level 5 unless a level is given: 1.3–1.7 times as fast as
+  by 0.2.0, which wrote at libdeflate's level 6, and under 1% larger. VCF.gz and BCF, and
+  `ntools bgzip`'s output, are written at level 6 (`CompressionLevel::VARIANTS`, HTSlib's
+  zlib-style 5): 1.3–1.4 times as fast as at HTSlib's default, libdeflate's level 7, and 5%
+  larger. Given levels keep their meaning; `-O z6`, `-O b6` and `bgzip -l 6` give HTSlib's size.
+  `CompressionLevel::default()` is 5.
+- Library: `bgzf::io::writer::CompressionLevel` is on libdeflate's scale, 0 to 12, in every build.
+  Builds without the `libdeflate` feature took zlib's 0 to 9, so `CompressionLevel::new(9)`
+  there was the highest level and is now 9 of 12 (`CompressionLevel::BEST` is 12). The
+  `From<CompressionLevel>` conversions to `i32` and to libdeflater's level are removed; use
+  `CompressionLevel::get`.
+- A BGZF block that inflates to fewer bytes than its ISIZE, or a CRAM gzip block to fewer than
+  its size, is an error (`InvalidData`), as in HTSlib; such blocks were accepted when the CRC
+  matched (BGZF) or always (CRAM gzip).
+- Compressed bytes are zflate's, so `ntools bgzip` and saved CSI/TBI indexes no longer match
+  HTSlib's byte for byte; they decompress to the same data, in the same blocks.
+- On 64-bit Arm, the multithreaded BGZF reader's jobs each decode up to 8 queued blocks
+  together, and vtools' frame reader its chunks, with zflate's decoder that decodes two at a
+  time on one thread (`bgzf::io::raw::inflate_frames`); on an Apple M4 Pro, long-read BAMs
+  inflate about 25% faster than one block at a time. A block is queued as soon as it is read, so
+  blocks are batched only while the workers are behind, and none waits for the next to be read.
+  Elsewhere a job still takes one block. When the reader pauses (a seek, `get_mut`), the reader
+  thread stops at the blocks it has taken, rather than filling every free buffer first.
 
 ## [0.2.1] - 2026-11-05
 

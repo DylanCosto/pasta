@@ -14,8 +14,6 @@ for byte.
 cargo install --path vtools
 ```
 
-This builds `vtools` with libdeflate (the `libdeflate` feature, on by default).
-
 ## Commands
 
 | Command | bcftools equivalent | Notes |
@@ -117,6 +115,10 @@ bytes. So output cut short by a fatal error ends at a record, and index files (C
 
 Intentional differences:
 
+- BCF and VCF.gz are written at level 6 unless a level is given (`-O b5`/`-O z5` in HTSlib's
+  terms): 1.3–1.4 times as fast as bcftools' default, with files 5% larger; `-O b6`/`-O z6` gives
+  bcftools' size ([Compression](../README.md#compression)). Index files are written at level 5.
+  The compressed bytes are zflate's, not HTSlib's; they decompress to the same data.
 - `query -N` (`--disable-automatic-newline`) takes no value. bcftools declares the long form
   with a required argument, so `--disable-automatic-newline` swallows the next argument there.
 - `query -H` with `%LINE` prints no header, as bcftools intends; bcftools fails writing the empty
@@ -1100,10 +1102,11 @@ option). Deliberate differences, where bcftools has bugs:
 ## Performance
 
 Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) on 2026-11-04 against bcftools/HTSlib
-1.24, both with libdeflate at the same compression levels, as wall time: medians of 3 warm runs,
-and one run each on the cohort. Commands are single-threaded unless the row says `--threads`.
-`kg` is 1000 Genomes chr22 with 500 samples (1.1 M records), `giab` the one-sample GIAB HG002
-calls (4.0 M records), and the cohort rows use chr22 of the 3,202-sample 1000 Genomes 30x panel.
+1.24, both with libdeflate at the same compression levels (these are vtools 0.2.0's timings; vtools
+now compresses with zflate, at level 6 unless a level is given), as wall time: medians of 3 warm
+runs, and one run each on the cohort. Commands are single-threaded unless the row says `--threads`.
+`kg` is 1000 Genomes chr22 with 500 samples (1.1 M records), `giab` the one-sample GIAB HG002 calls
+(4.0 M records), and the cohort rows use chr22 of the 3,202-sample 1000 Genomes 30x panel.
 
 | Operation | bcftools (s) | vtools (s) | Speedup |
 |---|---:|---:|---:|

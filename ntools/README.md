@@ -9,8 +9,6 @@ produce the same results as samtools 1.24 while being faster, especially with th
 cargo install --path ntools
 ```
 
-This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
-
 ## Commands
 
 | Command | samtools equivalent | Notes |
@@ -49,7 +47,7 @@ This builds `ntools` with libdeflate (the `libdeflate` feature, on by default).
 | `cram-size` | `cram-size` | sizes by content ID and expanded compression method (gzip level, rANS order and transforms, ...), with the data series using each block; `-v`, `-e` (encodings), `-o` |
 | `reference` | `reference` | from `MD` tags (any input) or embedded CRAM references (`-e`); `-r` (indexed), `-q`, `-o` |
 | `rmdup` | `rmdup` | paired-end, `-s`, `-S`; libraries from `@RG` `LB`; single-end mode holds only the reads that can still be replaced |
-| `bgzip` | HTSlib's `bgzip` | compress (`-c`, `-k`, `-f`, `-o`, `-l`, `-@`, `--binary`), `-d`, `-t`, `-b`/`-s`, `-i`/`-I`, `-r`, `-g`, several files; blocks cut where HTSlib cuts them (65,280 bytes, ending at line ends for text, with header lines in blocks of their own), so `.gzi` indexes list the same uncompressed offsets; HTSlib's compression levels (its default, and its mapping onto libdeflate's levels); output names, overwrite prompts, timestamps, and exit statuses as in HTSlib |
+| `bgzip` | HTSlib's `bgzip` | compress (`-c`, `-k`, `-f`, `-o`, `-l`, `-@`, `--binary`), `-d`, `-t`, `-b`/`-s`, `-i`/`-I`, `-r`, `-g`, several files; blocks cut where HTSlib cuts them (65,280 bytes, ending at line ends for text, with header lines in blocks of their own), so `.gzi` indexes list the same uncompressed offsets; `-l` levels mapped as HTSlib maps them (without one, level 6; the bytes are zflate's, not HTSlib's); output names, overwrite prompts, timestamps, and exit statuses as in HTSlib |
 
 Region arguments (`view`, `depth -r`, `mpileup -r`, `coverage -r`, `stats`, `merge -R`, and the
 rest) are parsed as HTSlib's `hts_parse_region` parses them: `chr1:1,000-2,000`, `chr1:1k-2k`,
@@ -101,6 +99,10 @@ intentional differences.
 
 Intentional differences:
 
+- BGZF output (BAM, compressed SAM) is written at level 5 unless a level is given, and `bgzip`'s
+  at 6: faster than samtools' default, and a little larger
+  ([Compression](../README.md#compression)). The compressed bytes are zflate's, not HTSlib's;
+  they decompress to the same data.
 - `@PG` lines name ntools. Use `--no-PG` (or `-P` for `reheader`) for identical headers.
 - SAM text is read as HTSlib's `sam_parse1` reads it: an RNAME or RNEXT missing from the header
   (by `SN` or `AN`) is read as `*`, a record with no reference sequence, POS 0, or CIGAR `*`
@@ -388,7 +390,9 @@ Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) on 2026-11-04 against
 reads, "long" 9,784 nanopore reads with MM/ML tags) are medians of 5 warm runs; whole-genome rows
 (GIAB HG003 35x Illumina, HG002 PacBio Revio, HG003 ONT R10.4.1) are one run each, at `-@ 16`.
 `-@ N` adds N threads in both tools. The three `view ... ->SAM` rows were re-timed for ntools 0.2.1
-on 2026-11-05 against the same samtools times; no other row's code path changed.
+on 2026-11-05 against the same samtools times; no other row's code path changed. These are 0.2.x
+timings, with libdeflate; ntools now compresses with zflate
+([Compression](../README.md#compression)), which writes BAM faster.
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|

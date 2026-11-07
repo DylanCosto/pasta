@@ -10,9 +10,8 @@ pub mod bgzf;
 pub mod core;
 pub mod cram;
 pub mod csi;
+mod deflate;
 pub mod fasta;
-#[cfg(feature = "libdeflate")]
-mod libdeflate;
 pub mod pileup;
 pub mod sam;
 pub mod tabix;

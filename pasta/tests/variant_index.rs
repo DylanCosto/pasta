@@ -38,10 +38,10 @@ fn saved_indexes_have_htslib_blocks() {
     assert_eq!(block_sizes(&got), block_sizes(&want));
 }
 
-/// bcftools is built with libdeflate, whose output pasta matches only with libdeflate too.
+/// The same index data as bcftools writes, in the same blocks; the compressed bytes are
+/// zflate's, at pasta's default level, not libdeflate's.
 #[test]
-#[cfg(feature = "libdeflate")]
-fn saved_indexes_have_htslib_bytes() {
+fn saved_indexes_have_htslib_data() {
     // 50 records over 400 Mb, enough data for the compression level to show.
     for (name, fmt) in [
         ("scattered.vcf.gz.csi", IndexFormat::Csi),
@@ -49,11 +49,21 @@ fn saved_indexes_have_htslib_bytes() {
         ("far.vcf.gz.tbi", IndexFormat::Tbi),
     ] {
         let (got, want) = save_again(name, fmt);
+        assert_eq!(block_sizes(&got), block_sizes(&want), "{name}");
         assert!(
-            got == want,
-            "{name}: {} bytes, want {}",
-            got.len(),
-            want.len()
+            decompressed(&got) == decompressed(&want),
+            "{name}: the data differs from bcftools'"
         );
     }
+}
+
+/// A BGZF file's data.
+fn decompressed(data: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(data)
+        .read_to_end(&mut out)
+        .expect("the file decompresses");
+    out
 }

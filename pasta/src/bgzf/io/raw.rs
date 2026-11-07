@@ -31,6 +31,18 @@ pub fn inflate_frame(frame: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     frame::inflate_frame_into(frame, out)
 }
 
+/// Decompresses complete frames, each into its `out`, replacing its contents: the result of
+/// [`inflate_frame`] for each, decompressed together, which on 64-bit Arm overlaps two frames'
+/// decoding on one thread.
+///
+/// # Panics
+///
+/// If `frames` and `outs` differ in length.
+pub fn inflate_frames(frames: &[&[u8]], outs: &mut [&mut Vec<u8>]) -> Vec<io::Result<()>> {
+    assert_eq!(frames.len(), outs.len(), "one output per frame");
+    frame::inflate_frames_into(frames, outs)
+}
+
 /// Compresses `data` into a complete frame in `out`, replacing its contents.
 ///
 /// # Errors
@@ -41,7 +53,7 @@ pub fn deflate_frame(data: &[u8], level: CompressionLevel, out: &mut Vec<u8>) ->
     use crate::bgzf::deflate;
 
     let mut compressed = Vec::new();
-    let crc32 = deflate::encode(data, level.into(), &mut compressed)?;
+    let crc32 = deflate::encode(data, level, &mut compressed)?;
 
     out.clear();
     write_frame(out, &compressed, crc32, data.len())?;
@@ -99,6 +111,47 @@ mod tests {
         assert!(out.is_empty());
         assert!(is_eof_marker(&EOF_MARKER));
 
+        Ok(())
+    }
+
+    #[test]
+    fn frames_inflate_together_as_one_by_one() -> io::Result<()> {
+        let mut frames = Vec::new();
+        for (i, level) in [0, 1, 5, 6, 9, 12].into_iter().enumerate() {
+            let data: Vec<u8> = (0..65280u32)
+                .map(|j| ((j * (i as u32 + 3)) % 61) as u8)
+                .collect();
+            let mut frame = Vec::new();
+            deflate_frame(
+                &data,
+                CompressionLevel::new(level).expect("level"),
+                &mut frame,
+            )?;
+            frames.push(frame);
+        }
+        frames.push(EOF_MARKER.to_vec());
+        // A frame whose data no longer matches its CRC, one whose DEFLATE data is damaged, and
+        // one cut short.
+        let mut bad_crc = frames[2].clone();
+        let at = bad_crc.len() - 8;
+        bad_crc[at] ^= 1;
+        let mut bad_data = frames[3].clone();
+        bad_data[20] ^= 0xff;
+        let short = frames[4][..frames[4].len() - 3].to_vec();
+        frames.extend([bad_crc, bad_data, short, frames[1].clone()]);
+
+        let srcs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        let mut bufs = vec![Vec::new(); srcs.len()];
+        let mut outs: Vec<&mut Vec<u8>> = bufs.iter_mut().collect();
+        let results = inflate_frames(&srcs, &mut outs);
+        for (i, (result, src)) in results.into_iter().zip(&srcs).enumerate() {
+            let mut want = Vec::new();
+            match (result, inflate_frame(src, &mut want)) {
+                (Ok(()), Ok(())) => assert_eq!(bufs[i], want, "frame {i}"),
+                (Err(got), Err(want)) => assert_eq!(got.kind(), want.kind(), "frame {i}"),
+                (got, want) => panic!("frame {i}: {got:?} against {want:?}"),
+            }
+        }
         Ok(())
     }
 }

@@ -12,10 +12,6 @@ publish = false
 name = "ntools"
 path = "src/main.rs"
 
-[features]
-default = ["libdeflate"]
-libdeflate = ["pasta/libdeflate"]
-
 [dependencies]
 anyhow = "1.0.86"
 bstr.workspace = true

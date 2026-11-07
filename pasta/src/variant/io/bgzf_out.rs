@@ -28,7 +28,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use crate::{
     bgzf::io::{
         worker,
-        writer::{BGZF_EOF, CompressionLevel, CompressionLevelImpl, write_frame},
+        writer::{BGZF_EOF, CompressionLevel, write_frame},
     },
     util::threads,
 };
@@ -39,7 +39,7 @@ pub const BLOCK_SIZE: usize = 0xff00;
 /// Compresses a block into a complete BGZF frame.
 fn compress_frame(
     data: &[u8],
-    level: CompressionLevelImpl,
+    level: CompressionLevel,
     scratch: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -129,7 +129,7 @@ pub struct BlockWriter<W: Write + Send + 'static> {
     block: Vec<u8>,
     /// The number of the block being filled.
     block_no: u64,
-    level: CompressionLevelImpl,
+    level: CompressionLevel,
     mode: Mode<W>,
     /// `addresses[k]` is the compressed address of block `k`, for the blocks known so far.
     addresses: Vec<u64>,
@@ -141,19 +141,18 @@ impl<W: Write + Send + 'static> BlockWriter<W> {
     /// Creates a writer compressing at `level` on `threads` worker threads (0 compresses on the
     /// calling thread, as it does when the system cannot start any; it may start fewer).
     pub fn new(inner: W, level: CompressionLevel, threads: usize) -> Self {
-        let level_impl: CompressionLevelImpl = level.into();
         let mode = match NonZero::new(threads) {
             None => Mode::Single {
                 inner,
                 scratch: Vec::new(),
                 frame: Vec::new(),
             },
-            Some(n) => spawn(inner, level_impl, n),
+            Some(n) => spawn(inner, level, n),
         };
         Self {
             block: Vec::with_capacity(BLOCK_SIZE),
             block_no: 0,
-            level: level_impl,
+            level,
             mode,
             addresses: vec![0],
             failed_block: None,
@@ -507,7 +506,7 @@ fn join<W>(
 /// output is the same).
 fn spawn<W: Write + Send + 'static>(
     inner: W,
-    level: CompressionLevelImpl,
+    level: CompressionLevel,
     threads: NonZero<usize>,
 ) -> Mode<W> {
     let single = |inner| Mode::Single {

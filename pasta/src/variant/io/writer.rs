@@ -56,8 +56,10 @@ impl OutputType {
 pub struct WriteOptions {
     /// The output type.
     pub output_type: OutputType,
-    /// The zlib-style compression level, 0-9 (`None` for the default, 6), mapped to the
-    /// compressor's level as HTSlib maps it.
+    /// The zlib-style compression level, 0-9, mapped to the compressor's level as HTSlib maps
+    /// it; `None` for pasta's default, zflate's fast level 5 (see [`CompressionLevel`]).
+    ///
+    /// [`CompressionLevel`]: crate::bgzf::io::writer::CompressionLevel
     pub level: Option<u8>,
     /// BGZF compression threads (0 compresses on the calling thread).
     pub threads: usize,
@@ -324,14 +326,18 @@ impl std::fmt::Debug for Writer {
     }
 }
 
-/// The compression level HTSlib's `bgzf_compress` uses for a zlib-style level (`None` for the
-/// default, 6): with libdeflate, levels 1-9 map to libdeflate's `{1,2,3,5,6,7,8,10,12}`, so the
-/// default compresses at libdeflate's 7; 0 writes stored blocks.
+/// The compression level for a zlib-style level, as HTSlib's `bgzf_compress` maps it onto
+/// libdeflate's, which zflate keeps: 1-9 become `{1,2,3,5,6,7,8,10,12}`, and 0 writes stored
+/// blocks. Without a level (`None`), [`CompressionLevel::VARIANTS`], level 6, where HTSlib's
+/// default compresses at 7.
 pub(crate) fn htslib_level(level: Option<u8>) -> CompressionLevel {
-    let level = level.unwrap_or(6).min(9);
-    #[cfg(feature = "libdeflate")]
-    let level = [0, 1, 2, 3, 5, 6, 7, 8, 10, 12][usize::from(level)];
-    CompressionLevel::new(level).unwrap_or_default()
+    match level {
+        Some(level) => {
+            let level = [0, 1, 2, 3, 5, 6, 7, 8, 10, 12][usize::from(level.min(9))];
+            CompressionLevel::new(level).unwrap_or_default()
+        }
+        None => CompressionLevel::VARIANTS,
+    }
 }
 
 /// Standard output, written to its file descriptor without Rust's line buffering. Like

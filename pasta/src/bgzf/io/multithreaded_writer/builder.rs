@@ -122,7 +122,7 @@ impl Builder {
                 flushed_rx,
             },
             buf: BytesMut::new(),
-            compression_level: self.compression_level.into(),
+            compression_level: self.compression_level,
         })
     }
 }

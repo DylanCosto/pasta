@@ -16,7 +16,7 @@ use crossbeam_channel::{Receiver, Sender};
 pub use self::builder::Builder;
 use super::{
     worker,
-    writer::{CompressionLevelImpl, MAX_BUF_SIZE},
+    writer::{CompressionLevel, MAX_BUF_SIZE},
 };
 
 /// The result of compressing a block, or the panic of the job that compressed it.
@@ -66,7 +66,7 @@ where
     pool: crate::util::threads::Pool,
     state: State<W>,
     buf: BytesMut,
-    compression_level: CompressionLevelImpl,
+    compression_level: CompressionLevel,
 }
 
 impl<W> MultithreadedWriter<W>
@@ -335,7 +335,7 @@ where
     })
 }
 
-fn compress(src: &[u8], compression_level: CompressionLevelImpl) -> io::Result<FrameParts> {
+fn compress(src: &[u8], compression_level: CompressionLevel) -> io::Result<FrameParts> {
     use crate::bgzf::deflate;
 
     let mut dst = Vec::new();

@@ -2,8 +2,10 @@
 //! builds or uses their `.gzi` indexes.
 //!
 //! Blocks are cut where HTSlib cuts them (65280 bytes, ending at a line end for text, or as an
-//! index says for `-g`), so `.gzi` files list the same uncompressed offsets. Compression uses
-//! HTSlib's levels: its default (6) and its mapping of zlib levels onto libdeflate's.
+//! index says for `-g`), so `.gzi` files list the same uncompressed offsets. `-l` levels map onto
+//! zflate's as HTSlib maps zlib's onto libdeflate's; without one, level 6, the default for
+//! variant output. zflate's bytes differ from libdeflate's, so the output is not HTSlib's byte for
+//! byte; it decompresses to the same data.
 
 mod blocks;
 mod detect;
@@ -639,15 +641,16 @@ impl Bgzip {
     }
 }
 
-/// HTSlib's compression level for `-l`: its default (6) for -1, and libdeflate's level for each
-/// zlib level (`bgzf_compress`).
+/// The compression level for `-l`: each zlib level 0 to 9 as HTSlib maps it onto libdeflate's
+/// (`bgzf_compress`), which zflate keeps; -1, the default for the VCF and other text `bgzip`
+/// mostly compresses, [`CompressionLevel::VARIANTS`] (level 6).
 fn compression_level(level: i64) -> CompressionLevel {
-    let level = usize::try_from(level).unwrap_or(6);
-
-    #[cfg(feature = "libdeflate")]
+    let Ok(level) = usize::try_from(level) else {
+        return CompressionLevel::VARIANTS;
+    };
     let level = [0, 1, 2, 3, 5, 6, 7, 8, 10, 12][level];
 
-    CompressionLevel::new(level as u8).expect("levels 0 to 9 are valid")
+    CompressionLevel::new(level).expect("levels 0 to 12 are valid")
 }
 
 /// Compresses `src` as `bgzip` does without `-g`: text in blocks that end at line ends (and
@@ -1268,11 +1271,11 @@ mod tests {
     fn test_compression_level() {
         assert_eq!(compression_level(0), CompressionLevel::NONE);
 
-        #[cfg(feature = "libdeflate")]
-        {
-            assert_eq!(compression_level(-1).get(), 7);
-            assert_eq!(compression_level(9).get(), 12);
-        }
+        assert_eq!(compression_level(-1), CompressionLevel::VARIANTS);
+        assert_eq!(compression_level(-1).get(), 6);
+        assert_eq!(compression_level(4).get(), 5);
+        assert_eq!(compression_level(6).get(), 7);
+        assert_eq!(compression_level(9).get(), 12);
     }
 
     fn compress_text(text: &[u8]) -> io::Result<Vec<usize>> {

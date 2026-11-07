@@ -113,7 +113,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             .output_format
             .or_else(|| OutputFormat::from_path(&args.output))
             .unwrap_or(OutputFormat::Bam),
-        level: output::parse_level(args.output_format_options.level(6)?)?,
+        level: output::parse_level(args.output_format_options.level(output::default_level())?)?,
         threads: args.threads,
         reference: args.reference.clone(),
         cram: args.output_format_options.cram()?,

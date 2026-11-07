@@ -38,5 +38,5 @@ VariantKey (https://github.com/tecnickcom/variantkey)
 
 Release archives also contain licenses/, with the complete samtools, HTSlib, htscodecs,
 bcftools (which includes edlib's), and VariantKey licence texts, and THIRD_PARTY_LICENSES.txt, with the licence and
-notice files of every crate compiled into the binaries (among them libdeflate, which the default
-build bundles).
+notice files of every crate compiled into the binaries (among them zflate's, with libdeflate's
+licence, from which zflate derives).

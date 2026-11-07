@@ -13,7 +13,8 @@ use crate::bgzf::{BGZF_HEADER_SIZE, BGZF_MAX_ISIZE, VirtualPosition, gz};
 
 // The max DEFLATE overhead for 65536 bytes of data at compression level 0.
 //
-// For zlib (and derivatives) and libdeflate, this is 10 bytes; and for miniz_oxide, 15 bytes.
+// For zlib (and derivatives), libdeflate and zflate, this is 10 bytes; and for miniz_oxide, 15
+// bytes.
 pub(crate) const COMPRESSION_LEVEL_0_OVERHEAD: usize = 15;
 
 // The max size of the write buffer.
@@ -41,11 +42,6 @@ pub(crate) const BGZF_EOF: [u8; 28] = [
     0x00, 0x00, 0x00, 0x00, // ISIZE = 0
 ];
 
-#[cfg(feature = "libdeflate")]
-pub(crate) type CompressionLevelImpl = libdeflater::CompressionLvl;
-#[cfg(not(feature = "libdeflate"))]
-pub(crate) type CompressionLevelImpl = i32;
-
 /// A BZGF writer.
 ///
 /// This implements [`std::io::Write`], consuming uncompressed data and emitting compressed data.
@@ -71,7 +67,7 @@ where
     position: u64,
     staging_buf: Vec<u8>,
     compression_buf: Vec<u8>,
-    compression_level: CompressionLevelImpl,
+    compression_level: CompressionLevel,
     is_done: bool,
 }
 

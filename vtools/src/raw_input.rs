@@ -356,6 +356,14 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+/// Decompresses `frames`, each into its `data`: together, which on 64-bit Arm overlaps two
+/// frames' decoding on one thread ([`raw::inflate_frames`]).
+fn inflate_frames(frames: &mut [Frame]) -> Vec<io::Result<()>> {
+    let (raws, mut datas): (Vec<&[u8]>, Vec<&mut Vec<u8>>) =
+        frames.iter_mut().map(|f| (&f.raw[..], &mut f.data)).unzip();
+    raw::inflate_frames(&raws, &mut datas)
+}
+
 /// Reads BGZF frames in order and decompresses them, in batches on `threads` worker threads.
 pub struct InflatingReader<R: Read> {
     inner: R,
@@ -445,23 +453,14 @@ impl<R: Read> InflatingReader<R> {
             }
         }
         let results: Vec<io::Result<()>> = if self.threads == 0 || batch.len() < 2 {
-            batch
-                .iter_mut()
-                .map(|f| raw::inflate_frame(&f.raw, &mut f.data))
-                .collect()
+            inflate_frames(&mut batch)
         } else {
             let chunk = batch.len().div_ceil(self.threads);
             std::thread::scope(|s| {
                 // A chunk whose thread cannot be started is inflated here.
                 let handles: Vec<_> = batch
                     .chunks_mut(chunk)
-                    .map(|c| {
-                        threads::spawn_scoped_or_run(s, move || {
-                            c.iter_mut()
-                                .map(|f| raw::inflate_frame(&f.raw, &mut f.data))
-                                .collect::<Vec<_>>()
-                        })
-                    })
+                    .map(|c| threads::spawn_scoped_or_run(s, move || inflate_frames(c)))
                     .collect();
                 handles
                     .into_iter()

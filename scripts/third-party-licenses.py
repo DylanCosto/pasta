@@ -7,10 +7,10 @@ Reads `cargo metadata` for the workspace (Linux x86_64, default features), follo
 (non-dev, non-build) dependencies of ntools and vtools, and writes, for each crate, its name,
 version and licence expression, and every licence or notice file it ships: LICENSE*, LICENCE*,
 COPYING*, NOTICE*, UNLICENSE, and the same names one directory down, which is where `-sys`
-crates keep the C library they bundle (libdeflate's COPYING). A text identical to one already
+crates keep the C library they bundle (libbz2-rs-sys's, say). A text identical to one already
 written (apart from whitespace) is written once and referred to after that. Run it after
-`cargo build`, so the crates' sources are in Cargo's registry. Exits nonzero if a crate ships no
-licence file.
+`cargo build`, so the crates' sources are in Cargo's registry. Exits nonzero if a crate ships
+no licence file.
 """
 
 import json

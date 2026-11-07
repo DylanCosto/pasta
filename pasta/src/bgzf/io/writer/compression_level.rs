@@ -1,13 +1,14 @@
 use std::{error, fmt};
 
 const MIN: u8 = 0;
-
-#[cfg(feature = "libdeflate")]
 const MAX: u8 = 12;
-#[cfg(not(feature = "libdeflate"))]
-const MAX: u8 = 9;
 
-/// A DEFLATE compression level.
+/// A DEFLATE compression level, 0 to 12, on libdeflate's scale, which zflate keeps: HTSlib maps
+/// zlib's levels 1–9 onto its 1, 2, 3, 5, 6, 7, 8, 10 and 12.
+///
+/// The default is 5, zflate's fast level, chosen for pipelines: it writes BAM 1.3–1.7 times as
+/// fast as libdeflate's 6, under 1% larger. VCF and BCF compress worse at 5 (11–12% larger than
+/// HTSlib's default, libdeflate's 7), so variant output uses [`Self::VARIANTS`].
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CompressionLevel(u8);
 
@@ -20,6 +21,10 @@ impl CompressionLevel {
 
     /// A compression level optimized for compression rate.
     pub const BEST: Self = Self(MAX);
+
+    /// The default for VCF and BCF output, 6: HTSlib's zlib-style level 5. It writes them 1.3–1.4
+    /// times as fast as HTSlib's default (libdeflate's 7), with files 5% larger.
+    pub const VARIANTS: Self = Self(6);
 
     /// Creates a compression level.
     ///
@@ -49,7 +54,7 @@ impl CompressionLevel {
 
 impl Default for CompressionLevel {
     fn default() -> Self {
-        Self(6)
+        Self(5)
     }
 }
 
@@ -86,18 +91,10 @@ impl From<CompressionLevel> for u8 {
     }
 }
 
-#[cfg(feature = "libdeflate")]
-impl From<CompressionLevel> for libdeflater::CompressionLvl {
-    fn from(compression_level: CompressionLevel) -> Self {
-        // SAFETY: The raw value is guaranteed to be between MIN and MAX, inclusive.
-        Self::new(i32::from(u8::from(compression_level))).unwrap()
-    }
-}
-
-#[cfg(not(feature = "libdeflate"))]
-impl From<CompressionLevel> for i32 {
-    fn from(compression_level: CompressionLevel) -> Self {
-        i32::from(u8::from(compression_level))
+impl CompressionLevel {
+    /// The same level, as zflate takes it.
+    pub(crate) fn to_zflate(self) -> zflate::CompressionLevel {
+        zflate::CompressionLevel::new(self.0).expect("zflate takes levels 0 to 12")
     }
 }
 
@@ -107,6 +104,7 @@ mod tests {
 
     #[test]
     fn test_default() {
-        assert_eq!(CompressionLevel::default(), CompressionLevel(6));
+        assert_eq!(CompressionLevel::default(), CompressionLevel(5));
+        assert_eq!(CompressionLevel::BEST, CompressionLevel(12));
     }
 }

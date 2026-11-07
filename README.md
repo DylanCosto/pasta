@@ -23,16 +23,15 @@ pasta-v0.2.1-x86_64-linux/ntools --version
 The macOS binaries are not signed: after downloading the archive with a browser, run
 `xattr -d com.apple.quarantine pasta-v0.2.1-aarch64-macos.tar.gz` before unpacking it.
 
-To build from source, with Rust 1.91 or newer and a C compiler:
+To build from source, with Rust 1.91 or newer:
 
 ```sh
 cargo install --locked --path ntools
 cargo install --locked --path vtools
 ```
 
-The default build links libdeflate, which is C. `cargo build --release --no-default-features -p
-ntools -p vtools` builds without any C code; deflate then uses zlib-rs, which gives the same
-decompressed data but other compressed bytes.
+The build is pure Rust: DEFLATE (BGZF and CRAM's gzip blocks) and CRC32 go through
+[zflate](https://crates.io/crates/zflate), a Rust port of libdeflate ([Compression](#compression)).
 
 ## Usage
 
@@ -75,8 +74,9 @@ CRAM references come from.
 
 ## Performance
 
-The largest speedups, as wall time on a 24-vCPU Intel Xeon VM against samtools and bcftools 1.24
-(both with libdeflate), with the same threads in both tools:
+The largest speedups, as wall time on a 24-vCPU Intel Xeon VM against samtools and bcftools 1.24,
+with the same threads in both tools, measured with ntools and vtools 0.2.0, which used libdeflate
+as samtools and bcftools do (pasta now uses zflate: [Compression](#compression)):
 
 | Tool | Command | Input | samtools/bcftools | ntools/vtools | Speedup |
 |---|---|---|---:|---:|---:|
@@ -121,6 +121,24 @@ Each tool's README lists every option: [ntools](ntools/README.md#commands) and
 - Inputs: local files, standard input (`-`), pipes, and FIFOs. Remote names (`http://`, `s3://`,
   ...) are not opened; download such files first.
 
+## Compression
+
+BGZF blocks and CRAM's gzip blocks are compressed and decompressed, and their CRC32s computed, by
+[zflate](https://github.com/DylanCosto/zflate), a Rust port of libdeflate. Against 0.2.0, which used
+libdeflate, on an Intel Xeon Gold 5418Y:
+
+- BAM (and compressed SAM) is written at level 5 unless a level is given: 1.3–1.7 times as fast as
+  by ntools 0.2.0, which wrote at libdeflate's level 6, and under 1% larger.
+- VCF.gz and BCF, and `ntools bgzip`'s output, are written at level 6 (HTSlib's zlib-style 5):
+  1.3–1.4 times as fast as at HTSlib's default, libdeflate's level 7, and 5% larger. `-O z6`,
+  `-O b6` and `bgzip -l 6` give HTSlib's size.
+- Reading BAM is 7–13% faster end to end (`view`, `flagstat`, `index`).
+
+Given levels keep their meaning: they map onto libdeflate's scale, which zflate keeps, as HTSlib
+maps them, and CRAM's gzip blocks keep HTSlib's levels. The compressed bytes are zflate's, not
+HTSlib's, so `ntools bgzip` output and index files differ from HTSlib's byte for byte; they
+decompress to the same data.
+
 ## Platforms
 
 | Platform | Status |
@@ -131,7 +149,9 @@ Each tool's README lists every option: [ntools](ntools/README.md#commands) and
 | Windows | Not supported (ntools uses Unix-only APIs) |
 
 SIMD code (AVX2 for CRAM quality decoding and `vtools gtcheck`) is chosen at run time, with a
-portable fallback, and results do not depend on the platform: `vtools call -c` computes its
+portable fallback; so is zflate's (BMI2, PCLMULQDQ, VPCLMULQDQ and AVX-512 on x86_64; the CRC and
+PMULL instructions on arm64, where the multithreaded BGZF reader also decodes blocks two at a
+time). Results do not depend on the platform: `vtools call -c` computes its
 80-bit sums in software where there is no x87 unit, and BAQ keeps the quality of a base it is
 certain of everywhere (x86-64 samtools sets it to 0, arm64 samtools keeps it).
 

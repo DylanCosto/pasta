@@ -54,7 +54,7 @@ pub struct Args {
     output_format: Option<OutputFormat>,
 
     /// BGZF compression level for BAM output.
-    #[arg(short = 'l', default_value_t = 6)]
+    #[arg(short = 'l', default_value_t = output::default_level())]
     level: u8,
 
     /// Sort unaligned reads by minimiser (samtools' -M), which ntools does not support.

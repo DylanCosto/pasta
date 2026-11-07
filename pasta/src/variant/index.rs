@@ -4,8 +4,8 @@
 //!
 //! Indexes built here have the same bins, chunks, linear indexes, and per-contig counts as
 //! HTSlib's, and list each target's bins in the order of HTSlib's hash table, and are saved in
-//! HTSlib's BGZF blocks at its compression level, so an index of the same data file has the
-//! same bytes.
+//! HTSlib's BGZF blocks, so an index of the same data file has the same data as HTSlib's, block
+//! for block. Its compressed bytes are zflate's, at pasta's default level, not libdeflate's.
 
 mod khash;
 pub mod tabix;
@@ -726,7 +726,8 @@ impl Index {
     // ---- reading and writing ----
 
     /// Writes the index as `fmt` to a BGZF-compressed file (HTSlib's `hts_idx_save_as`), in
-    /// HTSlib's blocks at its default level, so the file has the same bytes as HTSlib's.
+    /// HTSlib's blocks at pasta's default level: the same data as HTSlib's file, block for
+    /// block, in zflate's compressed bytes.
     ///
     /// # Errors
     ///

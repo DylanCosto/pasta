@@ -119,7 +119,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
     let write_options = WriteOptions {
         format: args.output_format,
-        level: output::parse_level(args.output_format_options.level(6)?)?,
+        level: output::parse_level(args.output_format_options.level(output::default_level())?)?,
         threads: args.threads,
         reference: args.reference.clone(),
         cram: args.output_format_options.cram()?,

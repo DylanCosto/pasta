@@ -154,6 +154,89 @@ pub(crate) fn inflate_frame_into(src: &[u8], out: &mut Vec<u8>) -> io::Result<()
     inflate(cdata, crc32, out)
 }
 
+/// [`parse_block`] for several frames, each into its block, inflating their data together with
+/// zflate's batch decoder ([`deflate::decode_batch`]): each result is what `parse_block` gives
+/// that frame.
+///
+/// [`deflate::decode_batch`]: crate::bgzf::deflate::decode_batch
+pub(crate) fn parse_blocks(srcs: &[&[u8]], blocks: &mut [&mut Block]) -> Vec<io::Result<()>> {
+    let parsed = srcs
+        .iter()
+        .zip(blocks.iter_mut())
+        .map(|(src, block)| {
+            let (block_size, cdata, crc32, isize) = parse_frame(src)?;
+            block_initialize(block, block_size, isize);
+            Ok((cdata, crc32))
+        })
+        .collect();
+    let mut dsts: Vec<&mut [u8]> = blocks.iter_mut().map(|b| b.data_mut().as_mut()).collect();
+    inflate_parsed(parsed, &mut dsts)
+}
+
+/// [`inflate_frame_into`] for several frames, each into its `out`, inflating their data
+/// together as [`parse_blocks`] does: each result is what `inflate_frame_into` gives that frame.
+pub(crate) fn inflate_frames_into(
+    srcs: &[&[u8]],
+    outs: &mut [&mut Vec<u8>],
+) -> Vec<io::Result<()>> {
+    let parsed = srcs
+        .iter()
+        .zip(outs.iter_mut())
+        .map(|(src, out)| {
+            let (_, cdata, crc32, isize) = parse_frame(src)?;
+            out.clear();
+            out.resize(isize, 0);
+            Ok((cdata, crc32))
+        })
+        .collect();
+    let mut dsts: Vec<&mut [u8]> = outs.iter_mut().map(|o| &mut o[..]).collect();
+    inflate_parsed(parsed, &mut dsts)
+}
+
+/// Inflates the data of the frames that parsed (their DEFLATE data and CRC) together, each
+/// into its `dst`, and checks their CRCs, as [`inflate`] does for one; a frame that did not
+/// parse keeps its error.
+fn inflate_parsed(
+    parsed: Vec<io::Result<(&[u8], u32)>>,
+    dsts: &mut [&mut [u8]],
+) -> Vec<io::Result<()>> {
+    use crate::bgzf::deflate;
+
+    let mut srcs = Vec::with_capacity(parsed.len());
+    let mut outs = Vec::with_capacity(parsed.len());
+    for (frame, dst) in parsed.iter().zip(dsts.iter_mut()) {
+        if let Ok((cdata, _)) = frame {
+            srcs.push(*cdata);
+            outs.push(&mut **dst);
+        }
+    }
+    let inflated = deflate::decode_batch(&srcs, &mut outs);
+    drop(outs);
+
+    let mut inflated = match inflated {
+        Ok(results) => results.into_iter(),
+        Err(e) => {
+            // The decompressor could not be allocated: every frame fails with that error.
+            let error = || io::Error::new(e.kind(), e.to_string());
+            return parsed
+                .into_iter()
+                .map(|frame| frame.and(Err(error())))
+                .collect();
+        }
+    };
+    parsed
+        .into_iter()
+        .zip(dsts.iter())
+        .map(|(frame, dst)| {
+            let (_, crc32) = frame?;
+            inflated
+                .next()
+                .expect("a result for each frame that parsed")?;
+            check_crc32(dst, crc32)
+        })
+        .collect()
+}
+
 fn parse_frame(src: &[u8]) -> io::Result<(u64, &[u8], u32, usize)> {
     let (header, cdata, trailer) = split_frame(src)?;
 
@@ -178,8 +261,13 @@ fn inflate(src: &[u8], expected_crc32: u32, dst: &mut [u8]) -> io::Result<()> {
     use crate::bgzf::deflate;
 
     deflate::decode(src, dst)?;
+    check_crc32(dst, expected_crc32)
+}
 
-    let actual_crc32 = deflate::crc32(dst);
+fn check_crc32(data: &[u8], expected_crc32: u32) -> io::Result<()> {
+    use crate::bgzf::deflate;
+
+    let actual_crc32 = deflate::crc32(data);
 
     if actual_crc32 == expected_crc32 {
         Ok(())

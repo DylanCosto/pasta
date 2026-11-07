@@ -12,10 +12,6 @@ publish = false
 name = "vtools"
 path = "src/main.rs"
 
-[features]
-default = ["libdeflate"]
-libdeflate = ["pasta/libdeflate"]
-
 [dependencies]
 anyhow = "1.0.86"
 clap = { version = "4.5.0", features = ["derive", "wrap_help"] }

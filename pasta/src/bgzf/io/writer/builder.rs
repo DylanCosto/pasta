@@ -11,7 +11,7 @@ pub struct Builder {
 impl Builder {
     /// Sets a compression level.
     ///
-    /// By default, the compression level is set to level 6.
+    /// By default, the compression level is 5 (see [`CompressionLevel`]).
     ///
     /// # Examples
     ///
@@ -44,7 +44,7 @@ impl Builder {
             position: 0,
             staging_buf: Vec::with_capacity(MAX_BUF_SIZE),
             compression_buf: Vec::new(),
-            compression_level: self.compression_level.into(),
+            compression_level: self.compression_level,
             is_done: false,
         }
     }

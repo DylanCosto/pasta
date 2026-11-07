@@ -38,9 +38,6 @@ use crate::{
     source::{self, Format},
 };
 
-/// The BGZF compression level htslib uses by default (zlib's).
-const DEFAULT_LEVEL: u8 = 6;
-
 /// The region name samtools uses for unplaced, unmapped records.
 const UNMAPPED_REGION: &str = "*";
 
@@ -952,7 +949,7 @@ fn write_options(
         Some(level) => level,
         None if args.uncompressed => 0,
         None if args.fast => 1,
-        None => DEFAULT_LEVEL,
+        None => output::default_level(),
     };
 
     Ok(WriteOptions {
