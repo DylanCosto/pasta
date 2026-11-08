@@ -414,7 +414,6 @@ where
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_releasing_file_releases_what_it_has_read() -> io::Result<()> {
         use std::{fs, os::unix::fs::MetadataExt};
@@ -438,7 +437,7 @@ mod tests {
 
         assert_eq!(read, data);
 
-        // Some filesystems cannot punch holes; the file is then only read.
+        // Only Linux punches holes, and not on every filesystem; elsewhere the file is only read.
         if file.releasing {
             let metadata = fs::metadata(&path)?;
             assert_eq!(metadata.len(), data.len() as u64);
