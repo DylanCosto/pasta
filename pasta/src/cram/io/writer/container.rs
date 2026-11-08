@@ -41,6 +41,8 @@ fn remove_regenerated_md_nm(
     }
 
     let mut reference_sequence = None;
+    // The MD string of each record in turn.
+    let mut md = Vec::new();
 
     for record in records
         .iter_mut()
@@ -66,7 +68,13 @@ fn remove_regenerated_md_nm(
         }
 
         if let Some((_, sequence, len)) = &reference_sequence {
-            record.remove_regenerated_md_nm((**sequence).as_ref(), *len, store_md, store_nm);
+            record.remove_regenerated_md_nm(
+                (**sequence).as_ref(),
+                *len,
+                store_md,
+                store_nm,
+                &mut md,
+            );
         }
     }
 

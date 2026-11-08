@@ -11,13 +11,15 @@ mod parallel;
 pub(crate) mod record;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, Write},
     mem,
     ops::Range,
     sync::Arc,
     thread,
 };
+
+use rustc_hash::FxHashMap;
 
 use crate::bam;
 use crate::fasta;
@@ -32,7 +34,7 @@ use self::{
 };
 pub(crate) use self::{
     context::Context,
-    record::{Record, ReferenceBases},
+    record::{ReadGroups, Record, ReferenceBases},
 };
 use crate::cram::FileDefinition;
 
@@ -58,28 +60,6 @@ pub(crate) fn get_reference_sequence(
     Ok(sequence)
 }
 
-/// Returns `get_reference_sequence` for the records of a container: as
-/// [`get_reference_sequence`], remembering the last sequence, since a container's records are
-/// usually on one.
-fn reference_sequence_lookup<'a>(
-    repository: &'a fasta::Repository,
-    missing_names: &'a mut HashSet<Vec<u8>>,
-) -> impl FnMut(&[u8]) -> io::Result<Option<Arc<fasta::record::Sequence>>> + 'a {
-    let mut last: Option<(Vec<u8>, Option<Arc<fasta::record::Sequence>>)> = None;
-
-    move |name| {
-        if let Some((last_name, sequence)) = &last
-            && last_name == name
-        {
-            return Ok(sequence.clone());
-        }
-
-        let sequence = get_reference_sequence(repository, missing_names, name)?;
-        last = Some((name.to_vec(), sequence.clone()));
-        Ok(sequence)
-    }
-}
-
 fn is_coordinate_sorted(header: &sam::Header) -> bool {
     use crate::sam::header::record::value::map::header::{sort_order::COORDINATE, tag::SORT_ORDER};
 
@@ -89,6 +69,18 @@ fn is_coordinate_sorted(header: &sam::Header) -> bool {
         .map(|sort_order| sort_order == COORDINATE)
         .unwrap_or_default()
 }
+
+/// A file header whose missing reference sequence checksums are calculated on another thread
+/// (see [`Writer::write_header`]), and the containers written meanwhile, in order.
+#[derive(Debug)]
+struct PendingHeader {
+    header: thread::JoinHandle<io::Result<sam::Header>>,
+    buf: Vec<u8>,
+}
+
+/// The most bytes of containers held while the file header is pending: past this, writing waits
+/// for the header.
+const MAX_PENDING_LEN: usize = 256 << 20;
 
 /// The reference sequences a writer used (see [`Writer::use_reference_sequence`]).
 #[derive(Debug, Default)]
@@ -163,7 +155,7 @@ struct Batch {
     bam_records: Vec<u8>,
     /// The reference sequences of the records, by ID, kept loaded until the container is
     /// encoded.
-    reference_sequences: HashMap<usize, Option<Arc<fasta::record::Sequence>>>,
+    reference_sequences: FxHashMap<usize, Option<Arc<fasta::record::Sequence>>>,
     /// The reference sequence ID of the last record, once there is one.
     last_reference_sequence_id: Option<Option<usize>>,
     /// Whether the records are on more than one reference sequence (or unmapped and not).
@@ -185,7 +177,7 @@ impl Batch {
         let mut batch = Self {
             records: vec![Pending::Converted; records.len()],
             bam_records: Vec::new(),
-            reference_sequences: HashMap::new(),
+            reference_sequences: FxHashMap::default(),
             ..Default::default()
         };
 
@@ -204,7 +196,7 @@ impl Batch {
             records: Vec::with_capacity(records),
             converted: Vec::with_capacity(self.converted.len()),
             bam_records: Vec::with_capacity(self.bam_records.len()),
-            reference_sequences: HashMap::new(),
+            reference_sequences: FxHashMap::default(),
             last_reference_sequence_id: None,
             has_many_reference_sequences: false,
         }
@@ -242,17 +234,32 @@ impl Batch {
 }
 
 /// Converts the records of a container.
-fn convert(ctx: &Context, header: &sam::Header, batch: Batch) -> io::Result<Vec<Record>> {
+/// Converts the records of `batch` not converted yet, on the batch's reference sequences, which
+/// the caller holds (`reference_sequences`) while the container is encoded.
+fn convert(
+    header: &sam::Header,
+    batch: Batch,
+    reference_sequences: &FxHashMap<usize, Option<Arc<fasta::record::Sequence>>>,
+) -> io::Result<Vec<Record>> {
     if batch.converted.len() == batch.records.len() {
         return Ok(batch.converted);
     }
 
-    let mut missing_names = HashSet::new();
-    let mut get_reference_sequence =
-        reference_sequence_lookup(&ctx.reference_sequence_repository, &mut missing_names);
+    // The records' reference sequences are borrowed rather than each record cloning (and dropping)
+    // one: workers counting references to the same sequence would contend for its cache line.
+    let get_reference_sequence = |name: &[u8]| {
+        let sequence = header
+            .reference_sequences()
+            .get_index_of(name)
+            .and_then(|id| reference_sequences.get(&id))
+            .and_then(|sequence| sequence.as_deref());
+
+        Ok(sequence)
+    };
 
     let mut converted = batch.converted.into_iter();
     let mut bam_record = bam::Record::default();
+    let mut read_groups = ReadGroups::default();
 
     batch
         .records
@@ -262,7 +269,12 @@ fn convert(ctx: &Context, header: &sam::Header, batch: Batch) -> io::Result<Vec<
             Pending::Bam(range) => {
                 bam_record.0.clear();
                 bam_record.0.extend_from_slice(&batch.bam_records[range]);
-                Record::try_from_alignment_record(header, &bam_record, &mut get_reference_sequence)
+                Record::try_from_bam_record(
+                    header,
+                    &bam_record,
+                    &mut read_groups,
+                    get_reference_sequence,
+                )
             }
         })
         .collect()
@@ -324,6 +336,14 @@ where
     record_counter: u64,
     /// Reference sequences the repository lacks.
     missing_reference_sequence_names: HashSet<Vec<u8>>,
+    /// The file header while its reference sequence checksums are calculated (see
+    /// [`Self::write_header`]).
+    pending_header: Option<PendingHeader>,
+    /// The reference sequence of the last record converted on this thread, by name, as
+    /// consecutive records are usually on the same one.
+    last_reference_sequence: Option<(Vec<u8>, Option<Arc<fasta::record::Sequence>>)>,
+    /// The read group of the last record converted on this thread.
+    read_groups: ReadGroups,
     /// The reference sequences used so far.
     reference_sequences: ReferenceSequences,
     /// The workers that encode containers, if any; without them, this thread does.
@@ -384,6 +404,8 @@ where
     /// ```
     pub fn into_inner(mut self) -> W {
         self.unfinished_header = None;
+        // A file header still being completed is written, as far as it can be.
+        let _ = self.write_pending_header(true);
         self.inner.take().expect("the writer has its inner writer")
     }
 }
@@ -431,14 +453,11 @@ where
 
         self.flush(header)?;
 
-        if let Some(workers) = &mut self.workers {
-            let inner = self
-                .inner
-                .as_mut()
-                .expect("the writer has its inner writer");
-            let result = workers.advance(inner, self.compressor.as_mut(), 0);
-            self.check(result)?;
+        if self.workers.is_some() {
+            self.advance_workers(0)?;
         }
+
+        self.write_pending_header(true)?;
 
         write_eof_container(self.get_mut())
     }
@@ -485,12 +504,15 @@ where
     /// # Ok::<(), io::Error>(())
     /// ```
     pub fn write_file_header(&mut self, header: &sam::Header) -> io::Result<()> {
+        let threads = self.workers.as_ref().map_or(1, Workers::thread_count);
+
         write_file_header(
             self.inner
                 .as_mut()
                 .expect("the writer has its inner writer"),
             &self.context.reference_sequence_repository,
             header,
+            threads,
         )?;
 
         self.unfinished_header = Some(header.clone());
@@ -515,20 +537,110 @@ where
     /// # Ok::<_, io::Error>(())
     /// ```
     pub fn write_header(&mut self, header: &sam::Header) -> io::Result<()> {
-        let file_definition = FileDefinition::new(self.context.version, Default::default());
+        use crate::sam::header::record::value::map::reference_sequence::tag;
 
-        write_header(
-            self.inner
-                .as_mut()
-                .expect("the writer has its inner writer"),
-            &self.context.reference_sequence_repository,
-            &file_definition,
-            header,
-        )?;
+        let file_definition = FileDefinition::new(self.context.version, Default::default());
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("the writer has its inner writer");
+
+        let lacks_checksums = header
+            .reference_sequences()
+            .values()
+            .any(|map| !map.other_fields().contains_key(&tag::MD5_CHECKSUM));
+
+        match &self.workers {
+            // The checksums, which for a large reference take long to calculate, are calculated on
+            // another thread while the workers encode the first containers.
+            Some(workers) if lacks_checksums => {
+                write_file_definition(inner, &file_definition)?;
+
+                let repository = self.context.reference_sequence_repository.clone();
+                let threads = workers.thread_count();
+                let mut pending = header.clone();
+                let releases_sequences = is_coordinate_sorted(header);
+
+                let handle =
+                    thread::Builder::new()
+                        .name("cram-checksums".into())
+                        .spawn(move || {
+                            header::add_missing_reference_sequence_checksums(
+                                &repository,
+                                pending.reference_sequences_mut(),
+                                releases_sequences,
+                                threads,
+                            )?;
+
+                            Ok(pending)
+                        })?;
+
+                self.pending_header = Some(PendingHeader {
+                    header: handle,
+                    buf: Vec::new(),
+                });
+            }
+            _ => {
+                let threads = self.workers.as_ref().map_or(1, Workers::thread_count);
+                write_header(
+                    inner,
+                    &self.context.reference_sequence_repository,
+                    &file_definition,
+                    header,
+                    threads,
+                )?;
+            }
+        }
 
         self.unfinished_header = Some(header.clone());
 
         Ok(())
+    }
+
+    /// Writes the pending file header (see [`Self::write_header`]) and the containers written
+    /// since, once its checksums are calculated, or waiting for them if `wait`.
+    fn write_pending_header(&mut self, wait: bool) -> io::Result<()> {
+        let Some(pending) = &self.pending_header else {
+            return Ok(());
+        };
+
+        if !wait && !pending.header.is_finished() && pending.buf.len() < MAX_PENDING_LEN {
+            return Ok(());
+        }
+
+        let pending = self.pending_header.take().expect("a header is pending");
+
+        let header = pending
+            .header
+            .join()
+            .map_err(|_| io::Error::other("the reference checksum thread panicked"))??;
+
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("the writer has its inner writer");
+
+        header::write_header_container(inner, &header)?;
+        inner.write_all(&pending.buf)
+    }
+
+    /// Writes the containers the workers have finished, keeping at most `max` in flight.
+    fn advance_workers(&mut self, max: usize) -> io::Result<()> {
+        let workers = self.workers.as_mut().expect("the writer has workers");
+
+        let result = match &mut self.pending_header {
+            Some(pending) => workers.advance(&mut pending.buf, self.compressor.as_mut(), max),
+            None => workers.advance(
+                self.inner
+                    .as_mut()
+                    .expect("the writer has its inner writer"),
+                self.compressor.as_mut(),
+                max,
+            ),
+        };
+
+        let result = result.and_then(|()| self.write_pending_header(false));
+        self.check(result)
     }
 
     /// Writes a CRAM record.
@@ -587,7 +699,34 @@ where
         record: &bam::Record,
     ) -> io::Result<()> {
         if self.workers.is_none() {
-            return self.write_alignment_record(header, record);
+            if self.failed {
+                return Err(failed());
+            }
+
+            let repository = &self.context.reference_sequence_repository;
+            let missing_names = &mut self.missing_reference_sequence_names;
+            let last = &mut self.last_reference_sequence;
+
+            // The last sequence is borrowed, not cloned, for each record.
+            let record =
+                Record::try_from_bam_record(header, record, &mut self.read_groups, |name| {
+                    if last
+                        .as_ref()
+                        .is_none_or(|(last_name, _)| last_name[..] != name[..])
+                    {
+                        let sequence = get_reference_sequence(repository, missing_names, name)?;
+                        *last = Some((name.to_vec(), sequence));
+                    }
+
+                    let last: &_ = last;
+                    Ok(last.as_ref().and_then(|(_, sequence)| sequence.as_deref()))
+                })?;
+
+            let read_length = record.read_length;
+            self.start_record(header, record.reference_sequence_id)?;
+            self.use_reference_sequence(header, record.reference_sequence_id)?;
+            self.batch.push(record);
+            return self.record_added(header, read_length);
         }
 
         if self.failed {
@@ -740,18 +879,13 @@ where
             self.bases = 0;
 
             let max = workers.capacity();
-            let inner = self
-                .inner
-                .as_mut()
-                .expect("the writer has its inner writer");
-            let result = workers.advance(inner, self.compressor.as_mut(), max);
-            return self.check(result);
+            return self.advance_workers(max);
         }
 
         let next = self.batch.next(self.records_per_container);
         let mut batch = mem::replace(&mut self.batch, next);
         let reference_sequences = mem::take(&mut batch.reference_sequences);
-        let mut records = convert(&self.context, header, batch)?;
+        let mut records = convert(header, batch, &reference_sequences)?;
 
         let result = write_container(
             self.inner
@@ -2073,7 +2207,10 @@ mod tests {
             .build_from_writer(Failing);
         writer.unfinished_header = Some(header.clone());
         writer.batch.push(
-            Record::try_from_alignment_record(&header, &unmapped_record(0), |_| Ok(None)).unwrap(),
+            Record::try_from_alignment_record(&header, &unmapped_record(0), |_| {
+                Ok(None::<&fasta::record::Sequence>)
+            })
+            .unwrap(),
         );
 
         // Neither the pending container nor the EOF container can be written; dropping does not

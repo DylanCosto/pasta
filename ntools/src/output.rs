@@ -406,6 +406,87 @@ impl HeaderReference {
     }
 }
 
+/// The bases read at a time to calculate a reference sequence checksum.
+const CHECKSUM_PART_LEN: u64 = 1 << 22;
+
+/// Calculates the `M5` checksums of the sequences `wanted` (header index, name, and length) of
+/// the indexed FASTA `path`, in order, on up to `threads` threads, each reading with its own
+/// reader a part of a sequence at a time.
+fn reference_checksums(
+    path: &Path,
+    wanted: &[(usize, Vec<u8>, u64)],
+    threads: usize,
+) -> io::Result<Vec<[u8; 16]>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pasta::{core::Region, fasta};
+
+    let checksum = |reader: &mut fasta::io::IndexedReader<_>, name: &[u8], length: u64| {
+        let mut digest = cram::NormalizedSequenceDigest::new();
+        let mut start = 0;
+
+        while start < length {
+            let end = (start + CHECKSUM_PART_LEN).min(length);
+            let position = |n: u64| {
+                usize::try_from(n)
+                    .ok()
+                    .and_then(pasta::core::Position::new)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid length"))
+            };
+            let region = Region::new(name.to_vec(), position(start + 1)?..=position(end)?);
+            let record = reader.query(&region)?;
+            digest.update(record.sequence().as_ref());
+            start = end;
+        }
+
+        Ok::<_, io::Error>(digest.finalize())
+    };
+
+    let next = AtomicUsize::new(0);
+
+    // Each thread's checksums, by index in `wanted`.
+    type Checksums = Vec<(usize, [u8; 16])>;
+
+    let results: Vec<io::Result<Checksums>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads.min(wanted.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut reader =
+                        fasta::io::indexed_reader::Builder::default().build_from_path(path)?;
+                    let mut checksums = Vec::new();
+
+                    loop {
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+
+                        let Some((_, name, length)) = wanted.get(k) else {
+                            break;
+                        };
+
+                        checksums.push((k, checksum(&mut reader, name, *length)?));
+                    }
+
+                    Ok(checksums)
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a checksum thread does not panic"))
+            .collect()
+    });
+
+    let mut checksums = vec![[0; 16]; wanted.len()];
+
+    for result in results {
+        for (k, checksum) in result? {
+            checksums[k] = checksum;
+        }
+    }
+
+    Ok(checksums)
+}
+
 /// See [`CramReference::Given`].
 pub struct GivenReference {
     /// The reference FASTA's absolute path (`UR`), as HTSlib makes it (without resolving links).
@@ -414,6 +495,8 @@ pub struct GivenReference {
     path: PathBuf,
     /// Whether `M5` fields are replaced with the reference's checksums (`ignore_md5`).
     replaces_md5: bool,
+    /// The threads to calculate checksums on.
+    threads: usize,
 }
 
 impl GivenReference {
@@ -428,19 +511,26 @@ impl GivenReference {
     /// read back with this reference. (HTSlib keeps them, writing a header that does not
     /// describe the reference the records are stored against.)
     ///
-    /// Each sequence is read only for its checksum and not kept (the writer's repository loads
-    /// the ones records need), so one sequence at a time is in memory.
+    /// Missing `M5` fields are added by the CRAM writer, which calculates them while it takes
+    /// records. The checksums that replace given ones are calculated here: each sequence is read
+    /// only for its checksum and not kept, a part at a time, on up to `threads` threads at once,
+    /// each with its own reader.
     fn annotate(&self, header: &sam::Header) -> io::Result<sam::Header> {
-        use pasta::{core::Region, fasta};
+        use pasta::fasta;
         use sam::header::record::value::map::reference_sequence::tag;
 
         let mut header = header.clone();
         let mut missing = false;
-        let mut reader =
-            fasta::io::indexed_reader::Builder::default().build_from_path(&self.path)?;
+        let reader = fasta::io::indexed_reader::Builder::default().build_from_path(&self.path)?;
 
-        for (name, reference_sequence) in header.reference_sequences_mut() {
+        // The sequences to calculate checksums of, by their header index, with their lengths, and
+        // whether the reference has each sequence.
+        let mut wanted = Vec::new();
+        let mut present = Vec::new();
+
+        for (i, (name, reference_sequence)) in header.reference_sequences().iter().enumerate() {
             let length = reader.index().get(name).map(|record| record.length());
+            present.push(length.is_some());
 
             if let Some(length) = length
                 && u64::try_from(reference_sequence.length().get()).ok() != Some(length)
@@ -451,22 +541,35 @@ impl GivenReference {
                 );
             }
 
+            let fields = reference_sequence.other_fields();
+
+            // The writer adds missing checksums, while it takes records; checksums given are
+            // calculated here only to replace them.
+            if let Some(length) = length
+                && fields.contains_key(&tag::MD5_CHECKSUM)
+                && self.replaces_md5
+            {
+                wanted.push((i, name.to_vec(), length));
+            }
+        }
+
+        drop(reader);
+
+        let checksums = reference_checksums(&self.path, &wanted, self.threads.max(1))?;
+        let mut checksums = wanted.iter().map(|(i, _, _)| *i).zip(checksums).peekable();
+
+        for (i, (name, reference_sequence)) in
+            header.reference_sequences_mut().iter_mut().enumerate()
+        {
             let fields = reference_sequence.other_fields_mut();
 
             // A replaced checksum keeps its place.
-            if !fields.contains_key(&tag::MD5_CHECKSUM) || (self.replaces_md5 && length.is_some()) {
-                if length.is_some() {
-                    let record = reader.query(&Region::new(name.to_vec(), ..))?;
-                    let sequence = record.sequence().as_ref();
-                    let checksum = cram::calculate_normalized_sequence_digest(sequence);
-                    let hex: String = checksum.iter().map(|b| format!("{b:02x}")).collect();
-                    fields.insert(tag::MD5_CHECKSUM, hex.into());
-                } else {
-                    eprintln!(
-                        "[W::cram_get_ref] Reference file given, but ref '{name}' not present"
-                    );
-                    missing = true;
-                }
+            if let Some((_, checksum)) = checksums.next_if(|(j, _)| *j == i) {
+                let hex: String = checksum.iter().map(|b| format!("{b:02x}")).collect();
+                fields.insert(tag::MD5_CHECKSUM, hex.into());
+            } else if !fields.contains_key(&tag::MD5_CHECKSUM) && !present[i] {
+                eprintln!("[W::cram_get_ref] Reference file given, but ref '{name}' not present");
+                missing = true;
             }
 
             fields.insert(tag::URI, self.uri.clone().into());
@@ -551,6 +654,7 @@ impl FormatWriter {
                                 .into_owned(),
                             path: path.clone(),
                             replaces_md5: options.cram.ignore_md5,
+                            threads: options.threads,
                         }),
                     ),
                     None => {

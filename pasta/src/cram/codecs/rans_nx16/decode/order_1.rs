@@ -314,6 +314,12 @@ mod tests {
                 let src = &src[..len];
                 let encoded = encode(Flags::ORDER | Flags::N32, src)?;
                 assert_eq!(super::super::decode(&encoded, len)?, src, "len = {len}");
+
+                // Bytes that code no smaller are stored as they are.
+                if Flags::from(encoded[0]).contains(Flags::CAT) {
+                    continue;
+                }
+
                 assert_eq!(decode_scalar(&encoded, len)?, src, "len = {len}");
 
                 // The decoder reads the stream to its end, so a truncated one runs out of input.

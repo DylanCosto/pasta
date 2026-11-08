@@ -4,6 +4,7 @@ pub mod aac;
 pub(crate) mod bzip2;
 pub(crate) mod fqzcomp;
 pub(crate) mod gzip;
+mod histogram;
 pub(crate) mod lzma;
 pub(crate) mod name_tokenizer;
 pub mod rans_4x8;

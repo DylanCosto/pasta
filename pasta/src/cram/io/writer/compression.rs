@@ -184,7 +184,8 @@ const TRIALS: i32 = 3;
 const MAX_FAILS: i32 = 4;
 const MAX_DELTA: f64 = 0.20;
 
-/// rANS Nx16 interleaves 32 states for blocks at least this large (HTSlib's `SIMD_AUTO`).
+/// rANS Nx16 interleaves 32 states for blocks at least this large, unless they are striped
+/// (HTSlib's `SIMD_AUTO`).
 const RANS_32_STATE_MIN_LEN: usize = 50_000;
 
 const fn bit(method: usize) -> u32 {
@@ -782,7 +783,7 @@ fn encode(
             let mut flags =
                 rans_nx16::Flags::from_bits_truncate(pr_flags(method, RANS_PR0, RANS_PR1));
 
-            if src.len() >= RANS_32_STATE_MIN_LEN {
+            if src.len() >= RANS_32_STATE_MIN_LEN && !flags.contains(rans_nx16::Flags::STRIPE) {
                 flags.insert(rans_nx16::Flags::N32);
             }
 

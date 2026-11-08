@@ -1,18 +1,13 @@
 mod convert;
+mod data;
 mod feature;
 mod md_nm;
 
 use crate::core::Position;
-use crate::sam::{
-    self as sam,
-    alignment::{
-        record::{MappingQuality, data::field::Tag},
-        record_buf::data::field::Value,
-    },
-};
-use bstr::BString;
+use crate::sam::{self as sam, alignment::record::MappingQuality};
 
-pub(crate) use self::convert::{push_mismatches, read_length};
+pub(crate) use self::convert::{ReadGroups, push_mismatches, read_length};
+pub(crate) use self::data::Data;
 pub use self::feature::Feature;
 use crate::cram::record::{Flags, MateFlags};
 
@@ -37,21 +32,39 @@ pub struct Record {
     pub(crate) read_length: usize,
     pub(crate) alignment_start: Option<Position>,
     pub(crate) read_group_id: Option<usize>,
-    pub(crate) name: Option<BString>,
     pub(crate) mate_flags: MateFlags,
     pub(crate) mate_reference_sequence_id: Option<usize>,
     pub(crate) mate_alignment_start: Option<Position>,
     pub(crate) template_length: i32,
     pub(crate) mate_distance: Option<usize>,
-    pub(crate) data: Vec<(Tag, Value)>,
+    pub(crate) data: Data,
     pub(crate) features: Vec<Feature>,
     pub(crate) reference_bases: ReferenceBases,
     pub(crate) mapping_quality: Option<MappingQuality>,
-    pub(crate) sequence: Vec<u8>,
-    pub(crate) quality_scores: Vec<u8>,
+    /// The bases, the quality scores, then the name, in one allocation.
+    pub(crate) bases: Vec<u8>,
+    /// The length of the bases in `bases`.
+    pub(crate) sequence_len: usize,
+    /// The length of the name at the end of `bases`, if there is one.
+    pub(crate) name_len: Option<usize>,
 }
 
 impl Record {
+    /// The read's bases (empty if missing).
+    pub(crate) fn sequence(&self) -> &[u8] {
+        &self.bases[..self.sequence_len]
+    }
+
+    /// The read's quality scores, one for each base of the read length.
+    pub(crate) fn quality_scores(&self) -> &[u8] {
+        &self.bases[self.sequence_len..self.bases.len() - self.name_len.unwrap_or(0)]
+    }
+
+    pub(crate) fn name(&self) -> Option<&[u8]> {
+        self.name_len
+            .map(|len| &self.bases[self.bases.len() - len..])
+    }
+
     pub fn alignment_span(&self) -> usize {
         calculate_alignment_span(self.read_length, &self.features)
     }
@@ -72,8 +85,8 @@ impl Record {
         self.reference_bases = ReferenceBases::Verbatim;
 
         // A missing sequence (`*`) has no aligned bases to store.
-        if !self.sequence.is_empty() {
-            self.features = verbatim_features(&self.features, &self.sequence);
+        if !self.sequence().is_empty() {
+            self.features = verbatim_features(&self.features, self.sequence());
         }
     }
 }

@@ -38,20 +38,34 @@ pub(super) fn build_tag_sets(records: &[Record]) -> TagSets {
     let mut tag_sets = Vec::new();
 
     for record in records {
-        let set = record
-            .data
-            .iter()
-            .map(|(tag, value)| Key::new(*tag, value.ty()))
-            .collect();
+        if find_tag_set(&tag_sets, record).is_none() {
+            let set = record
+                .data
+                .iter()
+                .map(|field| Key::new(field.tag, field.ty))
+                .collect();
 
-        if tag_sets.iter().any(|s| s == &set) {
-            continue;
-        } else {
             tag_sets.push(set);
         }
     }
 
     tag_sets
+}
+
+/// Returns the index of the record's tag set (its tags and their types, in order) in
+/// `tag_sets`, without collecting it.
+pub(crate) fn find_tag_set(tag_sets: &TagSets, record: &Record) -> Option<usize> {
+    use crate::cram::container::compression_header::preservation_map::tag_sets::Key;
+
+    tag_sets.iter().position(|set| {
+        let mut fields = record.data.iter();
+
+        set.iter().all(|key| {
+            fields
+                .next()
+                .is_some_and(|field| *key == Key::new(field.tag, field.ty))
+        }) && fields.next().is_none()
+    })
 }
 
 #[cfg(test)]

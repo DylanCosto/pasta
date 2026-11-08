@@ -7,13 +7,17 @@ use crate::cram::{
 
 const CHUNK_COUNT: NonZero<usize> = NonZero::new(4).unwrap();
 
-pub(super) fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
+/// The flags a chunk is coded with in turn, of those of the striped stream, as htscodecs codes
+/// them; it keeps the first that codes smallest.
+const CHUNK_FLAGS: [Flags; 4] = [Flags::ORDER, Flags::RLE, Flags::PACK, Flags::empty()];
+
+pub(super) fn encode(flags: Flags, src: &[u8]) -> io::Result<Vec<u8>> {
     let uncompressed_sizes = build_uncompressed_sizes(src.len(), CHUNK_COUNT);
     let uncompressed_chunks = transpose(src, &uncompressed_sizes);
 
     let compressed_chunks: Vec<_> = uncompressed_chunks
-        .into_iter()
-        .map(|chunk| super::encode(Flags::NO_SIZE, &chunk))
+        .iter()
+        .map(|chunk| encode_chunk(flags, chunk))
         .collect::<io::Result<_>>()?;
 
     let mut dst = Vec::new();
@@ -22,6 +26,24 @@ pub(super) fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
     dst.extend(compressed_chunks.into_iter().flatten());
 
     Ok(dst)
+}
+
+fn encode_chunk(flags: Flags, chunk: &[u8]) -> io::Result<Vec<u8>> {
+    let mut best: Option<Vec<u8>> = None;
+
+    for chunk_flags in CHUNK_FLAGS {
+        if !flags.contains(chunk_flags) {
+            continue;
+        }
+
+        let data = super::encode(chunk_flags | Flags::NO_SIZE | (flags & Flags::N32), chunk)?;
+
+        if best.as_ref().is_none_or(|best| data.len() < best.len()) {
+            best = Some(data);
+        }
+    }
+
+    Ok(best.expect("chunks are always coded with order 0"))
 }
 
 // § 3.6 "Striped rANS Nx16" (2023-03-15): "The uncompressed data length may not necessary be an
@@ -77,7 +99,7 @@ mod tests {
     #[test]
     fn test_encode() -> io::Result<()> {
         let src = b"ndls";
-        let actual = encode(src)?;
+        let actual = encode(Flags::STRIPE, src)?;
 
         let expected = [
             0x04, // chunk count = 4

@@ -5,6 +5,40 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- pasta: `cram::NormalizedSequenceDigest`, which calculates the `M5` checksum of a reference
+  sequence (`calculate_normalized_sequence_digest`) over its parts, given in turn.
+
+### Changed
+
+- pasta: CRAM is written as fast as samtools writes it single-threaded, faster with threads, and
+  no larger. On GIAB HG003 chr20 (1.1 GB BAM, GRCh38), `ntools view -C` writes CRAM 3.1 in 56.7 s
+  against samtools' 63.9 s single-threaded (0.9.0: 85.5 s), and in 3.9 s against 12.3 s at
+  `-@ 16` (0.9.0: 16.7 s); CRAM 3.0 in 57.0 s against 56.8 s, and 4.0 s against 12.2 s. On the
+  whole 35x genome (44 GB BAM) at `-@ 16`, CRAM 3.1 takes 160.9 s against 223.9 s (0.9.0:
+  270 s), with 8% less CPU time than samtools. The files are within 0.05% of samtools' size
+  (0.9.0's CRAM 3.1 was 5% larger), and samtools reads them back to the same records.
+  - The read-name tokenizer is htscodecs' `tok3` encoder: each name is encoded against the name
+    htscodecs picks (found with a trie, as htscodecs does), the prefix of a format it recognizes
+    (Illumina, Ion Torrent, Oxford Nanopore, PacBio) is one token, and the token streams are laid
+    out as htscodecs lays them out. rANS 4x8 and Nx16 normalize frequencies as htscodecs does,
+    store data that does not compress as it is, and code the parts of a striped stream with the
+    method that suits each. Given the same data, rANS and read-name blocks come out byte for byte
+    as HTSlib 1.24 writes them.
+  - Tags are stored as HTSlib stores them, from the BAM record's own bytes: fixed-size values
+    without a length each, strings ended by a tab.
+  - The `M5` checksums of a header's `@SQ` lines that lack them are calculated on all `-@` threads
+    while records are encoded, reading each sequence a part at a time where the reference is
+    indexed. MD5 is pasta's own, about 10% faster than the `md-5` crate, which pasta no longer
+    depends on.
+  - The rANS coders, the record conversion, and the slice encoder allocate and branch less.
+    Records borrow their reference sequence instead of each counting a reference to it, on which
+    the threads contended.
+  The compressed bytes of CRAM output change.
+- ntools: writing CRAM no longer calculates the reference's `M5` checksums before the first
+  record; the CRAM writer does, alongside the records.
+
 ## [0.9.0] - 2026-11-08
 
 ### Added

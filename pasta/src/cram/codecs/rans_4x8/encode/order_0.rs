@@ -1,8 +1,11 @@
 use std::io::{self, Write};
 
-use super::{header, state_renormalize, state_step, write_header, write_states};
+use super::{EncodingSymbol, ReverseWriter, header, write_header, write_states};
 use crate::cram::{
-    codecs::rans_4x8::{ALPHABET_SIZE, LOWER_BOUND, Order, STATE_COUNT},
+    codecs::{
+        histogram,
+        rans_4x8::{ALPHABET_SIZE, LOWER_BOUND, Order, STATE_COUNT},
+    },
     io::writer::num::{write_itf8, write_u8},
 };
 
@@ -15,21 +18,31 @@ pub fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
     let frequencies = normalize_frequencies(&raw_frequencies);
     let cumulative_frequencies = build_cumulative_frequencies(&frequencies);
 
-    let mut buf = Vec::new();
+    let mut symbols = [EncodingSymbol::default(); ALPHABET_SIZE];
+
+    for ((symbol, &f), &g) in symbols
+        .iter_mut()
+        .zip(&frequencies)
+        .zip(&cumulative_frequencies)
+    {
+        if f > 0 {
+            *symbol = EncodingSymbol::new(f, g);
+        }
+    }
+
+    let mut buf = ReverseWriter::for_symbols(src.len());
     let mut states = [LOWER_BOUND; STATE_COUNT];
 
     for (i, &sym) in src.iter().enumerate().rev() {
         let state = &mut states[i % STATE_COUNT];
-        let j = usize::from(sym);
-        *state = state_renormalize(*state, frequencies[j], &mut buf)?;
-        *state = state_step(*state, frequencies[j], cumulative_frequencies[j]);
+        *state = symbols[usize::from(sym)].put(*state, &mut buf);
     }
 
     let mut dst = vec![0; header::SIZE];
 
     write_frequencies(&mut dst, &frequencies)?;
     write_states(&mut dst, &states)?;
-    dst.extend(buf.iter().rev());
+    dst.extend(buf.as_slice());
 
     let compressed_size = dst[header::SIZE..].len();
     // SAFETY: `dst.len() >= header::SIZE`.
@@ -88,66 +101,57 @@ where
 }
 
 fn build_raw_frequencies(src: &[u8]) -> RawFrequencies {
-    let mut frequencies = [0; ALPHABET_SIZE];
-
-    for &b in src {
-        let i = usize::from(b);
-        frequencies[i] += 1;
-    }
-
-    frequencies
+    histogram::order_0(src)
 }
 
+/// The total that normalized frequencies are scaled to (htscodecs' `TOTFREQ`). They add up to one
+/// less, 4095 (§ 2.1 "Frequency table").
+pub(super) const TOTAL: u32 = 1 << 12;
+
+/// 0.98 in 1.31 fixed point (htscodecs').
+const SCALE_98: u64 = 2_104_533_975;
+
+/// Normalizes `raw_frequencies` to add up to 4095 as htscodecs' `rans_compress_O0` does, so that
+/// the output is the same: each is scaled by [`TOTAL`] over their sum in 1.31 fixed point, rounded
+/// down but kept above 0, and the most frequent symbol (the first, if several) takes up the
+/// difference, unless that would take more than half of it, when all are scaled by 0.98 first.
 pub(super) fn normalize_frequencies(raw_frequencies: &RawFrequencies) -> Frequencies {
-    // § 2.1 "Frequency table" (2023-03-15): "The total sum of symbol frequencies are normalised to
-    // add up to 4095."
-    const SCALING_FACTOR: u16 = 4095;
+    let len: u64 = raw_frequencies.iter().map(|&f| u64::from(f)).sum();
 
-    let (max_index, sum) = describe_frequencies(raw_frequencies);
-
-    if sum == 0 {
+    if len == 0 {
         return [0; ALPHABET_SIZE];
     }
 
-    let mut normalized_frequencies = [0; ALPHABET_SIZE];
-    let mut normalized_sum = 0;
+    let mut scale = (u64::from(TOTAL) << 31) / len + (1 << 30) / len;
+    let mut frequencies = *raw_frequencies;
 
-    for (&f, g) in raw_frequencies.iter().zip(&mut normalized_frequencies) {
-        if f == 0 {
+    loop {
+        let (mut sum, mut max, mut max_index) = (1, 0, 0);
+
+        for (i, f) in frequencies.iter_mut().enumerate().filter(|(_, f)| **f > 0) {
+            if *f > max {
+                (max, max_index) = (*f, i);
+            }
+
+            // At most `TOTAL`.
+            *f = ((u64::from(*f) * scale) >> 31).max(1) as u32;
+            sum += *f;
+        }
+
+        let f = &mut frequencies[max_index];
+
+        if sum < TOTAL {
+            *f += TOTAL - sum;
+        } else if sum - TOTAL > *f / 2 {
+            scale = SCALE_98;
             continue;
+        } else {
+            *f -= sum - TOTAL;
         }
 
-        let normalized_frequency = f * u32::from(SCALING_FACTOR) / sum;
-        // SAFETY: `normalized_frequency <= SCALING_FACTOR`.
-        *g = (normalized_frequency as u16).max(1);
-
-        normalized_sum += *g;
+        // Each is at most `TOTAL` - 1.
+        return frequencies.map(|f| f as u16);
     }
-
-    if normalized_sum < SCALING_FACTOR {
-        normalized_frequencies[max_index] += SCALING_FACTOR - normalized_sum;
-    } else if normalized_sum > SCALING_FACTOR {
-        normalized_frequencies[max_index] -= normalized_sum - SCALING_FACTOR;
-    }
-
-    normalized_frequencies
-}
-
-fn describe_frequencies(raw_frequencies: &[u32]) -> (usize, u32) {
-    let mut max = u32::MIN;
-    let mut max_index = 0;
-    let mut sum = 0;
-
-    for (i, &f) in raw_frequencies.iter().enumerate() {
-        if f >= max {
-            max = f;
-            max_index = i;
-        }
-
-        sum += f;
-    }
-
-    (max_index, sum)
 }
 
 pub(super) fn build_cumulative_frequencies(frequencies: &Frequencies) -> CumulativeFrequencies {

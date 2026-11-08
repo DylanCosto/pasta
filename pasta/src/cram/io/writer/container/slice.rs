@@ -1,7 +1,9 @@
 mod header;
 pub mod records;
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{io, sync::Arc};
+
+use rustc_hash::FxHashMap;
 
 use crate::core::Position;
 use crate::fasta;
@@ -181,17 +183,32 @@ pub(super) fn get_reference_sequence_context(records: &[Record]) -> ReferenceSeq
 fn set_mates(records: &mut [Record]) {
     assert!(!records.is_empty());
 
-    let mut indices = HashMap::new();
+    let is_paired = |record: &Record| {
+        let flags = record.bam_flags;
+        flags.is_segmented() && !flags.is_secondary() && !flags.is_supplementary()
+    };
+
+    // For each paired record, the next one with its name, which it is paired with: going back
+    // from the last record, each is paired with the one after it last seen.
+    let mut next_with_name = vec![None; records.len()];
+    let mut indices: FxHashMap<Option<&[u8]>, usize> =
+        FxHashMap::with_capacity_and_hasher(records.len(), Default::default());
+
+    for (i, record) in records.iter().enumerate().rev() {
+        if is_paired(record) {
+            next_with_name[i] = indices.insert(record.name(), i);
+        }
+    }
+
+    drop(indices);
+
     let mut i = records.len() - 1;
 
     loop {
         let record = &mut records[i];
-        let flags = record.bam_flags;
 
-        if flags.is_segmented() && !flags.is_secondary() && !flags.is_supplementary() {
-            let name = record.name.as_ref().map(|name| name.to_owned());
-
-            if let Some(j) = indices.insert(name, i) {
+        if is_paired(record) {
+            if let Some(j) = next_with_name[i] {
                 let mid = i + 1;
                 let (left, right) = records.split_at_mut(mid);
 
@@ -354,12 +371,12 @@ fn compress_core_data_block(
         .iter()
         .all(|record| {
             record.cram_flags.quality_scores_are_stored_as_array()
-                && !record.quality_scores.is_empty()
+                && !record.quality_scores().is_empty()
         })
         .then(|| {
             records
                 .iter()
-                .map(|record| record.quality_scores.len())
+                .map(|record| record.quality_scores().len())
                 .collect()
         });
 
@@ -512,7 +529,8 @@ mod tests {
             reference_sequence_id: Some(0),
             read_length: 10,
             alignment_start: Position::new(start),
-            name: Some("r".into()),
+            bases: b"r".to_vec(),
+            name_len: Some(1),
             mate_reference_sequence_id: Some(0),
             mate_alignment_start: Position::new(mate_start),
             template_length,

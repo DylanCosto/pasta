@@ -3,6 +3,8 @@ mod encoding;
 mod preservation_map;
 mod tag_encodings;
 
+pub(crate) use self::preservation_map::find_tag_set;
+
 use std::io::{self, Write};
 
 use self::{
