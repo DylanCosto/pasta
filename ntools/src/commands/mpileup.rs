@@ -4,8 +4,6 @@
 //! [`crate::pileup`] and the BAQ port in [`crate::baq`]. Each input is read on its own thread,
 //! and reads are filtered and realigned (BAQ) in batches across the `-@` threads, keeping their
 //! order; samtools does this work on one thread.
-//!
-//! Not supported: `--output-mods` (`-M`).
 
 use std::{
     collections::HashSet,
@@ -215,7 +213,7 @@ pub struct Args {
     #[arg(short = '6', long = "illumina1.3+")]
     illumina13: bool,
 
-    /// Output base modifications (not supported).
+    /// Output base modifications (MM and ML tags) after their bases.
     #[arg(short = 'M', long = "output-mods")]
     output_mods: bool,
 

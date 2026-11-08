@@ -59,11 +59,18 @@ impl Block {
                 CompressionMethod::AdaptiveArithmeticCoding,
                 aac::encode(*flags, src)?,
             ),
-            // An encoder chosen by the caller carries no level: HTSlib's default.
-            Some(Encoder::NameTokenizer) => (
-                CompressionMethod::NameTokenizer,
-                name_tokenizer::encode(src, compression::DEFAULT_LEVEL)?,
-            ),
+            // An encoder chosen by the caller carries no level: HTSlib's default. Names the
+            // tokenizer cannot code, with more tokens than decoders accept, are gzipped instead.
+            Some(Encoder::NameTokenizer) => {
+                match name_tokenizer::encode(src, compression::DEFAULT_LEVEL) {
+                    Ok(buf) => (CompressionMethod::NameTokenizer, buf),
+                    Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        let level = flate2::Compression::new(u32::from(compression::DEFAULT_LEVEL));
+                        (CompressionMethod::Gzip, gzip::encode(level, src)?)
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             // fqzcomp needs record boundaries; the slice writer encodes quality scores with it.
             Some(Encoder::Fqzcomp) => {
                 return Err(io::Error::new(
@@ -180,6 +187,28 @@ mod tests {
         ];
 
         assert_eq!(buf, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_name_tokenizer_falls_back_to_gzip() -> io::Result<()> {
+        use crate::cram::codecs::gzip;
+
+        // Each "a1" is two tokens: 64 of them are more than decoders accept.
+        let names = "a1".repeat(64) + "\0";
+        let block = Block::encode(
+            ContentType::ExternalData,
+            0,
+            Some(&Encoder::NameTokenizer),
+            names.as_bytes(),
+        )?;
+
+        assert_eq!(block.compression_method, CompressionMethod::Gzip);
+
+        let mut decoded = vec![0; names.len()];
+        gzip::decode(&block.src, &mut decoded)?;
+        assert_eq!(decoded, names.as_bytes());
 
         Ok(())
     }

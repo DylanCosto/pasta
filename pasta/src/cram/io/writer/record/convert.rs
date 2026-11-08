@@ -250,27 +250,34 @@ impl Parts<'_> {
     }
 }
 
-/// The last read group looked up in a header by name, as consecutive records usually share it.
+/// The index of the last read group found by name, as consecutive records usually share it.
 #[derive(Debug, Default)]
 pub(crate) struct ReadGroups {
-    /// The header (its address), the name, and the read group's index.
-    last: Option<(usize, Vec<u8>, Option<usize>)>,
+    last: Option<usize>,
 }
 
 impl ReadGroups {
     /// The index in `header` of the read group named `name`.
+    ///
+    /// The last index found is checked against `header` rather than trusted, as records may come
+    /// with another header.
     fn get(&mut self, header: &sam::Header, name: &[u8]) -> Option<usize> {
-        let header_address = std::ptr::from_ref(header).addr();
+        let read_groups = header.read_groups();
 
-        if let Some((address, last_name, id)) = &self.last
-            && *address == header_address
-            && last_name[..] == name[..]
+        if let Some(id) = self.last
+            && read_groups
+                .get_index(id)
+                .is_some_and(|(last_name, _)| last_name[..] == name[..])
         {
-            return *id;
+            return Some(id);
         }
 
-        let id = header.read_groups().get_index_of(name);
-        self.last = Some((header_address, name.to_vec(), id));
+        let id = read_groups.get_index_of(name);
+
+        if id.is_some() {
+            self.last = id;
+        }
+
         id
     }
 }
@@ -653,6 +660,22 @@ mod tests {
         }
 
         data
+    }
+
+    #[test]
+    fn test_read_groups_follow_the_header() -> Result<(), Box<dyn std::error::Error>> {
+        let a: sam::Header = "@RG\tID:x\n@RG\tID:y\n".parse()?;
+        let b: sam::Header = "@RG\tID:y\n@RG\tID:x\n".parse()?;
+        let mut read_groups = ReadGroups::default();
+
+        assert_eq!(read_groups.get(&a, b"y"), Some(1));
+        // The same name in another header, at another index.
+        assert_eq!(read_groups.get(&b, b"y"), Some(0));
+        assert_eq!(read_groups.get(&b, b"x"), Some(1));
+        assert_eq!(read_groups.get(&b, b"z"), None);
+        assert_eq!(read_groups.get(&a, b"x"), Some(0));
+
+        Ok(())
     }
 
     #[test]
