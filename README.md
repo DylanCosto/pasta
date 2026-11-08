@@ -16,12 +16,12 @@ binaries, with SHA-256 checksums, for Linux x86_64 (`x86_64-linux`; glibc 2.28 o
 Ubuntu 18.10 and later) and macOS on Apple silicon (`aarch64-macos`):
 
 ```sh
-tar -xzf pasta-v0.2.1-x86_64-linux.tar.gz
-pasta-v0.2.1-x86_64-linux/ntools --version
+tar -xzf pasta-v0.9.0-x86_64-linux.tar.gz
+pasta-v0.9.0-x86_64-linux/ntools --version
 ```
 
 The macOS binaries are not signed: after downloading the archive with a browser, run
-`xattr -d com.apple.quarantine pasta-v0.2.1-aarch64-macos.tar.gz` before unpacking it.
+`xattr -d com.apple.quarantine pasta-v0.9.0-aarch64-macos.tar.gz` before unpacking it.
 
 To build from source, with Rust 1.91 or newer:
 
@@ -75,8 +75,9 @@ CRAM references come from.
 ## Performance
 
 The largest speedups, as wall time on a 24-vCPU Intel Xeon VM against samtools and bcftools 1.24,
-with the same threads in both tools, measured with ntools and vtools 0.2.0, which used libdeflate
-as samtools and bcftools do (pasta now uses zflate: [Compression](#compression)):
+with the same threads in both tools. The ntools rows were measured with ntools 0.2.0, which
+compressed with libdeflate as samtools does, and the vtools rows with vtools 0.9.0, which
+compresses with zflate, at a lower level by default ([Compression](#compression)):
 
 | Tool | Command | Input | samtools/bcftools | ntools/vtools | Speedup |
 |---|---|---|---:|---:|---:|
@@ -85,10 +86,11 @@ as samtools and bcftools do (pasta now uses zflate: [Compression](#compression))
 | ntools | `flagstat -@ 16` | HG003 35x Illumina, whole genome (14 GB CRAM 3.1) | 30.4 s | 7.6 s | 4.02x |
 | ntools | `stats -@ 16` | HG003 35x Illumina, whole genome (44 GB BAM) | 1,441 s | 554 s | 2.60x |
 | ntools | `view` CRAM to BAM `-@ 16` | HG003 ONT R10.4.1, whole genome (69 GB CRAM) | 746 s | 445 s | 1.67x |
-| vtools | `view` VCF.gz to VCF `--threads 4` | 1000 Genomes chr22, 500 samples | 19.6 s | 1.6 s | 12.23x |
-| vtools | `concat` 4 chunks `-Ob` | 1000 Genomes chr22, 500 samples | 8.2 s | 0.7 s | 11.94x |
-| vtools | `view` VCF.gz to BCF `--threads 4` | 1000 Genomes chr22, 3,202 samples | 67.3 s | 13.2 s | 5.09x |
-| vtools | `merge -Ob --threads 4` | 1000 Genomes chr22, 3,202 samples (sample halves) | 72.4 s | 29.9 s | 2.43x |
+| vtools | `stats -s - --threads 4` | 1000 Genomes chr22, 500 samples | 16.6 s | 1.3 s | 13.19x |
+| vtools | `view` VCF.gz to VCF `--threads 4` | 1000 Genomes chr22, 500 samples | 19.5 s | 1.6 s | 11.97x |
+| vtools | `concat` 4 chunks `-Ob` | 1000 Genomes chr22, 500 samples | 8.3 s | 0.7 s | 11.62x |
+| vtools | `view` VCF.gz to BCF `--threads 4` | 1000 Genomes chr22, 3,202 samples | 66.9 s | 8.4 s | 7.93x |
+| vtools | `merge -Ob --threads 4` | 1000 Genomes chr22, 3,202 samples (sample halves) | 72.6 s | 29.8 s | 2.44x |
 
 More rows, and the cases where samtools or bcftools is faster, are in the
 [ntools](ntools/README.md#performance) and [vtools](vtools/README.md#performance) READMEs.
@@ -124,15 +126,18 @@ Each tool's README lists every option: [ntools](ntools/README.md#commands) and
 ## Compression
 
 BGZF blocks and CRAM's gzip blocks are compressed and decompressed, and their CRC32s computed, by
-[zflate](https://github.com/DylanCosto/zflate), a Rust port of libdeflate. Against 0.2.0, which used
-libdeflate, on an Intel Xeon Gold 5418Y:
+[zflate](https://github.com/DylanCosto/zflate), a Rust port of libdeflate. On an Intel Xeon Gold
+5418Y:
 
-- BAM (and compressed SAM) is written at level 5 unless a level is given: 1.3–1.7 times as fast as
-  by ntools 0.2.0, which wrote at libdeflate's level 6, and under 1% larger.
-- VCF.gz and BCF, and `ntools bgzip`'s output, are written at level 6 (HTSlib's zlib-style 5):
-  1.3–1.4 times as fast as at HTSlib's default, libdeflate's level 7, and 5% larger. `-O z6`,
-  `-O b6` and `bgzip -l 6` give HTSlib's size.
-- Reading BAM is 7–13% faster end to end (`view`, `flagstat`, `index`).
+- BAM (and compressed SAM) is written at level 5 unless a level is given, under 1% larger than by
+  ntools 0.2.0, which wrote at libdeflate's level 6: `view -b` of long reads is 1.3 times as fast
+  as in 0.2.0 single-threaded and 1.2 times at `-@ 8`, and `sort -@ 4` and `markdup` of short
+  reads 1.5 and 1.7 times.
+- VCF.gz and BCF, and `ntools bgzip`'s output, are written at level 6 (HTSlib's zlib-style 5), 5%
+  larger than at HTSlib's default, libdeflate's level 7: `ntools bgzip` is 1.3 times as fast as
+  HTSlib's single-threaded and 1.6 times at `-@ 8`, and vtools writes BCF and VCF.gz with
+  threads 1.1–1.4 times as fast as 0.2.0. `-O z6`, `-O b6` and `bgzip -l 6` give HTSlib's size.
+- Reading BAM is 7–13% faster than in 0.2.0, end to end (`view`, `flagstat`, `index`).
 
 Given levels keep their meaning: they map onto libdeflate's scale, which zflate keeps, as HTSlib
 maps them, and CRAM's gzip blocks keep HTSlib's levels. The compressed bytes are zflate's, not

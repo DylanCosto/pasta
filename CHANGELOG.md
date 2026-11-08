@@ -5,6 +5,8 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-08
+
 ### Added
 
 - pasta: `bgzf::io::writer::CompressionLevel::VARIANTS`, level 6, the default for VCF and BCF.
@@ -16,19 +18,19 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   instead of eight on every token stream, and stripes the streams of numbers. It also no longer
   allocates for each token, and, like htscodecs, codes a repeat of a slice's first name as a
   duplicate. On 2 million GIAB HG003 NovaSeq reads, single-threaded, `ntools view -C` takes 8.9 s
-  instead of 15.1 s (samtools: 7.1 s), and the file is 4.7% smaller, 0.3% smaller than
-  samtools'. The compressed bytes of CRAM output change. `Encoder::NameTokenizer` uses the
-  settings of HTSlib's default level.
+  instead of 15.1 s, and the file is 4.7% smaller; on the whole 35x genome at `-@ 16`, it takes
+  270 s instead of 473 s (samtools: 227 s). The compressed bytes of CRAM output change.
+  `Encoder::NameTokenizer` uses the settings of HTSlib's default level.
 - pasta compresses and decompresses DEFLATE (BGZF blocks, CRAM's gzip blocks) and computes CRC32
   with zflate 1.0, a Rust port of libdeflate, in place of libdeflate: the build has no C code, and
   the `libdeflate` feature is gone. On x86-64 (Xeon Gold 5418Y), reading BAM is 7–13% faster end
   to end (`view`, `flagstat`, `index`).
-- BAM and compressed SAM are written at level 5 unless a level is given: 1.3–1.7 times as fast as
-  by 0.2.0, which wrote at libdeflate's level 6, and under 1% larger. VCF.gz and BCF, and
-  `ntools bgzip`'s output, are written at level 6 (`CompressionLevel::VARIANTS`, HTSlib's
-  zlib-style 5): 1.3–1.4 times as fast as at HTSlib's default, libdeflate's level 7, and 5%
-  larger. Given levels keep their meaning; `-O z6`, `-O b6` and `bgzip -l 6` give HTSlib's size.
-  `CompressionLevel::default()` is 5.
+- BAM and compressed SAM are written at level 5 unless a level is given: commands that write BAM
+  are 1.2–1.7 times as fast as in 0.2.0, which wrote at libdeflate's level 6, and their files
+  under 1% larger. VCF.gz and BCF, and `ntools bgzip`'s output, are written at level 6
+  (`CompressionLevel::VARIANTS`, HTSlib's zlib-style 5): 1.1–1.6 times as fast as at HTSlib's
+  default, libdeflate's level 7, and 5% larger. Given levels keep their meaning; `-O z6`, `-O b6`
+  and `bgzip -l 6` give HTSlib's size. `CompressionLevel::default()` is 5.
 - ntools: on Linux, `sort` and `collate` free the disk space of their temporary files while
   merging them, as far as the merge has read. A pipeline of commands that spill then needs
   temporary space for about one copy of the reads instead of one per command: on GIAB HG003

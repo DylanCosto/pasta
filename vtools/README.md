@@ -1101,42 +1101,42 @@ option). Deliberate differences, where bcftools has bugs:
 
 ## Performance
 
-Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) on 2026-11-04 against bcftools/HTSlib
-1.24, both with libdeflate at the same compression levels (these are vtools 0.2.0's timings; vtools
-now compresses with zflate, at level 6 unless a level is given), as wall time: medians of 3 warm
-runs, and one run each on the cohort. Commands are single-threaded unless the row says `--threads`.
-`kg` is 1000 Genomes chr22 with 500 samples (1.1 M records), `giab` the one-sample GIAB HG002 calls
-(4.0 M records), and the cohort rows use chr22 of the 3,202-sample 1000 Genomes 30x panel.
+Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) against bcftools/HTSlib 1.24, which
+compresses with libdeflate, as wall time: medians of 5 warm runs of vtools 0.9.0 on 2026-11-07,
+and of 3 on the cohort on 2026-11-08. Commands are single-threaded unless the row says
+`--threads`. `kg` is 1000 Genomes chr22 with 500 samples (1.1 M records), `giab` the one-sample
+GIAB HG002 calls (4.0 M records), and the cohort rows use chr22 of the 3,202-sample 1000 Genomes
+30x panel. vtools writes VCF.gz and BCF at level 6 unless a level is given, 5% larger than
+bcftools at its default ([Compression](../README.md#compression)).
 
 | Operation | bcftools (s) | vtools (s) | Speedup |
 |---|---:|---:|---:|
-| view VCF.gz to VCF, kg | 20.520 | 7.710 | 2.66x |
-| view VCF.gz to VCF, kg, --threads 4 | 19.570 | 1.600 | 12.23x |
-| view VCF.gz to BCF, kg, --threads 4 | 11.390 | 1.900 | 5.99x |
-| view -f PASS -i 'FMT/DP>40', giab | 4.290 | 4.500 | 0.95x |
-| query -f '%CHROM %POS[ %GT]', kg | 13.810 | 6.870 | 2.01x |
-| filter -s LowAF -e 'AF<0.01', kg | 9.160 | 4.710 | 1.94x |
-| index -t, kg vcf.gz | 3.950 | 1.590 | 2.48x |
-| concat 4 chunks -Ob, kg | 8.240 | 0.690 | 11.94x |
-| sort -Ob, giab | 27.890 | 25.540 | 1.09x |
-| norm -m-any -Ob, kg | 9.150 | 8.270 | 1.11x |
-| stats -s -, kg | 6.320 | 3.040 | 2.08x |
-| mpileup -f -a AD,DP, short reads 1 Mb, --threads 4 | 3.310 | 0.880 | 3.76x |
-| call -m, one-sample mpileup (1 M records) | 2.050 | 1.960 | 1.05x |
-| view VCF.gz to BCF, cohort, --threads 4 | 67.290 | 13.220 | 5.09x |
-| merge sample halves -Ob, cohort, --threads 4 | 72.440 | 29.850 | 2.43x |
-| concat --ligate 2 chunks -Ob, cohort | 88.810 | 89.400 | 0.99x |
+| view VCF.gz to VCF, kg | 20.540 | 7.310 | 2.81x |
+| view VCF.gz to VCF, kg, --threads 4 | 19.510 | 1.630 | 11.97x |
+| view VCF.gz to BCF, kg, --threads 4 | 11.330 | 1.330 | 8.52x |
+| view -f PASS -i 'FMT/DP>40', giab | 4.290 | 4.530 | 0.95x |
+| query -f '%CHROM %POS[ %GT]', kg | 13.870 | 6.830 | 2.03x |
+| filter -s LowAF -e 'AF<0.01', kg | 9.130 | 4.710 | 1.94x |
+| index -t, kg vcf.gz | 3.950 | 1.130 | 3.50x |
+| concat 4 chunks -Ob, kg | 8.250 | 0.710 | 11.62x |
+| sort -Ob, giab | 27.780 | 21.200 | 1.31x |
+| norm -m-any -Ob, kg | 9.140 | 6.050 | 1.51x |
+| stats -s -, kg | 6.330 | 3.000 | 2.11x |
+| stats -s -, kg vcf.gz, --threads 4 | 16.620 | 1.260 | 13.19x |
+| mpileup -f -a AD,DP, short reads 1 Mb, --threads 4 | 3.290 | 0.890 | 3.70x |
+| call -m, one-sample mpileup (1 M records) | 2.050 | 1.590 | 1.29x |
+| view VCF.gz to BCF, cohort, --threads 4 | 66.940 | 8.440 | 7.93x |
+| merge sample halves -Ob, cohort, --threads 4 | 72.600 | 29.750 | 2.44x |
+| concat --ligate 2 chunks -Ob, cohort | 89.050 | 66.750 | 1.33x |
 
 ### Where bcftools is faster
 
 - `view -f PASS -i 'FMT/DP>40'` on giab (0.95x): with one sample each record carries little work,
   and vtools' filter evaluation costs about 50 ns per record more than bcftools'.
-- `concat --ligate` on the cohort (0.99x), where most of the time is BGZF compression on one
-  thread in both tools.
-- Within 5% of bcftools, though not slower: on giab, `view` BCF to VCF,
-  `query -f '[%GT %DP %AD]'`, and `norm -d exact`; `call` on small inputs; and `+split-vep -d`.
-- Memory: `csq` takes about twice bcftools' (287 MB against 139 MB; 748 MB against 461 MB with
+- Within 5% of bcftools, though not slower: on giab, `view` BCF to VCF and
+  `query -f '[%GT %DP %AD]'`; and `call -m -g 10` on a small input.
+- Memory: `csq` takes about twice bcftools' (287 MB against 139 MB; 748 MB against 460 MB with
   `-Ot`). `norm -m-any`, `annotate -a` with a tab file, `roh -s` with one sample,
-  `query -f '%LINE'` on giab, and `mpileup -f` take 7 to 18 MB more. With `--threads`, memory
-  grows with the thread count: at `--threads 16`, `mpileup | call` takes 192 MB (bcftools:
-  50 MB), `view` BCF to VCF.gz 175 MB (18 MB), and `concat` 118 MB (19 MB).
+  `query -f '%LINE'` on giab, and `mpileup -f` take 7 to 17 MB more. With `--threads`, memory
+  grows with the thread count: at `--threads 16`, in 0.2.0, `mpileup | call` took 192 MB
+  (bcftools: 50 MB), `view` BCF to VCF.gz 175 MB (18 MB), and `concat` 118 MB (19 MB).
