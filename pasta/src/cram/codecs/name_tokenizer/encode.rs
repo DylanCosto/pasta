@@ -1,7 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::hash_map::Entry,
     io::{self, Write},
+    ops::Range,
 };
+
+use rustc_hash::FxHashMap;
 
 use super::Type;
 use crate::cram::io::writer::num::{write_u8, write_u32_le, write_uint7};
@@ -21,26 +24,10 @@ pub fn encode(mut src: &[u8], level: u8) -> io::Result<Vec<u8>> {
 
     write_header(&mut dst, src.len(), names.len())?;
 
-    let mut names_indices = HashMap::new();
-    let mut diffs = Vec::with_capacity(names.len());
-    let mut max_token_count = 0;
-
-    if let Some(name) = names.first() {
-        let diff = build_first_diff(name);
-        max_token_count = max_token_count.max(diff.tokens.len());
-        diffs.push(diff);
-    }
-
-    for (i, name) in names.iter().enumerate().skip(1) {
-        let diff = build_diff(&diffs, &names_indices, i, name);
-        names_indices.entry(name).or_insert(i);
-        max_token_count = max_token_count.max(diff.tokens.len());
-        diffs.push(diff);
-    }
-
+    let diffs = Diffs::build(&names);
     let mut token_writer = TokenWriter::default();
 
-    for diff in &diffs {
+    for diff in &diffs.diffs {
         let token = match diff.mode {
             Mode::Dup(delta) => Token::Dup(delta),
             Mode::Diff(delta) => Token::Diff(delta),
@@ -51,15 +38,12 @@ pub fn encode(mut src: &[u8], level: u8) -> io::Result<Vec<u8>> {
 
     encode_token_byte_streams(&mut dst, &token_writer, level)?;
 
-    for i in 0..max_token_count {
+    for i in 0..diffs.max_token_count {
         let mut token_writer = TokenWriter::default();
 
-        for diff in &diffs {
-            if diff.is_dup() {
-                continue;
-            }
-
-            if let Some(token) = diff.tokens.get(i) {
+        // A duplicate has no tokens.
+        for diff in &diffs.diffs {
+            if let Some(token) = diffs.tokens[diff.tokens.clone()].get(i) {
                 token_writer.write_token(token)?;
             }
         }
@@ -89,8 +73,8 @@ where
 }
 
 #[derive(Debug)]
-enum Token {
-    String(Vec<u8>),
+enum Token<'a> {
+    String(&'a [u8]),
     Char(u8),
     PaddedDigits(u32, usize),
     // ...
@@ -104,7 +88,7 @@ enum Token {
     End,
 }
 
-impl Token {
+impl Token<'_> {
     fn ty(&self) -> Type {
         match self {
             Self::String(_) => Type::String,
@@ -128,13 +112,26 @@ enum Mode {
     Dup(usize),
 }
 
+/// How a name is encoded.
 struct Diff {
     mode: Mode,
-    raw_tokens: Vec<Vec<u8>>,
-    tokens: Vec<Token>,
-    /// The tokens as the decoder resolves them (a match or a delta becomes the value it
-    /// stands for), which later names are encoded against.
+    /// The name's tokens in [`Diffs::tokens`]; none for a duplicate.
+    tokens: Range<usize>,
+    /// The name's raw and resolved tokens in [`Diffs::raw`] and [`Diffs::resolved`], which the next
+    /// name is encoded against: its own, or for a duplicate those of the name it copies.
+    view: Range<usize>,
+}
+
+/// The diffs of a list of names, with their tokens in flat lists that the diffs index.
+struct Diffs<'a> {
+    diffs: Vec<Diff>,
+    tokens: Vec<Token<'a>>,
+    raw: Vec<&'a [u8]>,
+    /// The tokens as the decoder resolves them (a match or a delta becomes the value it stands
+    /// for).
     resolved: Vec<Resolved>,
+    /// The most tokens of any name, counting its end.
+    max_token_count: usize,
 }
 
 /// A token's value after decoding.
@@ -145,18 +142,76 @@ enum Resolved {
     Other,
 }
 
-impl Diff {
-    fn new(mode: Mode) -> Self {
-        Self {
-            mode,
-            raw_tokens: Vec::new(),
+impl<'a> Diffs<'a> {
+    fn build(names: &[&'a [u8]]) -> Self {
+        let mut diffs = Self {
+            diffs: Vec::with_capacity(names.len()),
             tokens: Vec::new(),
+            raw: Vec::new(),
             resolved: Vec::new(),
+            max_token_count: 0,
+        };
+
+        let mut indices: FxHashMap<&[u8], usize> = FxHashMap::default();
+
+        for (i, &name) in names.iter().enumerate() {
+            match indices.entry(name) {
+                Entry::Occupied(entry) => {
+                    // A duplicate resolves to the name it copies.
+                    let j = *entry.get();
+                    let view = diffs.diffs[j].view.clone();
+
+                    diffs.diffs.push(Diff {
+                        mode: Mode::Dup(i - j),
+                        tokens: 0..0,
+                        view,
+                    });
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(i);
+
+                    // The first name stands alone; the others are encoded against the one before.
+                    match i.checked_sub(1) {
+                        Some(h) => {
+                            let prev = diffs.diffs[h].view.clone();
+                            diffs.push(Mode::Diff(1), name, prev);
+                        }
+                        None => diffs.push(Mode::Diff(0), name, 0..0),
+                    }
+                }
+            }
         }
+
+        diffs
     }
 
-    fn is_dup(&self) -> bool {
-        matches!(self.mode, Mode::Dup(_))
+    /// Adds a name, encoding each token against the token in the same position of `prev`, a
+    /// range of [`Self::raw`].
+    fn push(&mut self, mode: Mode, name: &'a [u8], prev: Range<usize>) {
+        let (tokens_start, view_start) = (self.tokens.len(), self.raw.len());
+
+        for (j, raw) in tokenize(name).enumerate() {
+            let k = prev.start + j;
+
+            let (token, resolved) = if k < prev.end {
+                token_after(raw, self.raw[k], self.resolved[k])
+            } else {
+                new_token(raw)
+            };
+
+            self.tokens.push(token);
+            self.raw.push(raw);
+            self.resolved.push(resolved);
+        }
+
+        self.tokens.push(Token::End);
+        self.max_token_count = self.max_token_count.max(self.tokens.len() - tokens_start);
+
+        self.diffs.push(Diff {
+            mode,
+            tokens: tokens_start..self.tokens.len(),
+            view: view_start..self.raw.len(),
+        });
     }
 }
 
@@ -188,7 +243,7 @@ fn tokenize(b: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// A token for `raw` on its own: zero-padded digits, digits, a character, or a string.
-fn new_token(raw: &[u8]) -> (Token, Resolved) {
+fn new_token(raw: &[u8]) -> (Token<'_>, Resolved) {
     if let Some(n) = parse_digits0(raw) {
         (
             Token::PaddedDigits(n, raw.len()),
@@ -199,13 +254,13 @@ fn new_token(raw: &[u8]) -> (Token, Resolved) {
     } else if let [c] = raw {
         (Token::Char(*c), Resolved::Other)
     } else {
-        (Token::String(raw.into()), Resolved::Other)
+        (Token::String(raw), Resolved::Other)
     }
 }
 
 /// A token for `raw` given the previous name's token in the same position: a match, a delta
 /// from its number, or a new token.
-fn token_after(raw: &[u8], prev_raw: &[u8], prev: Resolved) -> (Token, Resolved) {
+fn token_after<'a>(raw: &'a [u8], prev_raw: &[u8], prev: Resolved) -> (Token<'a>, Resolved) {
     if raw == prev_raw {
         return (Token::Match, prev);
     }
@@ -245,54 +300,6 @@ fn digit_count(n: u32) -> usize {
     n.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
-fn build_first_diff(name: &[u8]) -> Diff {
-    let mut diff = Diff::new(Mode::Diff(0));
-
-    for raw_token in tokenize(name) {
-        let (token, resolved) = new_token(raw_token);
-        diff.raw_tokens.push(raw_token.into());
-        diff.tokens.push(token);
-        diff.resolved.push(resolved);
-    }
-
-    diff.tokens.push(Token::End);
-
-    diff
-}
-
-fn build_diff(
-    diffs: &[Diff],
-    names_indices: &HashMap<&[u8], usize>,
-    i: usize,
-    name: &[u8],
-) -> Diff {
-    if let Some(j) = names_indices.get(name) {
-        // A duplicate resolves to the name it copies.
-        let mut diff = Diff::new(Mode::Dup(i - j));
-        diff.raw_tokens = diffs[*j].raw_tokens.clone();
-        diff.resolved = diffs[*j].resolved.clone();
-        return diff;
-    }
-
-    let mut diff = Diff::new(Mode::Diff(1));
-    let prev_diff = &diffs[i - 1];
-
-    for (j, raw_token) in tokenize(name).enumerate() {
-        let (token, resolved) = match (prev_diff.raw_tokens.get(j), prev_diff.resolved.get(j)) {
-            (Some(prev_raw), Some(&prev)) => token_after(raw_token, prev_raw, prev),
-            _ => new_token(raw_token),
-        };
-
-        diff.raw_tokens.push(raw_token.into());
-        diff.tokens.push(token);
-        diff.resolved.push(resolved);
-    }
-
-    diff.tokens.push(Token::End);
-
-    diff
-}
-
 /// Zero-padded digits: digits with a leading zero, including a lone `0` (which htscodecs decodes
 /// to nothing as plain digits).
 fn parse_digits0(s: &[u8]) -> Option<u32> {
@@ -330,7 +337,7 @@ struct TokenWriter {
 }
 
 impl TokenWriter {
-    fn write_token(&mut self, token: &Token) -> io::Result<()> {
+    fn write_token(&mut self, token: &Token<'_>) -> io::Result<()> {
         write_type(&mut self.type_writer, token.ty())?;
 
         match token {

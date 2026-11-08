@@ -13,11 +13,12 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 - pasta: CRAM 3.1 read names are compressed as HTSlib compresses them. The name tokenizer tries
   the one or two rANS settings htscodecs tries for each kind of token at the compression level,
-  instead of eight on every token stream, and stripes the streams of numbers. On 2 million GIAB
-  HG003 NovaSeq reads, single-threaded, `ntools view -C` takes 11.4 s instead of 15.1 s
-  (samtools: 7.2 s), and the file is 4.7% smaller, 0.3% smaller than samtools'. The compressed
-  bytes of CRAM output change. `Encoder::NameTokenizer` uses the settings of HTSlib's default
-  level.
+  instead of eight on every token stream, and stripes the streams of numbers. It also no longer
+  allocates for each token, and, like htscodecs, codes a repeat of a slice's first name as a
+  duplicate. On 2 million GIAB HG003 NovaSeq reads, single-threaded, `ntools view -C` takes 8.9 s
+  instead of 15.1 s (samtools: 7.1 s), and the file is 4.7% smaller, 0.3% smaller than
+  samtools'. The compressed bytes of CRAM output change. `Encoder::NameTokenizer` uses the
+  settings of HTSlib's default level.
 - pasta compresses and decompresses DEFLATE (BGZF blocks, CRAM's gzip blocks) and computes CRC32
   with zflate 1.0, a Rust port of libdeflate, in place of libdeflate: the build has no C code, and
   the `libdeflate` feature is gone. On x86-64 (Xeon Gold 5418Y), reading BAM is 7–13% faster end
