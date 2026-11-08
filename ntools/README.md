@@ -240,6 +240,9 @@ Intentional differences:
   records of a template together even when they do not pair up, where samtools writes the
   leftovers at the end. Output named from a prefix in BGZF SAM (`--output-fmt sam.gz`, and
   `split`'s `%.`) ends in `.sam.gz`; samtools names it `.sam`, which hides its compression.
+  `collate` holds records in memory up to `-m` (768M by default, for all threads together),
+  spilling sorted runs to temporary files beyond it; samtools has no `-m` and always writes its
+  64 temporary files, holding one at a time.
 - `ampliconclip` fixes samtools bugs: `OA` tags follow the SAM specification
   (`RNAME,POS,strand,CIGAR,MAPQ,NM;`), where samtools writes the read name as RNAME and drops
   the comma before MAPQ without an `NM` tag; clipping the 3' end of a read that ends in a
@@ -436,7 +439,8 @@ at `-@ 8`, at its default level 6, for a file 5% larger than HTSlib's default.
   peaks at 2.0 GB of temporary files against samtools' 2.4 GB (3.7 GB before), and takes 81 s
   against 153 s. `markdup` stops speeding up past `-@ 4`, limited by the thread that matches
   duplicates.
-- Memory: `collate -Ou` takes 350 MB against samtools' 26 MB on the corpus, `mpileup -M` on the
-  long reads 509 MB against 43 MB, `stats` on the long reads at `-@ 8` 843 MB against
-  660 MB, and `view -C -@ 16` on the 35x short reads of chr20 720 MB against 510 MB
-  (single-threaded, 105 MB against 245 MB).
+- Memory: `collate -Ou` takes 350 MB against samtools' 26 MB on the corpus, which fits in its
+  memory, and on the 35x short reads of chr20 (1.1 GB BAM) at `-@ 16`, 910 MB against 348 MB, in
+  17.9 s against 34.2 s; `mpileup -M` on the long reads takes 70 MB against 44 MB, `stats` on the
+  long reads at `-@ 8` 843 MB against 660 MB, and `view -C -@ 16` on the 35x short reads of chr20
+  720 MB against 510 MB (single-threaded, 105 MB against 245 MB).

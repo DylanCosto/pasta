@@ -86,8 +86,7 @@ impl Order {
             // (`bamshuf.c`'s `elem_lt`), keeping input order among equal ones.
             Self::Collate => name_hash(a)
                 .cmp(&name_hash(b))
-                .then_with(|| name(a).cmp(name(b)))
-                .then_with(|| segment_flags(a).cmp(&segment_flags(b))),
+                .then_with(|| compare_same_hash(a, b)),
             Self::Tag { tag, .. } => {
                 self.compare_tagged(a, tag_value(a, tag), b, tag_value(b, tag))
             }
@@ -111,6 +110,14 @@ impl Order {
             _ => self.compare(a, b),
         }
     }
+}
+
+/// Compares records with equal [`name_hash`]es by [`Order::Collate`]: by name, then by READ1 and
+/// READ2 flags.
+pub fn compare_same_hash(a: &[u8], b: &[u8]) -> Ordering {
+    name(a)
+        .cmp(name(b))
+        .then_with(|| segment_flags(a).cmp(&segment_flags(b)))
 }
 
 /// A record's READ1 and READ2 flags as a number (`flag >> 6 & 3`): 0 for neither, 1 for READ1,

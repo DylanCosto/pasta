@@ -16,7 +16,7 @@ use pasta::bgzf::io::writer::CompressionLevel;
 
 use crate::{
     bgzf_stream::{BgzfReader, BgzfWriter},
-    sort_order::{Order, coordinate_key, name_hash, tag_offset},
+    sort_order::{Order, compare_same_hash, coordinate_key, name_hash, tag_offset},
 };
 
 /// The fixed-size prefix of every encoded BAM record, up to the read name.
@@ -68,6 +68,18 @@ fn integer_key(order: Order, record: &[u8]) -> u64 {
             .and_then(|offset| u64::try_from(offset).ok())
             .unwrap_or(NO_TAG),
         Order::NameNatural | Order::NameAscii | Order::TemplateCoordinate => 0,
+    }
+}
+
+/// Compares records `a` and `b` by `order`, given their [`integer_key`]s, which decide most
+/// comparisons without reading the records.
+fn compare_keyed(order: Order, a_key: u64, a: &[u8], b_key: u64, b: &[u8]) -> Ordering {
+    match order {
+        Order::Coordinate => a_key.cmp(&b_key),
+        // The key is a name hash; equal hashes fall back to comparing names.
+        Order::Collate => a_key.cmp(&b_key).then_with(|| compare_same_hash(a, b)),
+        Order::Tag { .. } => order.compare_tagged(a, tag_at(a, a_key), b, tag_at(b, b_key)),
+        _ => order.compare(a, b),
     }
 }
 
@@ -137,24 +149,14 @@ impl Chunk {
         let parts = threads + 1;
         let part_len = self.entries.len().div_ceil(parts).max(1);
 
-        let compare = |a: &Entry, b: &Entry| match order {
-            Order::Coordinate => a.key.cmp(&b.key),
-            // The key is a name hash; equal hashes fall back to comparing names.
-            Order::Collate => a
-                .key
-                .cmp(&b.key)
-                .then_with(|| order.compare(&data[a.start..a.end], &data[b.start..b.end])),
-            Order::Tag { .. } => {
-                let (a_record, b_record) = (&data[a.start..a.end], &data[b.start..b.end]);
-
-                order.compare_tagged(
-                    a_record,
-                    tag_at(a_record, a.key),
-                    b_record,
-                    tag_at(b_record, b.key),
-                )
-            }
-            _ => order.compare(&data[a.start..a.end], &data[b.start..b.end]),
+        let compare = |a: &Entry, b: &Entry| {
+            compare_keyed(
+                order,
+                a.key,
+                &data[a.start..a.end],
+                b.key,
+                &data[b.start..b.end],
+            )
         };
 
         // Stable sorts of contiguous parts, merged with ties going to the earlier part, give a
@@ -351,6 +353,8 @@ impl RecordSource for SpillFile {
 }
 
 struct Head {
+    /// The record's [`integer_key`], computed once rather than in every comparison.
+    key: u64,
     record: Vec<u8>,
     source: usize,
     order: Order,
@@ -358,8 +362,7 @@ struct Head {
 
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.order
-            .compare(&self.record, &other.record)
+        compare_keyed(self.order, self.key, &self.record, other.key, &other.record)
             .then(self.source.cmp(&other.source))
             .reverse()
     }
@@ -392,6 +395,7 @@ where
 
         if s.next_record(&mut record)? {
             heap.push(Head {
+                key: integer_key(order, &record),
                 record,
                 source,
                 order,
@@ -403,6 +407,7 @@ where
         f(&head.record)?;
 
         if sources[head.source].next_record(&mut head.record)? {
+            head.key = integer_key(order, &head.record);
             heap.push(head);
         }
     }
