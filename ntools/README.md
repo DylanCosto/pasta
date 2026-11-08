@@ -385,30 +385,31 @@ Intentional differences:
 
 ## Performance
 
-Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) on 2026-11-04 against samtools/HTSlib
-1.24, both with libdeflate, as wall time. Corpus rows ("short" is 1M synthetic 150 bp paired
-reads, "long" 9,784 nanopore reads with MM/ML tags) are medians of 5 warm runs; whole-genome rows
-(GIAB HG003 35x Illumina, HG002 PacBio Revio, HG003 ONT R10.4.1) are one run each, at `-@ 16`.
-`-@ N` adds N threads in both tools. The three `view ... ->SAM` rows were re-timed for ntools 0.2.1
-on 2026-11-05 against the same samtools times; no other row's code path changed. These are 0.2.x
-timings, with libdeflate; ntools now compresses with zflate
-([Compression](../README.md#compression)), which writes BAM faster.
+Measured on an Intel Xeon Gold 5418Y VM (24 vCPUs, 122 GB) against samtools/HTSlib 1.24, which
+compresses with libdeflate, as wall time. `-@ N` adds N threads in both tools. Corpus rows
+("short" is 1M synthetic 150 bp paired reads, "long" 9,784 nanopore reads with MM/ML tags) are
+medians of 5 warm runs of ntools 0.9.0 on 2026-11-07. Whole-genome rows (GIAB HG003 35x Illumina,
+HG002 PacBio Revio, HG003 ONT R10.4.1) are one run each, at `-@ 16`, of ntools 0.2.0 on
+2026-11-04, which compressed with libdeflate, except `view BAM->CRAM 3.1`, re-timed with ntools
+0.9.0 on 2026-11-08. ntools now compresses with zflate ([Compression](../README.md#compression)),
+which writes BAM faster.
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
-| view BAM->SAM, long | 2.120 | 1.700 | 1.25x |
-| view CRAM->SAM, short | 0.870 | 0.940 | 0.93x |
+| view BAM->SAM, long | 2.120 | 1.560 | 1.36x |
+| view BAM->BAM, long, -@4 | 3.350 | 1.790 | 1.87x |
+| view CRAM->SAM, short | 0.870 | 0.930 | 0.94x |
 | view CRAM->SAM, long, -@8 | 0.550 | 0.330 | 1.67x |
-| sort, short, -@4 | 0.980 | 0.570 | 1.72x |
-| index, long, -@4 | 0.330 | 0.300 | 1.10x |
-| markdup, short | 3.790 | 2.090 | 1.81x |
+| sort, short, -@4 | 0.970 | 0.390 | 2.49x |
+| index, long, -@4 | 0.320 | 0.270 | 1.19x |
+| markdup, short | 3.800 | 1.260 | 3.02x |
 | stats, short | 1.650 | 1.010 | 1.63x |
-| mpileup -f (BAQ), short, -@8 (samtools mpileup has no threads) | 27.770 | 3.810 | 7.29x |
+| mpileup -f (BAQ), short, -@8 (samtools mpileup has no threads) | 27.730 | 3.870 | 7.17x |
 | flagstat, 35x HG003 short reads (BAM) | 92.150 | 70.360 | 1.31x |
 | view -c, 35x HG003 short reads (CRAM 3.1) | 23.460 | 5.060 | 4.64x |
 | flagstat, 35x HG003 short reads (CRAM 3.1) | 30.420 | 7.560 | 4.02x |
 | stats, 35x HG003 short reads (BAM) | 1440.650 | 553.840 | 2.60x |
-| view BAM->CRAM 3.1, 35x HG003 short reads | 224.750 | 473.130 | 0.48x |
+| view BAM->CRAM 3.1, 35x HG003 short reads | 227.240 | 270.010 | 0.84x |
 | collate, fixmate -m, sort, markdup (piped), 35x HG003 short reads | 2869.200 | 2909.910 | 0.99x |
 | stats, HG002 Revio (BAM) | 2169.500 | 293.970 | 7.38x |
 | sort -n, HG002 Revio (BAM) | 1011.740 | 646.610 | 1.56x |
@@ -416,22 +417,26 @@ timings, with libdeflate; ntools now compresses with zflate
 
 Counting CRAM records (`view -c`, `flagstat`, `idxstats`) decodes only the fields the command
 reads, as samtools does, and also selects tags one by one (`-d TAG`, the read group filters),
-which HTSlib does not: speedups of 1.06x to 6.49x on the corpus as CRAM 3.1. `bgzip` is level with
-HTSlib's single-threaded, where both spend their time in libdeflate, and up to 1.23x faster with
-threads.
+which HTSlib does not: speedups of 1.06x to 6.49x on the corpus as CRAM 3.1. `bgzip` of the GIAB
+HG002 VCF (2.8 GB) takes 12.4 s against HTSlib's 16.1 s single-threaded, and 1.5 s against 2.4 s
+at `-@ 8`, at its default level 6, for a file 5% larger than HTSlib's default.
 
 ### Where samtools is faster
 
-- Writing CRAM (`view -C`) takes more CPU time than HTSlib: 1.5x samtools' time single-threaded
-  on the corpus, close at `-@ 8`, and faster at `-@ 16`; on whole genomes, 2.1x samtools' time
-  on the 35x short reads and 1.05x on the Revio long reads. Since then, read names are compressed
-  as HTSlib compresses them: on 2 million of the 35x short reads, single-threaded, `view -C`
-  takes 1.6x samtools' time, where it took 2.1x, and writes a file 0.3% smaller than samtools'.
-- `view` CRAM to SAM of the short reads (0.93x) and `depth` (0.90x) are slightly slower
-  single-threaded. On the 69 GB ONT CRAM, `view -c` and `flagstat` (0.86x and 0.89x) mostly wait
-  for the file to be read and use less CPU time than samtools.
-- The whole-genome `collate | fixmate -m | sort | markdup` pipeline is level (0.99x) and its
-  temporary files take 155.5 GB at peak against samtools' 79.8 GB. `markdup` stops speeding up
-  past `-@ 4`, limited by the thread that matches duplicates.
-- Memory: `collate -Ou` takes 350 MB against samtools' 28 MB on the corpus, `mpileup -M` on the
-  long reads 503 MB against 43 MB, and `stats` on the long reads at `-@ 8` 843 MB against 661 MB.
+- Writing CRAM (`view -C`) takes more time than HTSlib: on 2 million of the 35x short reads,
+  single-threaded, 1.25x samtools' time (8.9 s against 7.1 s), for a file 0.3% smaller than
+  samtools'; on the whole 35x genome at `-@ 16`, 1.19x (270 s against 227 s), with 1.6 times its
+  CPU time. ntools 0.2.0 took 2.1x on both, and 1.05x on the Revio long reads; since then, read
+  names are compressed as HTSlib compresses them.
+- `view` CRAM to SAM of the short reads is slightly slower single-threaded (0.94x). On the 69 GB
+  ONT CRAM, `view -c` and `flagstat` (0.86x and 0.89x in 0.2.0) mostly wait for the file to be
+  read and use less CPU time than samtools.
+- The whole-genome `collate | fixmate -m | sort | markdup` pipeline was level in 0.2.0 (0.99x),
+  and its temporary files took 155.5 GB at peak against samtools' 79.8 GB. ntools now frees the
+  space of its temporary files as it merges them: on GIAB HG003 chr20 at `-@ 2`, the pipeline
+  peaks at 2.0 GB of temporary files against samtools' 2.4 GB (3.7 GB before), and takes 81 s
+  against 153 s. `markdup` stops speeding up past `-@ 4`, limited by the thread that matches
+  duplicates.
+- Memory: `collate -Ou` takes 350 MB against samtools' 26 MB on the corpus, `mpileup -M` on the
+  long reads 509 MB against 43 MB, `stats` on the long reads at `-@ 8` 843 MB against 660 MB,
+  and writing CRAM 113 MB against 28 MB on the 2 million short reads.

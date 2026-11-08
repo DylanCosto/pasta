@@ -1,6 +1,6 @@
 [package]
 name = "vtools"
-version = "0.2.1"
+version = "0.9.0"
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
