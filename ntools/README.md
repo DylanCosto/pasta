@@ -393,10 +393,9 @@ compresses with libdeflate, as wall time. `-@ N` adds N threads in both tools. C
 ("short" is 1M synthetic 150 bp paired reads, "long" 9,784 nanopore reads with MM/ML tags) are
 medians of 5 warm runs of ntools 0.9.0 on 2026-11-07. Whole-genome rows (GIAB HG003 35x Illumina,
 HG002 PacBio Revio, HG003 ONT R10.4.1) are one run each, at `-@ 16`, of ntools 0.2.0 on
-2026-11-04, which compressed with libdeflate, except `view BAM->CRAM 3.1`, re-timed on
-2026-11-08 with the CRAM writer of the next release ([changelog](../CHANGELOG.md)), with a warm
-cache. ntools now compresses with zflate ([Compression](../README.md#compression)), which writes
-BAM faster.
+2026-11-04, which compressed with libdeflate, except `view BAM->CRAM 3.1`, re-timed with ntools
+0.9.0 on 2026-11-08, with a warm cache. ntools now compresses with zflate
+([Compression](../README.md#compression)), which writes BAM faster.
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
