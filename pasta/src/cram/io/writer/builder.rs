@@ -208,6 +208,9 @@ impl Builder {
             record_counter: MIN_RECORD_COUNTER,
             bases: 0,
             missing_reference_sequence_names: Default::default(),
+            pending_header: None,
+            last_reference_sequence: None,
+            read_groups: Default::default(),
             reference_sequences: Default::default(),
             // Without threads, containers are encoded on this one.
             workers: self.worker_count.and_then(|n| Workers::start(n).ok()),

@@ -118,6 +118,11 @@ impl Workers {
         })
     }
 
+    /// The number of workers.
+    pub(super) fn thread_count(&self) -> usize {
+        self.pool.threads.len()
+    }
+
     /// The most containers in flight between calls.
     pub(super) fn capacity(&self) -> usize {
         self.pool.threads.len() * IN_FLIGHT_PER_WORKER
@@ -145,8 +150,8 @@ impl Workers {
         let rx = self.pool.spawn(Priority::Normal, move || {
             let mut batch = batch;
             // Encoding uses the reference sequences, which may be released from the cache.
-            let _reference_sequences = mem::take(&mut batch.reference_sequences);
-            let mut records = super::convert(&ctx, &header, batch)?;
+            let reference_sequences = mem::take(&mut batch.reference_sequences);
+            let mut records = super::convert(&header, batch, &reference_sequences)?;
             encode_container(&ctx, &header, record_counter, &mut records)
         });
 

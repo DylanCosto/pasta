@@ -509,7 +509,6 @@ dependencies = [
  "lexical-core",
  "libc",
  "lzma-rust2",
- "md-5",
  "memchr",
  "rustc-hash",
  "zflate",

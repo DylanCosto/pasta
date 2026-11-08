@@ -29,6 +29,28 @@ mod tests {
         Ok(())
     }
 
+    /// The encoder normalizes frequencies as htscodecs does, so its output is the same.
+    #[test]
+    fn test_encode_matches_htscodecs_fixtures() -> io::Result<()> {
+        let qual = include_bytes!("fixtures/qual.bin");
+        assert_eq!(
+            encode(Order::Zero, qual)?,
+            include_bytes!("fixtures/r4x8-qual-o0.bin")
+        );
+        assert_eq!(
+            encode(Order::One, qual)?,
+            include_bytes!("fixtures/r4x8-qual-o1.bin")
+        );
+
+        let big = sparse(70001, 2048, 4);
+        assert!(encode(Order::One, &big)? == include_bytes!("fixtures/r4x8-big-o1.bin"));
+
+        let wide = sparse(4099, 16, 32);
+        assert!(encode(Order::Zero, &wide)? == include_bytes!("fixtures/r4x8-wide-o0.bin"));
+
+        Ok(())
+    }
+
     #[test]
     fn test_self() -> io::Result<()> {
         let src = b"noodles";

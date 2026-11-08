@@ -1,9 +1,15 @@
 use std::io::{self, Write};
 
+#[inline]
 pub fn write_uint7<W>(writer: &mut W, mut n: u32) -> io::Result<()>
 where
     W: Write,
 {
+    // Most values (run lengths, small counts) fit one byte.
+    if n < 0x80 {
+        return writer.write_all(&[n as u8]);
+    }
+
     let mut buf = [0; 5];
 
     let mut i = buf.len() - 1;

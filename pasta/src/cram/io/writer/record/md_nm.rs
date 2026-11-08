@@ -1,7 +1,7 @@
 //! MD and NM tags left out because readers regenerate them, as HTSlib's writer does.
 
 use crate::core::Position;
-use crate::sam::alignment::{record::data::field::Tag, record_buf::data::field::Value};
+use crate::sam::alignment::record::data::field::{Tag, Type};
 
 use super::{Feature, Record, ReferenceBases};
 use crate::cram::record::md_nm::{Reference, Step, calculate_from_steps};
@@ -12,22 +12,34 @@ impl Record {
     ///
     /// As in HTSlib, both are kept for alignments that reach past the end of the reference
     /// sequence or align an N in the read to an N in the reference, where readers disagree.
-    /// `store_md` and `store_nm` keep them always (HTSlib's `store_md` and `store_nm`).
+    /// `store_md` and `store_nm` keep them always (HTSlib's `store_md` and `store_nm`). `md` is
+    /// a buffer for the regenerated MD string, reused from record to record.
     pub(crate) fn remove_regenerated_md_nm(
         &mut self,
         reference_sequence: &[u8],
         reference_sequence_length: usize,
         store_md: bool,
         store_nm: bool,
+        md: &mut Vec<u8>,
     ) {
-        let has = |tag| self.data.iter().filter(|(t, _)| *t == tag).count() == 1;
-        let has_md = !store_md && has(Tag::MISMATCHED_POSITIONS);
-        let has_nm = !store_nm && has(Tag::EDIT_DISTANCE);
+        // Whether each is there once.
+        let (mut md_count, mut nm_count) = (0, 0);
+
+        for field in self.data.iter() {
+            match field.tag {
+                Tag::MISMATCHED_POSITIONS => md_count += 1,
+                Tag::EDIT_DISTANCE => nm_count += 1,
+                _ => {}
+            }
+        }
+
+        let has_md = !store_md && md_count == 1;
+        let has_nm = !store_nm && nm_count == 1;
 
         if !(has_md || has_nm)
             || self.reference_bases != ReferenceBases::External
             || self.bam_flags.is_unmapped()
-            || self.sequence.is_empty()
+            || self.sequence().is_empty()
         {
             return;
         }
@@ -53,17 +65,21 @@ impl Record {
             .iter()
             .map(|feature| (usize::from(feature.position()), Step::from(feature)));
 
-        let Some((md, nm)) =
-            calculate_from_steps(&reference, start, self.read_length, steps, has_md)
-        else {
+        let Some(nm) = calculate_from_steps(
+            &reference,
+            start,
+            self.read_length,
+            steps,
+            has_md.then_some(&mut *md),
+        ) else {
             return;
         };
 
-        self.data.retain(|(tag, value)| match *tag {
+        self.data.retain(|field| match field.tag {
             Tag::MISMATCHED_POSITIONS => {
-                store_md || !matches!(value, Value::String(s) if s[..] == md[..])
+                store_md || field.ty != Type::String || field.as_str() != Some(&md[..])
             }
-            Tag::EDIT_DISTANCE => store_nm || value.as_int() != Some(i64::from(nm)),
+            Tag::EDIT_DISTANCE => store_nm || field.as_int() != Some(i64::from(nm)),
             _ => true,
         });
     }
@@ -73,11 +89,16 @@ impl Record {
     /// Whether an aligned N in the read is on an N in `reference_sequence`, which holds the whole
     /// alignment from `start`.
     fn aligns_n_to_n(&self, reference_sequence: &[u8], start: Position) -> bool {
+        // Most reads have no N.
+        if memchr::memchr2(b'N', b'n', self.sequence()).is_none() {
+            return false;
+        }
+
         let is_n = |b: &u8| b & !0x20 == b'N';
 
         let both_n = |read_pos: usize, ref_pos: usize, len: usize| {
             let read_bases = self
-                .sequence
+                .sequence()
                 .get(read_pos..read_pos + len)
                 .unwrap_or_default();
             let ref_bases = &reference_sequence[ref_pos..ref_pos + len];
@@ -172,6 +193,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::sam::alignment::record_buf::data::field::Value;
 
     const REFERENCE_SEQUENCE: &[u8] = b"ACGTACGTACGTACGTNNNN";
     const XS: Tag = Tag::new(b'X', b'S');
@@ -215,13 +237,19 @@ mod tests {
             Ok(has_reference.then(|| std::sync::Arc::new(sequence)))
         })?;
 
-        record.remove_regenerated_md_nm(REFERENCE_SEQUENCE, REFERENCE_SEQUENCE.len(), false, false);
+        record.remove_regenerated_md_nm(
+            REFERENCE_SEQUENCE,
+            REFERENCE_SEQUENCE.len(),
+            false,
+            false,
+            &mut Vec::new(),
+        );
 
         Ok(record)
     }
 
     fn tags(record: &Record) -> Vec<Tag> {
-        record.data.iter().map(|(tag, _)| *tag).collect()
+        record.data.iter().map(|field| field.tag).collect()
     }
 
     #[test]

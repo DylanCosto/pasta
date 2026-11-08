@@ -184,7 +184,18 @@ impl Encode<'_> for Integer {
 
                 write_itf8(dst, value)
             }
-            // pasta writes integers to external blocks only.
+            // A code of one symbol takes no bits, e.g., the length of a tag value of a fixed size.
+            Self::Huffman { alphabet, bit_lens } if bit_lens[..] == [0] => {
+                if alphabet[..] == [value] {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{value} is not the Huffman code's symbol, {alphabet:?}"),
+                    ))
+                }
+            }
+            // Otherwise, pasta writes integers to external blocks only.
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("encoding integers is not supported for {self:?}"),
@@ -438,6 +449,16 @@ mod tests {
             &[],
             &[0x0d],
         )?;
+
+        let constant = Encoding::new(Integer::Huffman {
+            alphabet: vec![4],
+            bit_lens: vec![0],
+        });
+        t(&constant, 4, &[], &[])?;
+        assert!(matches!(
+            t(&constant, 2, &[], &[]),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput
+        ));
 
         assert!(matches!(
             t(&Encoding::new(Integer::Subexp { offset: 0, k: 0 }), 1, &[], &[]),

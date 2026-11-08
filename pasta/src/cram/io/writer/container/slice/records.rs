@@ -18,7 +18,7 @@ use crate::cram::{
     },
     io::{
         BitWriter,
-        writer::{Record, record::Feature},
+        writer::{Record, container::compression_header::find_tag_set, record::Feature},
     },
     record::{Flags, MateFlags},
 };
@@ -225,7 +225,7 @@ impl<'a> Writer<'a> {
         let preservation_map = self.compression_header.preservation_map();
 
         if preservation_map.records_have_names() {
-            let name = record.name.as_ref().map(|s| s.as_ref());
+            let name = record.name().map(BStr::new);
             self.write_name(name)?;
         }
 
@@ -251,7 +251,7 @@ impl<'a> Writer<'a> {
             let preservation_map = self.compression_header.preservation_map();
 
             if !preservation_map.records_have_names() {
-                let name = record.name.as_ref().map(|s| s.as_ref());
+                let name = record.name().map(BStr::new);
                 self.write_name(name)?;
             }
 
@@ -340,21 +340,11 @@ impl<'a> Writer<'a> {
     }
 
     fn write_data(&mut self, record: &Record) -> io::Result<()> {
-        use crate::bam::record::codec::encoder::data::field::write_value;
-
-        let tag_set: Vec<_> = record
-            .data
-            .iter()
-            .map(|(tag, value)| tag_sets::Key::new(*tag, value.ty()))
-            .collect();
-
-        let tag_set_id = self
-            .compression_header
-            .preservation_map()
-            .tag_sets()
-            .iter()
-            .position(|set| **set == tag_set)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing tag set"))?;
+        let tag_set_id = find_tag_set(
+            self.compression_header.preservation_map().tag_sets(),
+            record,
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing tag set"))?;
 
         self.write_tag_set_id(tag_set_id)?;
 
@@ -363,12 +353,12 @@ impl<'a> Writer<'a> {
             .get(tag_set_id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid tag set"))?;
 
-        let mut buf = Vec::new();
-
-        for ((_, encoding), (_, value)) in tag_set.iter().zip(&record.data) {
-            write_value(&mut buf, &value.into())?;
-            encoding.encode(self.core_data_writer, self.external_data_writers, &buf)?;
-            buf.clear();
+        for ((_, encoding), field) in tag_set.iter().zip(record.data.iter()) {
+            encoding.encode(
+                self.core_data_writer,
+                self.external_data_writers,
+                field.value,
+            )?;
         }
 
         Ok(())
@@ -399,7 +389,7 @@ impl<'a> Writer<'a> {
         self.write_mapping_quality(record.mapping_quality)?;
 
         if record.cram_flags.quality_scores_are_stored_as_array() {
-            self.write_quality_scores(&record.quality_scores)?;
+            self.write_quality_scores(record.quality_scores())?;
         }
 
         Ok(())
@@ -603,10 +593,10 @@ impl<'a> Writer<'a> {
     }
 
     fn write_unmapped_read(&mut self, record: &Record) -> io::Result<()> {
-        self.write_sequence(&record.sequence)?;
+        self.write_sequence(record.sequence())?;
 
         if record.cram_flags.quality_scores_are_stored_as_array() {
-            self.write_quality_scores(&record.quality_scores)?;
+            self.write_quality_scores(record.quality_scores())?;
         }
 
         Ok(())

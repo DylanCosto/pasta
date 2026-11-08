@@ -53,7 +53,7 @@ pub(crate) fn embed(
 
 /// Whether a record has bases aligned to the reference, i.e., it is mapped and has a sequence.
 fn has_aligned_bases(record: &Record) -> bool {
-    !record.bam_flags.is_unmapped() && !record.sequence.is_empty()
+    !record.bam_flags.is_unmapped() && !record.sequence().is_empty()
 }
 
 /// The 0-based offset of a record's alignment start in the slice's reference sequence.
@@ -171,8 +171,8 @@ fn reencode(record: &Record, reference_sequence: &[u8], offset: usize) -> io::Re
                 &mut features,
                 reference_sequence,
                 reference_offset,
-                &record.sequence[read_offset..read_offset + len],
-                &record.quality_scores,
+                &record.sequence()[read_offset..read_offset + len],
+                record.quality_scores(),
                 read_offset,
             )?;
         } else {
@@ -185,12 +185,15 @@ fn reencode(record: &Record, reference_sequence: &[u8], offset: usize) -> io::Re
 
 /// Adds a `cF` tag for the MD and NM tags the record lacks.
 fn add_cram_flags(record: &mut Record) {
-    let has = |tag| record.data.iter().any(|(t, _)| *t == tag);
+    let has = |tag| record.data.iter().any(|field| field.tag == tag);
 
     let flags =
         u8::from(!has(Tag::MISMATCHED_POSITIONS)) | (u8::from(!has(Tag::EDIT_DISTANCE)) << 1);
 
     if flags != 0 {
-        record.data.push((CRAM_FLAGS, ValueBuf::UInt8(flags)));
+        record
+            .data
+            .push(CRAM_FLAGS, &ValueBuf::UInt8(flags))
+            .expect("an integer tag encodes");
     }
 }

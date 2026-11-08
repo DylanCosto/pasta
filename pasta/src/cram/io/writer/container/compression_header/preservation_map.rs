@@ -1,6 +1,8 @@
 mod substitution_matrix;
 mod tag_sets;
 
+pub(crate) use self::tag_sets::find_tag_set;
+
 use std::io::{self, Write};
 
 use self::{

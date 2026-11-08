@@ -19,7 +19,6 @@ flate2.workspace = true
 indexmap.workspace = true
 lexical-core.workspace = true
 lzma-rust2 = { version = "0.22.0", default-features = false, features = ["encoder", "std", "xz"] }
-md-5.workspace = true
 memchr.workspace = true
 rustc-hash = "2.1.3"
 # DEFLATE, gzip and CRC32: BGZF blocks, CRAM's gzip blocks.

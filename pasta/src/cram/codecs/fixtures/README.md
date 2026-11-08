@@ -27,3 +27,10 @@ C program linked against htslib that builds the same inputs with the same LCG
 (`HSQ1004:134:C0D8DACXX:…`). `tok3-rans.bin` and `tok3-arith.bin` are those names
 encoded by htscodecs 1.6.7's `tok3_encode_names` at level 9, with rANS Nx16 and
 with the arithmetic coder.
+
+`names-formats.bin` holds 26 NUL-terminated read names of the formats htscodecs
+recognizes (Illumina, Ion Torrent, Oxford Nanopore, PacBio) and others,
+including duplicates, a name that begins an earlier one, padded numbers and an
+empty name. `tok3-rans-formats-<level>.bin` are those names encoded by
+`tok3_encode_names` at levels 1 and 3 (the level HTSlib uses for names at its
+default level 5), with rANS Nx16.

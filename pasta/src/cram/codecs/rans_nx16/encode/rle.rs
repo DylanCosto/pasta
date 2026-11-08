@@ -6,21 +6,16 @@ pub use self::context::{Context, build_context, write_context};
 use crate::cram::io::writer::num::write_uint7;
 
 pub fn encode(src: &[u8], ctx: &mut Context) -> io::Result<Vec<u8>> {
-    let mut iter = src.iter().peekable();
-    let mut dst = Vec::new();
+    let mut dst = Vec::with_capacity(src.len());
+    let mut rest = src;
 
-    while let Some(&sym) = iter.next() {
-        write_u8(&mut dst, sym);
+    while let Some((&sym, tail)) = rest.split_first() {
+        dst.push(sym);
+        rest = tail;
 
         if ctx.alphabet[usize::from(sym)] {
-            let mut len = 0;
-
-            while let Some(&&s) = iter.peek()
-                && s == sym
-            {
-                len += 1;
-                iter.next();
-            }
+            let len = rest.iter().position(|&s| s != sym).unwrap_or(rest.len());
+            rest = &rest[len..];
 
             let n =
                 u32::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -29,10 +24,6 @@ pub fn encode(src: &[u8], ctx: &mut Context) -> io::Result<Vec<u8>> {
     }
 
     Ok(dst)
-}
-
-fn write_u8(dst: &mut Vec<u8>, n: u8) {
-    dst.push(n);
 }
 
 #[cfg(test)]

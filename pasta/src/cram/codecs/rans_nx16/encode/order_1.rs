@@ -1,14 +1,24 @@
 use std::io;
 
-use super::{EncodingSymbol, LOWER_BOUND, order_0, write_alphabet, write_states};
+use super::{EncodingSymbol, LOWER_BOUND, ReverseWriter, order_0, write_alphabet, write_states};
 use crate::cram::{
-    codecs::rans_nx16::ALPHABET_SIZE,
+    codecs::{histogram, rans_nx16::ALPHABET_SIZE},
     io::writer::num::{write_u8, write_uint7},
 };
 
 const CONTEXT_SIZE: usize = 2;
-const NORMALIZATION_BITS: u32 = 12;
 const NUL: u8 = 0x00;
+
+/// The frequency table shifts htscodecs chooses between (`TF_SHIFT_O1_FAST` and `TF_SHIFT_O1`).
+const FAST_BITS: u32 = 10;
+const BITS: u32 = 12;
+
+/// Frequency tables longer than this (with their header byte) are compressed with order-0 rANS
+/// when that saves space, as htscodecs does.
+const MAX_UNCOMPRESSED_TABLE_LEN: usize = 1000;
+
+/// The state count of a compressed frequency table (htscodecs' `rans_compress_O0_4x16`).
+const TABLE_STATE_COUNT: usize = 4;
 
 /// Frequencies by context, then symbol (`ALPHABET_SIZE` rows), on the heap: rows of absent
 /// contexts stay zero.
@@ -16,26 +26,163 @@ type Frequencies = Vec<[u32; ALPHABET_SIZE]>;
 
 pub(super) struct Context {
     alphabet: [bool; ALPHABET_SIZE],
+    /// The frequencies encoded with: each context's sum to `1 << bits`.
     frequencies: Frequencies,
+    bits: u32,
+    /// The frequency tables as written after the header byte, compressed or not.
+    table: Vec<u8>,
+    is_table_compressed: bool,
 }
 
-pub(super) fn build_context(src: &[u8], state_count: usize) -> Context {
+/// Builds the frequency tables as htscodecs' `encode_freq1` does: each context's is normalized
+/// to the power of two its count rounds to (written so, it costs a byte or two per symbol less
+/// than at the full total, which decoders scale back up), and to 10-bit totals instead of
+/// 12-bit ones when that is estimated to cost no more than 1% in size.
+pub(super) fn build_context(src: &[u8], state_count: usize) -> io::Result<Context> {
     let alphabet = build_alphabet(src);
-    let frequencies = build_frequencies(src, state_count);
-    let normalized_frequencies = normalize_frequencies(&frequencies, &alphabet);
+    let mut frequencies = build_frequencies(src, state_count);
 
-    Context {
-        alphabet,
-        frequencies: normalized_frequencies,
+    // The last symbol counts once more, as in htscodecs' `hist1_4`.
+    let mut totals = [0; ALPHABET_SIZE];
+
+    for (total, fs) in totals.iter_mut().zip(&frequencies) {
+        *total = fs.iter().sum();
     }
+
+    if let Some(&last) = src.last() {
+        totals[usize::from(last)] += 1;
+    }
+
+    let (bits, maxes) = choose_bits(&frequencies, &totals);
+
+    for i in contexts(&alphabet) {
+        let max = if bits == FAST_BITS {
+            maxes[i].min(1 << FAST_BITS)
+        } else {
+            maxes[i]
+        };
+
+        order_0::normalize_frequencies(&mut frequencies[i], totals[i], max)?;
+    }
+
+    let mut table = Vec::new();
+    write_alphabet(&mut table, &alphabet)?;
+    write_frequencies(&mut table, &alphabet, &frequencies)?;
+
+    for i in contexts(&alphabet) {
+        let max = frequencies[i].iter().sum();
+        order_0::scale_frequencies(&mut frequencies[i], max, 1 << bits);
+    }
+
+    let mut is_table_compressed = false;
+
+    if 1 + table.len() > MAX_UNCOMPRESSED_TABLE_LEN {
+        let ctx = order_0::build_context(&table)?;
+        let mut compressed_table = Vec::new();
+        order_0::write_context(&mut compressed_table, &ctx)?;
+        order_0::encode(&table, &ctx, TABLE_STATE_COUNT, &mut compressed_table)?;
+
+        if compressed_table.len() + 6 < 1 + table.len() {
+            let len = |n: usize| {
+                u32::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+            };
+
+            let mut buf = Vec::with_capacity(compressed_table.len() + 10);
+            write_uint7(&mut buf, len(table.len())?)?;
+            write_uint7(&mut buf, len(compressed_table.len())?)?;
+            buf.extend(compressed_table);
+
+            table = buf;
+            is_table_compressed = true;
+        }
+    }
+
+    Ok(Context {
+        alphabet,
+        frequencies,
+        bits,
+        table,
+        is_table_compressed,
+    })
 }
 
 pub(super) fn write_context(dst: &mut Vec<u8>, ctx: &Context) -> io::Result<()> {
-    // bits = 12, no compression (0)
-    write_u8(dst, 12 << 4)?;
-    write_alphabet(dst, &ctx.alphabet)?;
-    write_frequencies(dst, &ctx.alphabet, &ctx.frequencies)?;
+    // The shift is 10 or 12, so this fits a byte.
+    write_u8(
+        dst,
+        (ctx.bits << 4) as u8 | u8::from(ctx.is_table_compressed),
+    )?;
+    dst.extend(&ctx.table);
     Ok(())
+}
+
+/// Chooses 10-bit or 12-bit frequency totals from an estimate of the encoded size with each, and
+/// the power of two to write each context's frequencies at (htscodecs' `rans_compute_shift`).
+fn choose_bits(
+    frequencies: &Frequencies,
+    totals: &[u32; ALPHABET_SIZE],
+) -> (u32, [u32; ALPHABET_SIZE]) {
+    let (fast_total, total) = (1u32 << FAST_BITS, 1u32 << BITS);
+
+    let (mut e10, mut e12) = (0.0, 0.0);
+    let mut max_total = 0;
+    let mut maxes = [0; ALPHABET_SIZE];
+
+    for ((fs, &t), max) in frequencies.iter().zip(totals).zip(&mut maxes) {
+        if t == 0 {
+            continue;
+        }
+
+        let mut max_val = t.next_power_of_two();
+
+        // The symbols whose frequencies would be raised to 1.
+        let raised = |limit| fs.iter().filter(|&&f| f > 0 && max_val / f > limit).count();
+        let l10 = ((fast_total as usize + raised(fast_total)) as f64).ln();
+        let l12 = ((total as usize + raised(total)) as f64).ln();
+
+        let (t_fast, t_slow) = (
+            f64::from(fast_total) / f64::from(t),
+            f64::from(total) / f64::from(t),
+        );
+        let mut symbol_count = 0;
+
+        for &f in fs.iter().filter(|&&f| f > 0) {
+            symbol_count += 1;
+
+            let f = f64::from(f);
+            e10 -= f * (fast_log((f * t_fast).max(1.0)) - l10);
+            e12 -= f * (fast_log((f * t_slow).max(1.0)) - l12);
+
+            // An estimate of the cost of the frequency tables.
+            e10 += 1.3;
+            e12 += 4.7;
+        }
+
+        if symbol_count < 64 && max_val > 128 {
+            max_val /= 2;
+        }
+
+        if max_val > 1024 {
+            max_val /= 2;
+        }
+
+        *max = max_val.min(total);
+        max_total = max_total.max(*max);
+    }
+
+    let bits = if e10 / e12 < 1.01 || max_total <= fast_total {
+        FAST_BITS
+    } else {
+        BITS
+    };
+
+    (bits, maxes)
+}
+
+/// An approximation of the natural logarithm from the bits of a double (htscodecs' `fast_log`),
+/// which this matches, so that the same shift is chosen.
+fn fast_log(a: f64) -> f64 {
+    (a.to_bits() as i64 - 4_606_921_278_410_026_770) as f64 * 1.539_095_918_623_324e-16
 }
 
 pub fn encode(src: &[u8], ctx: &Context, state_count: usize, dst: &mut Vec<u8>) -> io::Result<()> {
@@ -52,7 +199,7 @@ pub fn encode(src: &[u8], ctx: &Context, state_count: usize, dst: &mut Vec<u8>) 
 
         for ((symbol, &f), &g) in row.iter_mut().zip(fs).zip(gs) {
             if f > 0 {
-                *symbol = EncodingSymbol::new(f, g, NORMALIZATION_BITS);
+                *symbol = EncodingSymbol::new(f, g, ctx.bits);
             }
         }
 
@@ -61,42 +208,67 @@ pub fn encode(src: &[u8], ctx: &Context, state_count: usize, dst: &mut Vec<u8>) 
         symbols.push(row);
     }
 
-    let put = |state: &mut u32, i: u8, j: u8, buf: &mut Vec<u8>| {
-        let row = &symbols[usize::from(rows[usize::from(i)])];
-        *state = row[usize::from(j)].put(*state, buf);
+    // A row for each context, absent ones an empty one, so a step takes one lookup.
+    let empty_row = [EncodingSymbol::default(); ALPHABET_SIZE];
+    let rows: [&[EncodingSymbol; ALPHABET_SIZE]; ALPHABET_SIZE] = std::array::from_fn(|i| {
+        if ctx.alphabet[i] {
+            &symbols[usize::from(rows[i])]
+        } else {
+            &empty_row
+        }
+    });
+
+    let mut buf = ReverseWriter::for_symbols(src.len());
+
+    match state_count {
+        4 => write_states(dst, &encode_states::<4>(src, &rows, &mut buf))?,
+        32 => write_states(dst, &encode_states::<32>(src, &rows, &mut buf))?,
+        _ => unreachable!("state count is 4 or 32"),
+    }
+
+    dst.extend(buf.as_slice());
+
+    Ok(())
+}
+
+/// Encodes `src` on `N` states, each a chunk of it, the last also taking the rest, returning the
+/// final states.
+fn encode_states<const N: usize>(
+    src: &[u8],
+    rows: &[&[EncodingSymbol; ALPHABET_SIZE]; ALPHABET_SIZE],
+    buf: &mut ReverseWriter,
+) -> [u32; N] {
+    let put = |state: &mut u32, i: u8, j: u8, buf: &mut ReverseWriter| {
+        *state = rows[usize::from(i)][usize::from(j)].put(*state, buf);
     };
 
-    let mut buf = Vec::with_capacity(src.len());
-    let mut states = vec![LOWER_BOUND; state_count];
+    let mut states = [LOWER_BOUND; N];
 
-    let (chunks, remainder) = split_chunks(src, state_count);
+    let (chunks, remainder) = split_chunks(src, N);
 
-    if !remainder.is_empty() {
-        let state = states.last_mut().unwrap();
-
-        for syms in remainder.windows(CONTEXT_SIZE).rev() {
-            put(state, syms[0], syms[1], &mut buf);
-        }
+    for syms in remainder.windows(CONTEXT_SIZE).rev() {
+        put(&mut states[N - 1], syms[0], syms[1], buf);
     }
+
+    let Some(chunk_size) = chunks.first().map(|chunk| chunk.len()) else {
+        return states;
+    };
+
+    let chunks: [&[u8]; N] = std::array::from_fn(|i| chunks[i]);
 
     // The decoder interleaves the states at each position, reading from a single stream, so
     // encode positions in reverse with the states in reverse at each one.
-    let chunk_size = chunks.first().map_or(0, |chunk| chunk.len());
-
-    for k in (0..chunk_size.saturating_sub(1)).rev() {
-        for (state, chunk) in states.iter_mut().rev().zip(chunks.iter().rev()) {
-            put(state, chunk[k], chunk[k + 1], &mut buf);
+    for k in (0..chunk_size - 1).rev() {
+        for (state, chunk) in states.iter_mut().zip(&chunks).rev() {
+            put(state, chunk[k], chunk[k + 1], buf);
         }
     }
 
-    for (state, chunk) in states.iter_mut().rev().zip(chunks.iter().rev()) {
-        put(state, NUL, chunk[0], &mut buf);
+    for (state, chunk) in states.iter_mut().zip(&chunks).rev() {
+        put(state, NUL, chunk[0], buf);
     }
 
-    write_states(dst, &states)?;
-    dst.extend(buf.iter().rev());
-
-    Ok(())
+    states
 }
 
 fn write_frequencies(
@@ -152,10 +324,8 @@ fn build_frequencies(src: &[u8], state_count: usize) -> Frequencies {
         frequencies[i][j] += 1;
     }
 
-    for syms in src.windows(CONTEXT_SIZE) {
-        let (i, j) = (usize::from(syms[0]), usize::from(syms[1]));
-        frequencies[i][j] += 1;
-    }
+    let rows = <&mut [_; ALPHABET_SIZE]>::try_from(&mut frequencies[..]).expect("a row per symbol");
+    histogram::add_order_1(src, rows);
 
     frequencies
 }
@@ -171,19 +341,6 @@ fn contexts(alphabet: &[bool; ALPHABET_SIZE]) -> impl Iterator<Item = usize> + '
 
 // Only the rows of contexts in the alphabet are touched: a fresh table is zeroed lazily, so
 // rows never read cost nothing.
-
-fn normalize_frequencies(
-    raw_frequencies: &Frequencies,
-    alphabet: &[bool; ALPHABET_SIZE],
-) -> Frequencies {
-    let mut frequencies = vec![[0; ALPHABET_SIZE]; ALPHABET_SIZE];
-
-    for i in contexts(alphabet) {
-        frequencies[i] = order_0::normalize_frequencies(&raw_frequencies[i]);
-    }
-
-    frequencies
-}
 
 fn build_cumulative_frequencies(
     frequencies: &Frequencies,

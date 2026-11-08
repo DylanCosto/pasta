@@ -8,26 +8,29 @@ pub fn encode(src: &[u8], ctx: &Context) -> Vec<u8> {
 
     match ctx.symbol_count.get() {
         1 => Vec::new(),
-        2 => pack(src, mapping_table, 8),
-        3..=4 => pack(src, mapping_table, 4),
-        5..=16 => pack(src, mapping_table, 2),
+        2 => pack::<8>(src, mapping_table),
+        3..=4 => pack::<4>(src, mapping_table),
+        5..=16 => pack::<2>(src, mapping_table),
         _ => unreachable!(),
     }
 }
 
-fn pack(src: &[u8], mapping_table: &[u8; ALPHABET_SIZE], chunk_size: usize) -> Vec<u8> {
+/// Packs `N` symbols, mapped to `8 / N` bits each, into each byte, the first in the low bits.
+fn pack<const N: usize>(src: &[u8], mapping_table: &[u8; ALPHABET_SIZE]) -> Vec<u8> {
     const BITS: usize = u8::BITS as usize;
 
-    let shift = BITS / chunk_size;
+    let pack_chunk = |chunk: &[u8]| {
+        chunk.iter().enumerate().fold(0, |d, (i, &sym)| {
+            d | (mapping_table[usize::from(sym)] << ((BITS / N) * i))
+        })
+    };
 
-    let compressed_size = src.len().div_ceil(chunk_size);
-    let mut dst = vec![0; compressed_size];
+    let (chunks, remainder) = src.as_chunks::<N>();
+    let mut dst = Vec::with_capacity(src.len().div_ceil(N));
+    dst.extend(chunks.iter().map(|chunk| pack_chunk(chunk)));
 
-    for (d, chunk) in dst.iter_mut().zip(src.chunks(chunk_size)) {
-        for (i, &sym) in chunk.iter().enumerate() {
-            let n = mapping_table[usize::from(sym)];
-            *d |= n << (shift * i);
-        }
+    if !remainder.is_empty() {
+        dst.push(pack_chunk(remainder));
     }
 
     dst
@@ -45,7 +48,7 @@ mod tests {
         mapping_table[usize::from(b'n')] = 0;
         mapping_table[usize::from(b'd')] = 1;
 
-        assert_eq!(pack(&src, &mapping_table, 8), [0b00001100]);
+        assert_eq!(pack::<8>(&src, &mapping_table), [0b00001100]);
     }
 
     #[test]
@@ -58,7 +61,7 @@ mod tests {
         mapping_table[usize::from(b'l')] = 2;
         mapping_table[usize::from(b's')] = 3;
 
-        assert_eq!(pack(&src, &mapping_table, 4), [0b11100100]);
+        assert_eq!(pack::<4>(&src, &mapping_table), [0b11100100]);
     }
 
     #[test]
@@ -72,6 +75,6 @@ mod tests {
         mapping_table[usize::from(b'l')] = 3;
         mapping_table[usize::from(b's')] = 4;
 
-        assert_eq!(pack(&src, &mapping_table, 2), [0b00100000]);
+        assert_eq!(pack::<2>(&src, &mapping_table), [0b00100000]);
     }
 }

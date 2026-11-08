@@ -390,9 +390,10 @@ compresses with libdeflate, as wall time. `-@ N` adds N threads in both tools. C
 ("short" is 1M synthetic 150 bp paired reads, "long" 9,784 nanopore reads with MM/ML tags) are
 medians of 5 warm runs of ntools 0.9.0 on 2026-11-07. Whole-genome rows (GIAB HG003 35x Illumina,
 HG002 PacBio Revio, HG003 ONT R10.4.1) are one run each, at `-@ 16`, of ntools 0.2.0 on
-2026-11-04, which compressed with libdeflate, except `view BAM->CRAM 3.1`, re-timed with ntools
-0.9.0 on 2026-11-08. ntools now compresses with zflate ([Compression](../README.md#compression)),
-which writes BAM faster.
+2026-11-04, which compressed with libdeflate, except `view BAM->CRAM 3.1`, re-timed on
+2026-11-08 with the CRAM writer of the next release ([changelog](../CHANGELOG.md)), with a warm
+cache. ntools now compresses with zflate ([Compression](../README.md#compression)), which writes
+BAM faster.
 
 | Operation | samtools (s) | ntools (s) | Speedup |
 |---|---:|---:|---:|
@@ -409,7 +410,7 @@ which writes BAM faster.
 | view -c, 35x HG003 short reads (CRAM 3.1) | 23.460 | 5.060 | 4.64x |
 | flagstat, 35x HG003 short reads (CRAM 3.1) | 30.420 | 7.560 | 4.02x |
 | stats, 35x HG003 short reads (BAM) | 1440.650 | 553.840 | 2.60x |
-| view BAM->CRAM 3.1, 35x HG003 short reads | 227.240 | 270.010 | 0.84x |
+| view BAM->CRAM 3.1, 35x HG003 short reads | 223.910 | 160.860 | 1.39x |
 | collate, fixmate -m, sort, markdup (piped), 35x HG003 short reads | 2869.200 | 2909.910 | 0.99x |
 | stats, HG002 Revio (BAM) | 2169.500 | 293.970 | 7.38x |
 | sort -n, HG002 Revio (BAM) | 1011.740 | 646.610 | 1.56x |
@@ -423,11 +424,9 @@ at `-@ 8`, at its default level 6, for a file 5% larger than HTSlib's default.
 
 ### Where samtools is faster
 
-- Writing CRAM (`view -C`) takes more time than HTSlib, and the files are larger: on 2 million
-  of the 35x short reads (chr20), single-threaded, 1.35x samtools' time (9.0 s against 6.6 s),
-  for a file 5% larger, mostly in the quality scores and read names; on the whole 35x genome at
-  `-@ 16`, 1.19x (270 s against 227 s), with 1.6 times its CPU time. ntools 0.2.0 took 2.1x on
-  the whole genome, and 1.05x on the Revio long reads.
+- Writing CRAM 3.0 (`view -C`) single-threaded is level with samtools: on the 35x short reads of
+  chr20 (1.1 GB BAM), 57.0 s against 56.8 s (CRAM 3.1: 56.7 s against 63.9 s; at `-@ 16`, 4.0 s
+  and 3.9 s against 12.2 s and 12.3 s).
 - `view` CRAM to SAM of the short reads is slightly slower single-threaded (0.94x). On the 69 GB
   ONT CRAM, `view -c` and `flagstat` (0.86x and 0.89x in 0.2.0) mostly wait for the file to be
   read and use less CPU time than samtools.
@@ -438,5 +437,6 @@ at `-@ 8`, at its default level 6, for a file 5% larger than HTSlib's default.
   against 153 s. `markdup` stops speeding up past `-@ 4`, limited by the thread that matches
   duplicates.
 - Memory: `collate -Ou` takes 350 MB against samtools' 26 MB on the corpus, `mpileup -M` on the
-  long reads 509 MB against 43 MB, and `stats` on the long reads at `-@ 8` 843 MB against
-  660 MB.
+  long reads 509 MB against 43 MB, `stats` on the long reads at `-@ 8` 843 MB against
+  660 MB, and `view -C -@ 16` on the 35x short reads of chr20 720 MB against 510 MB
+  (single-threaded, 105 MB against 245 MB).

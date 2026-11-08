@@ -12,7 +12,7 @@
 //! tags that mark where regenerated tags go, but no HTSlib release writes them; noodles does not
 //! read them.
 
-use std::{borrow::Cow, io::Write};
+use std::borrow::Cow;
 
 use crate::core::Position;
 use crate::sam::alignment::record::data::field::Tag;
@@ -120,21 +120,27 @@ fn reference<'a>(record: &'a Record<'_>) -> Option<Reference<'a>> {
 }
 
 /// The MD string being built, or nothing when only NM is needed.
-struct Md {
-    buf: Vec<u8>,
-    is_built: bool,
+struct Md<'a> {
+    buf: Option<&'a mut Vec<u8>>,
 }
 
-impl Md {
+impl Md<'_> {
     fn push(&mut self, b: u8) {
-        if self.is_built {
-            self.buf.push(b);
+        if let Some(buf) = &mut self.buf {
+            buf.push(b);
         }
     }
 
     fn push_number(&mut self, n: i64) {
-        if self.is_built {
-            write!(self.buf, "{n}").expect("writing to a Vec cannot fail");
+        use lexical_core::FormattedSize;
+
+        if let Some(buf) = &mut self.buf {
+            let mut dst = [0; i64::FORMATTED_SIZE_DECIMAL];
+
+            // Most are a digit or two, pushed rather than copied.
+            for &b in lexical_core::write(n, &mut dst).iter() {
+                buf.push(b);
+            }
         }
     }
 }
@@ -181,31 +187,36 @@ fn calculate(record: &Record<'_>, with_md: bool) -> Option<(Vec<u8>, u32)> {
         .iter()
         .map(|feature| (usize::from(feature.position()), Step::from(feature)));
 
-    calculate_from_steps(
+    let mut md = Vec::new();
+
+    let nm = calculate_from_steps(
         &reference,
         record.alignment_start?,
         record.read_length,
         steps,
-        with_md,
-    )
+        with_md.then_some(&mut md),
+    )?;
+
+    Some((md, nm))
 }
 
-/// The MD string (empty unless `with_md`) and NM count of a record from its features' `steps`,
-/// or `None` if it reads outside the loaded reference bases.
+/// The NM count of a record from its features' `steps`, writing its MD string to `md`, if any
+/// (cleared first), or `None` if it reads outside the loaded reference bases.
 pub(crate) fn calculate_from_steps<I>(
     reference: &Reference<'_>,
     alignment_start: Position,
     read_length: usize,
     steps: I,
-    with_md: bool,
-) -> Option<(Vec<u8>, u32)>
+    md: Option<&mut Vec<u8>>,
+) -> Option<u32>
 where
     I: IntoIterator<Item = (usize, Step)>,
 {
-    let mut md = Md {
-        buf: Vec::new(),
-        is_built: with_md,
-    };
+    let mut md = Md { buf: md };
+
+    if let Some(buf) = &mut md.buf {
+        buf.clear();
+    }
     let mut md_dist: i64 = 0;
     let mut nm: u32 = 0;
     let mut seq_pos = 1;
@@ -225,6 +236,15 @@ where
                 *md_dist += len as i64;
             }
 
+            return Some(());
+        }
+
+        // Most spans hold no N: they are all matches.
+        let i = start.checked_sub(reference.offset)?;
+        let bases = reference.bases.get(i..i + len)?;
+
+        if memchr::memchr2(b'N', b'n', bases).is_none() {
+            *md_dist += len as i64;
             return Some(());
         }
 
@@ -356,7 +376,7 @@ where
 
     push_dist(&mut md, md_dist);
 
-    Some((md.buf, nm))
+    Some(nm)
 }
 
 #[cfg(test)]

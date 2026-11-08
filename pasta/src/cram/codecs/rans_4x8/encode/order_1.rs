@@ -1,16 +1,21 @@
 use std::io::{self, Write};
 
-use super::{header, order_0, state_renormalize, state_step, write_header, write_states};
+use super::{EncodingSymbol, ReverseWriter, header, order_0, write_header, write_states};
 use crate::cram::{
-    codecs::rans_4x8::{ALPHABET_SIZE, LOWER_BOUND, Order, STATE_COUNT},
+    codecs::{
+        histogram,
+        rans_4x8::{ALPHABET_SIZE, LOWER_BOUND, Order, STATE_COUNT},
+    },
     io::writer::num::write_u8,
 };
 
 const CONTEXT_SIZE: usize = 2;
 const NUL: u8 = 0x00;
 
-type RawFrequencies = [[u32; ALPHABET_SIZE]; ALPHABET_SIZE];
-type Frequencies = [[u16; ALPHABET_SIZE]; ALPHABET_SIZE]; // F
+/// Frequencies by context, then symbol (`ALPHABET_SIZE` rows), on the heap: only the rows of
+/// contexts that occur are filled.
+type RawFrequencies = Vec<[u32; ALPHABET_SIZE]>;
+type Frequencies = Vec<[u16; ALPHABET_SIZE]>; // F
 type CumulativeFrequencies = Frequencies; // C
 
 pub fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
@@ -21,10 +26,48 @@ pub fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     let raw_frequencies = build_raw_frequencies(src);
-    let frequencies = normalize_frequencies(&raw_frequencies);
-    let cumulative_frequencies = build_cumulative_frequencies(&frequencies);
+    let contexts = build_alphabet(&raw_frequencies);
+    let last = *src.last().expect("the source is not empty");
+    let frequencies = normalize_frequencies(&raw_frequencies, last);
+    let cumulative_frequencies = build_cumulative_frequencies(&frequencies, &contexts);
 
-    let mut buf = Vec::new();
+    // Steps for the (context, symbol) pairs present, in one row per context that occurs.
+    let mut rows = [0u8; ALPHABET_SIZE];
+    let mut symbols: Vec<[EncodingSymbol; ALPHABET_SIZE]> = Vec::new();
+
+    for (i, (fs, gs)) in frequencies.iter().zip(&cumulative_frequencies).enumerate() {
+        if !contexts[i] {
+            continue;
+        }
+
+        let mut row = [EncodingSymbol::default(); ALPHABET_SIZE];
+
+        for ((symbol, &f), &g) in row.iter_mut().zip(fs).zip(gs) {
+            if f > 0 {
+                *symbol = EncodingSymbol::new(f, g);
+            }
+        }
+
+        // At most 256 rows, so an index fits a byte.
+        rows[i] = symbols.len() as u8;
+        symbols.push(row);
+    }
+
+    // A row for each context, absent ones an empty one, so a step takes one lookup.
+    let empty_row = [EncodingSymbol::default(); ALPHABET_SIZE];
+    let rows: [&[EncodingSymbol; ALPHABET_SIZE]; ALPHABET_SIZE] = std::array::from_fn(|i| {
+        if contexts[i] {
+            &symbols[usize::from(rows[i])]
+        } else {
+            &empty_row
+        }
+    });
+
+    let put = |state: &mut u32, i: u8, j: u8, buf: &mut ReverseWriter| {
+        *state = rows[usize::from(i)][usize::from(j)].put(*state, buf);
+    };
+
+    let mut buf = ReverseWriter::for_symbols(src.len());
     let mut states = [LOWER_BOUND; STATE_COUNT];
 
     let [chunk_0, chunk_1, chunk_2, chunk_3, chunk_4] = split_chunks(src);
@@ -32,41 +75,31 @@ pub fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
     // § 2.2.1 "rANS entropy encoding: Interleaving" (2023-03-15): "Any remainder, when the input
     // buffer is not divisible by 4, is processed ... by the 4th rANS state."
     for syms in chunk_4.windows(CONTEXT_SIZE).rev() {
-        let (i, j) = (usize::from(syms[0]), usize::from(syms[1]));
-        states[3] = state_renormalize(states[3], frequencies[i][j], &mut buf)?;
-        states[3] = state_step(states[3], frequencies[i][j], cumulative_frequencies[i][j]);
+        put(&mut states[3], syms[0], syms[1], &mut buf);
     }
 
-    let mut windows_rev = chunk_0
-        .windows(CONTEXT_SIZE)
-        .rev()
-        .zip(chunk_1.windows(CONTEXT_SIZE).rev())
-        .zip(chunk_2.windows(CONTEXT_SIZE).rev())
-        .zip(chunk_3.windows(CONTEXT_SIZE).rev());
+    // The decoder interleaves the states at each position, reading from a single stream, so
+    // encode positions in reverse with the states in reverse at each one.
+    let chunk_size = chunk_0.len();
 
-    for (((w0, w1), w2), w3) in &mut windows_rev {
-        let windows = [w0, w1, w2, w3];
-
-        for (state, syms) in states.iter_mut().rev().zip(windows.iter().rev()) {
-            let (i, j) = (usize::from(syms[0]), usize::from(syms[1]));
-            *state = state_renormalize(*state, frequencies[i][j], &mut buf)?;
-            *state = state_step(*state, frequencies[i][j], cumulative_frequencies[i][j]);
-        }
+    for k in (0..chunk_size.saturating_sub(1)).rev() {
+        put(&mut states[3], chunk_3[k], chunk_3[k + 1], &mut buf);
+        put(&mut states[2], chunk_2[k], chunk_2[k + 1], &mut buf);
+        put(&mut states[1], chunk_1[k], chunk_1[k + 1], &mut buf);
+        put(&mut states[0], chunk_0[k], chunk_0[k + 1], &mut buf);
     }
 
     let chunks = [chunk_0, chunk_1, chunk_2, chunk_3];
 
     for (state, chunk) in states.iter_mut().rev().zip(chunks.iter().rev()) {
-        let (i, j) = (usize::from(NUL), usize::from(chunk[0]));
-        *state = state_renormalize(*state, frequencies[i][j], &mut buf)?;
-        *state = state_step(*state, frequencies[i][j], cumulative_frequencies[i][j]);
+        put(state, NUL, chunk[0], &mut buf);
     }
 
     let mut dst = vec![0; header::SIZE];
 
     write_frequencies(&mut dst, &frequencies)?;
     write_states(&mut dst, &states)?;
-    dst.extend(buf.iter().rev());
+    dst.extend(buf.as_slice());
 
     let compressed_size = dst[header::SIZE..].len();
     // SAFETY: `dst.len() >= header::SIZE`.
@@ -76,7 +109,7 @@ pub fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
     Ok(dst)
 }
 
-fn write_frequencies<W>(writer: &mut W, frequencies: &Frequencies) -> io::Result<()>
+fn write_frequencies<W>(writer: &mut W, frequencies: &[[u16; ALPHABET_SIZE]]) -> io::Result<()>
 where
     W: Write,
 {
@@ -124,18 +157,21 @@ where
     Ok(())
 }
 
-fn build_alphabet(frequencies: &Frequencies) -> [bool; ALPHABET_SIZE] {
+fn build_alphabet<T>(frequencies: &[[T; ALPHABET_SIZE]]) -> [bool; ALPHABET_SIZE]
+where
+    T: Copy + Default + PartialEq,
+{
     let mut alphabet = [false; ALPHABET_SIZE];
 
     for (a, fs) in alphabet.iter_mut().zip(frequencies) {
-        *a = fs.iter().any(|&g| g > 0);
+        *a = fs.iter().any(|&g| g != T::default());
     }
 
     alphabet
 }
 
 fn build_raw_frequencies(src: &[u8]) -> RawFrequencies {
-    let mut frequencies = [[0; ALPHABET_SIZE]; ALPHABET_SIZE];
+    let mut frequencies = vec![[0; ALPHABET_SIZE]; ALPHABET_SIZE];
 
     // § 2.1.2 "Frequency table: Order-1 encoding": "We use the ASCII value (`\0`) as the starting
     // context for each interleaved rANS state..."
@@ -147,28 +183,84 @@ fn build_raw_frequencies(src: &[u8]) -> RawFrequencies {
         frequencies[i][j] += 1;
     }
 
-    for syms in src.windows(CONTEXT_SIZE) {
-        let (i, j) = (usize::from(syms[0]), usize::from(syms[1]));
-        frequencies[i][j] += 1;
+    let rows = <&mut [_; ALPHABET_SIZE]>::try_from(&mut frequencies[..]).expect("a row per symbol");
+    histogram::add_order_1(src, rows);
+
+    frequencies
+}
+
+/// Normalizes each context's frequencies to add up to 4095, as htscodecs' `rans_compress_O1`
+/// does, so that the output is the same.
+///
+/// htscodecs counts the last symbol, `last`, once more in its context's total (in `hist1_4`), so
+/// that context gets a row even if no symbol follows it.
+// Kept out of `encode`, whose loop otherwise compiles slower.
+#[inline(never)]
+fn normalize_frequencies(raw_frequencies: &RawFrequencies, last: u8) -> Frequencies {
+    let mut frequencies = vec![[0; ALPHABET_SIZE]; ALPHABET_SIZE];
+
+    for (i, (f, g)) in raw_frequencies.iter().zip(&mut frequencies).enumerate() {
+        let total = f.iter().sum::<u32>() + u32::from(i == usize::from(last));
+
+        if total > 0 {
+            *g = normalize_row(f, total);
+        }
     }
 
     frequencies
 }
 
-fn normalize_frequencies(raw_frequencies: &RawFrequencies) -> Frequencies {
-    let mut frequencies = [[0; ALPHABET_SIZE]; ALPHABET_SIZE];
+/// Normalizes a context's frequencies `raw_frequencies`, which add up to `total` (or one less),
+/// as htscodecs does: each is scaled by [`order_0::TOTAL`] over `total` in floating point,
+/// rounded down but kept above 0, and the most frequent symbol (the first, if several) takes up
+/// the difference, unless that would take at least half of it, when all are scaled by 0.98
+/// first.
+fn normalize_row(raw_frequencies: &[u32; ALPHABET_SIZE], total: u32) -> [u16; ALPHABET_SIZE] {
+    use order_0::TOTAL;
 
-    for (f, g) in raw_frequencies.iter().zip(&mut frequencies) {
-        *g = order_0::normalize_frequencies(f);
+    let mut scale = f64::from(TOTAL) / f64::from(total);
+    let mut frequencies = *raw_frequencies;
+
+    loop {
+        let (mut sum, mut max, mut max_index) = (1, 0, 0);
+
+        for (i, f) in frequencies.iter_mut().enumerate().filter(|(_, f)| **f > 0) {
+            if *f > max {
+                (max, max_index) = (*f, i);
+            }
+
+            *f = ((f64::from(*f) * scale) as u32).max(1);
+            sum += *f;
+        }
+
+        let f = &mut frequencies[max_index];
+
+        if sum < TOTAL {
+            *f += TOTAL - sum;
+        } else if sum - TOTAL >= *f / 2 {
+            scale = 0.98;
+            continue;
+        } else {
+            *f -= sum - TOTAL;
+        }
+
+        // Each is at most `TOTAL` - 1.
+        return frequencies.map(|f| f as u16);
     }
-
-    frequencies
 }
 
-fn build_cumulative_frequencies(frequencies: &Frequencies) -> CumulativeFrequencies {
-    let mut cumulative_frequencies = [[0; ALPHABET_SIZE]; ALPHABET_SIZE];
+fn build_cumulative_frequencies(
+    frequencies: &Frequencies,
+    contexts: &[bool; ALPHABET_SIZE],
+) -> CumulativeFrequencies {
+    let mut cumulative_frequencies = vec![[0; ALPHABET_SIZE]; ALPHABET_SIZE];
 
-    for (f, g) in frequencies.iter().zip(&mut cumulative_frequencies) {
+    for ((f, g), _) in frequencies
+        .iter()
+        .zip(&mut cumulative_frequencies)
+        .zip(contexts)
+        .filter(|(_, c)| **c)
+    {
         *g = order_0::build_cumulative_frequencies(f);
     }
 
@@ -255,7 +347,6 @@ mod tests {
         // § 2.1.2 "Frequency table: Order-1 encoding" (563e8ab 2025-04-07)
         let src = b"abracadabraabracadabraabracadabraabracadabrad";
         let frequencies = build_raw_frequencies(src);
-        let frequencies = normalize_frequencies(&frequencies);
 
         let mut expected = [false; ALPHABET_SIZE];
         expected[usize::from(NUL)] = true;
@@ -269,7 +360,6 @@ mod tests {
 
         let src = b"noodles";
         let frequencies = build_raw_frequencies(src);
-        let frequencies = normalize_frequencies(&frequencies);
 
         let mut expected = [false; ALPHABET_SIZE];
         expected[usize::from(NUL)] = true;
@@ -303,22 +393,28 @@ mod tests {
 
     #[test]
     fn test_normalize_frequencies() {
-        // § 2.1.2 "Frequency table: Order-1 encoding" (563e8ab 2025-04-07)
+        // The example of § 2.1.2 "Frequency table: Order-1 encoding" (563e8ab 2025-04-07), which
+        // rounds differently from htscodecs: it has 1639 and 1023 for `a` before `b` and `d`.
         let src = b"abracadabraabracadabraabracadabraabracadabrad";
         let raw_frequencies = build_raw_frequencies(src);
 
         let mut expected = [[0; ALPHABET_SIZE]; ALPHABET_SIZE];
         expected[usize::from(NUL)][usize::from(b'a')] = 4095;
         expected[usize::from(b'a')][usize::from(b'a')] = 614;
-        expected[usize::from(b'a')][usize::from(b'b')] = 1639;
+        expected[usize::from(b'a')][usize::from(b'b')] = 1638;
         expected[usize::from(b'a')][usize::from(b'c')] = 819;
-        expected[usize::from(b'a')][usize::from(b'd')] = 1023;
+        expected[usize::from(b'a')][usize::from(b'd')] = 1024;
         expected[usize::from(b'b')][usize::from(b'r')] = 4095;
         expected[usize::from(b'c')][usize::from(b'a')] = 4095;
         expected[usize::from(b'd')][usize::from(b'a')] = 4095;
         expected[usize::from(b'r')][usize::from(b'a')] = 4095;
 
-        assert_eq!(normalize_frequencies(&raw_frequencies), expected);
+        assert_eq!(normalize_frequencies(&raw_frequencies, b'd'), expected);
+
+        // The last symbol's context has a row even if no symbol follows it there.
+        let raw_frequencies = build_raw_frequencies(b"aaab");
+        let frequencies = normalize_frequencies(&raw_frequencies, b'b');
+        assert_eq!(frequencies[usize::from(b'b')][usize::from(NUL)], 4095);
     }
 
     #[test]

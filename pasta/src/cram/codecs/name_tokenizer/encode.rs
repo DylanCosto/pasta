@@ -1,437 +1,499 @@
-use std::{
-    collections::hash_map::Entry,
-    io::{self, Write},
-    ops::Range,
-};
+mod trie;
 
-use rustc_hash::FxHashMap;
+use std::{io, ops::Range};
 
+use self::trie::Trie;
 use super::Type;
 use crate::cram::io::writer::num::{write_u8, write_u32_le, write_uint7};
 
 const NUL: u8 = 0x00;
 
+/// The token positions a name can use, counting position 0 (whether it is a duplicate, and of
+/// which name) and its end. htscodecs' decoder accepts no more (`MAX_TOKENS`).
+const MAX_TOKENS: usize = 128;
+
+/// The most digits read as one number, as htscodecs reads them, so that any fits in 32 bits.
+const MAX_DIGITS: usize = 9;
+
+/// The types of the streams of a token position, in the order they are written: the types of its
+/// tokens, then their values.
+const STREAM_TYPES: [Type; 10] = [
+    Type::Type,
+    Type::String,
+    Type::Char,
+    Type::Digits0,
+    Type::DZLen,
+    Type::Dup,
+    Type::Diff,
+    Type::Digits,
+    Type::Delta,
+    Type::Delta0,
+];
+
+/// The flag on the first stream of a token position.
+const NEW_POSITION: u8 = 0x80;
+
+/// The flag on a stream that is a copy of an earlier one.
+const DUPLICATE: u8 = 0x40;
+
 /// Compresses NUL-terminated read names with the name tokenizer, coding its token streams with
 /// rANS Nx16 at a CRAM compression `level` (1–9), as HTSlib's `tok3_encode_names` does.
-pub fn encode(mut src: &[u8], level: u8) -> io::Result<Vec<u8>> {
+pub fn encode(src: &[u8], level: u8) -> io::Result<Vec<u8>> {
+    let names: Vec<_> = match src.strip_suffix(&[NUL]) {
+        Some(names) => names.split(|&b| b == NUL).collect(),
+        None if src.is_empty() => Vec::new(),
+        None => src.split(|&b| b == NUL).collect(),
+    };
+
+    let mut encoder = Encoder::new();
+
+    for &name in &names {
+        encoder.push(name)?;
+    }
+
+    // The decoded length: each name and its NUL.
+    let len = names.iter().map(|name| name.len() + 1).sum();
+
     let mut dst = Vec::new();
-
-    if let Some(buf) = src.strip_suffix(&[NUL]) {
-        src = buf;
-    }
-
-    let names: Vec<_> = src.split(|&b| b == NUL).collect();
-
-    write_header(&mut dst, src.len(), names.len())?;
-
-    let diffs = Diffs::build(&names);
-    let mut token_writer = TokenWriter::default();
-
-    for diff in &diffs.diffs {
-        let token = match diff.mode {
-            Mode::Dup(delta) => Token::Dup(delta),
-            Mode::Diff(delta) => Token::Diff(delta),
-        };
-
-        token_writer.write_token(&token)?;
-    }
-
-    encode_token_byte_streams(&mut dst, &token_writer, level)?;
-
-    for i in 0..diffs.max_token_count {
-        let mut token_writer = TokenWriter::default();
-
-        // A duplicate has no tokens.
-        for diff in &diffs.diffs {
-            if let Some(token) = diffs.tokens[diff.tokens.clone()].get(i) {
-                token_writer.write_token(token)?;
-            }
-        }
-
-        encode_token_byte_streams(&mut dst, &token_writer, level)?;
-    }
+    write_header(&mut dst, len, names.len())?;
+    encoder.write_streams(&mut dst, level)?;
 
     Ok(dst)
 }
 
-fn write_header<W>(writer: &mut W, src_len: usize, names_count: usize) -> io::Result<()>
-where
-    W: Write,
-{
-    let ulen =
-        u32::try_from(src_len).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    write_u32_le(writer, ulen)?;
+fn write_header(dst: &mut Vec<u8>, len: usize, names_count: usize) -> io::Result<()> {
+    let ulen = u32::try_from(len).map_err(invalid_input)?;
+    write_u32_le(dst, ulen)?;
 
-    let n_names =
-        u32::try_from(names_count).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    write_u32_le(writer, n_names)?;
+    let n_names = u32::try_from(names_count).map_err(invalid_input)?;
+    write_u32_le(dst, n_names)?;
 
     // TODO: use_arith
-    write_u8(writer, 0)?;
+    write_u8(dst, 0)?;
 
     Ok(())
 }
 
-#[derive(Debug)]
-enum Token<'a> {
-    String(&'a [u8]),
-    Char(u8),
-    PaddedDigits(u32, usize),
-    // ...
-    Dup(usize),
-    Diff(usize),
-    Digits(u32),
-    Delta(u8),
-    Delta0(u8),
-    Match,
-    // ...
-    End,
+/// The token streams of names so far, and what htscodecs keeps to encode the next name.
+struct Encoder<'a> {
+    trie: Trie<'a>,
+    names: Vec<Context<'a>>,
+    tokens: Vec<Token>,
+    positions: Vec<Position>,
 }
 
-impl Token<'_> {
-    fn ty(&self) -> Type {
-        match self {
-            Self::String(_) => Type::String,
-            Self::Char(_) => Type::Char,
-            Self::PaddedDigits(..) => Type::Digits0,
-            // ...
-            Self::Dup(_) => Type::Dup,
-            Self::Diff(_) => Type::Diff,
-            Self::Digits(_) => Type::Digits,
-            Self::Delta(..) => Type::Delta,
-            Self::Delta0(..) => Type::Delta0,
-            Self::Match => Type::Match,
-            // ...
-            Self::End => Type::End,
+/// A name as later names are encoded against it (htscodecs' `last_context`).
+#[derive(Clone)]
+struct Context<'a> {
+    name: &'a [u8],
+    /// Its tokens in [`Encoder::tokens`], from position 1.
+    tokens: Range<usize>,
+}
+
+/// A token as later names compare against it (htscodecs' `last_context_tok`).
+#[derive(Clone, Copy, Debug)]
+enum Token {
+    /// Letters and punctuation, at `start..start + len` of its name.
+    Alpha {
+        start: usize,
+        len: usize,
+    },
+    Char(u8),
+    /// A number padded with zeros to `width` digits.
+    Digits0 {
+        value: u32,
+        width: usize,
+    },
+    Digits(u32),
+}
+
+/// The streams of a token position.
+#[derive(Default)]
+struct Position {
+    /// The stream of each type of [`STREAM_TYPES`].
+    streams: [Vec<u8>; STREAM_TYPES.len()],
+    /// The numbers stored as deltas from the number in this position of the name they are
+    /// encoded against, and those that could not be (htscodecs' `token_dcount` and
+    /// `token_icount`). A number is stored as a delta only while the second count is less than
+    /// the first plus 5.
+    delta_count: u32,
+    digits_count: u32,
+}
+
+impl<'a> Encoder<'a> {
+    fn new() -> Self {
+        Self {
+            trie: Trie::new(),
+            names: Vec::new(),
+            tokens: Vec::new(),
+            positions: vec![Position::default()],
         }
     }
-}
 
-enum Mode {
-    Diff(usize),
-    Dup(usize),
-}
+    /// Encodes a name as htscodecs' `encode_name` does: against the last name equal to it or that
+    /// it begins, if any; otherwise the last name sharing the prefix its format suggests, if any;
+    /// otherwise the name before it.
+    fn push(&mut self, name: &'a [u8]) -> io::Result<()> {
+        let n = self.names.len();
+        let id = u32::try_from(n).map_err(invalid_input)?;
 
-/// How a name is encoded.
-struct Diff {
-    mode: Mode,
-    /// The name's tokens in [`Diffs::tokens`]; none for a duplicate.
-    tokens: Range<usize>,
-    /// The name's raw and resolved tokens in [`Diffs::raw`] and [`Diffs::resolved`], which the next
-    /// name is encoded against: its own, or for a duplicate those of the name it copies.
-    view: Range<usize>,
-}
+        let format = Format::guess(name);
+        let visit = self.trie.visit(name, id, format.prefix_len);
+        let exact = visit.full.filter(|&m| m != id);
 
-/// The diffs of a list of names, with their tokens in flat lists that the diffs index.
-struct Diffs<'a> {
-    diffs: Vec<Diff>,
-    tokens: Vec<Token<'a>>,
-    raw: Vec<&'a [u8]>,
-    /// The tokens as the decoder resolves them (a match or a delta becomes the value it stands
-    /// for).
-    resolved: Vec<Resolved>,
-    /// The most tokens of any name, counting its end.
-    max_token_count: usize,
-}
+        let m = exact
+            .or(visit.prefix)
+            .map_or(n.saturating_sub(1), |m| m as usize);
 
-/// A token's value after decoding.
-#[derive(Clone, Copy, Debug)]
-enum Resolved {
-    Digits(u32),
-    PaddedDigits(u32, usize),
-    Other,
-}
+        let distance = (n - m) as u32;
 
-impl<'a> Diffs<'a> {
-    fn build(names: &[&'a [u8]]) -> Self {
-        let mut diffs = Self {
-            diffs: Vec::with_capacity(names.len()),
-            tokens: Vec::new(),
-            raw: Vec::new(),
-            resolved: Vec::new(),
-            max_token_count: 0,
+        if exact.is_some() && self.names[m].name.len() == name.len() {
+            self.positions[0].push_u32(Type::Dup, distance);
+
+            let tokens = self.names[m].tokens.clone();
+            self.names.push(Context { name, tokens });
+
+            return Ok(());
+        }
+
+        self.positions[0].push_u32(Type::Diff, distance);
+
+        // The first name sharing the prefix is encoded against itself, which is nothing.
+        let prev = match self.names.get(m) {
+            Some(prev) => prev.clone(),
+            None => Context {
+                name: &[],
+                tokens: 0..0,
+            },
         };
 
-        let mut indices: FxHashMap<&[u8], usize> = FxHashMap::default();
+        let tokens_start = self.tokens.len();
+        let mut i = 0;
+        let mut pos = 1;
 
-        for (i, &name) in names.iter().enumerate() {
-            match indices.entry(name) {
-                Entry::Occupied(entry) => {
-                    // A duplicate resolves to the name it copies.
-                    let j = *entry.get();
-                    let view = diffs.diffs[j].view.clone();
+        let prev_token = |tokens: &[Token], pos: usize| {
+            let k = prev.tokens.start + pos - 1;
+            (k < prev.tokens.end).then(|| tokens[k])
+        };
 
-                    diffs.diffs.push(Diff {
-                        mode: Mode::Dup(i - j),
-                        tokens: 0..0,
-                        view,
-                    });
+        // The prefix of a known format is one token.
+        if format.is_fixed {
+            let prefix = &name[..format.prefix_len];
+            let position = position(&mut self.positions, pos)?;
+
+            match prev_token(&self.tokens, pos) {
+                Some(Token::Alpha { len, .. })
+                    if len == prefix.len() && prev.name.starts_with(prefix) =>
+                {
+                    position.push_type(Type::Match);
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert(i);
-
-                    // The first name stands alone; the others are encoded against the one before.
-                    match i.checked_sub(1) {
-                        Some(h) => {
-                            let prev = diffs.diffs[h].view.clone();
-                            diffs.push(Mode::Diff(1), name, prev);
-                        }
-                        None => diffs.push(Mode::Diff(0), name, 0..0),
-                    }
-                }
+                _ => position.push_string(prefix),
             }
+
+            self.tokens.push(Token::Alpha {
+                start: 0,
+                len: prefix.len(),
+            });
+
+            i = prefix.len();
+            pos += 1;
         }
 
-        diffs
-    }
-
-    /// Adds a name, encoding each token against the token in the same position of `prev`, a
-    /// range of [`Self::raw`].
-    fn push(&mut self, mode: Mode, name: &'a [u8], prev: Range<usize>) {
-        let (tokens_start, view_start) = (self.tokens.len(), self.raw.len());
-
-        for (j, raw) in tokenize(name).enumerate() {
-            let k = prev.start + j;
-
-            let (token, resolved) = if k < prev.end {
-                token_after(raw, self.raw[k], self.resolved[k])
-            } else {
-                new_token(raw)
-            };
+        while i < name.len() {
+            let prev_token = prev_token(&self.tokens, pos);
+            let position = position(&mut self.positions, pos)?;
+            let (token, end) = push_token(position, name, i, prev.name, prev_token);
 
             self.tokens.push(token);
-            self.raw.push(raw);
-            self.resolved.push(resolved);
+            i = end;
+            pos += 1;
         }
 
-        self.tokens.push(Token::End);
-        self.max_token_count = self.max_token_count.max(self.tokens.len() - tokens_start);
+        position(&mut self.positions, pos)?.push_type(Type::End);
 
-        self.diffs.push(Diff {
-            mode,
+        self.names.push(Context {
+            name,
             tokens: tokens_start..self.tokens.len(),
-            view: view_start..self.raw.len(),
         });
+
+        Ok(())
     }
-}
 
-/// Splits a name into runs of letters, runs of digits, and single other characters, as
-/// htscodecs' tokenizer does, so that numbers can be stored as deltas from the previous name.
-fn tokenize(b: &[u8]) -> impl Iterator<Item = &[u8]> {
-    use std::iter;
+    /// Writes each token position's streams, as htscodecs' `tok3_encode_names` does.
+    fn write_streams(&self, dst: &mut Vec<u8>, level: u8) -> io::Result<()> {
+        struct Block {
+            pos: u8,
+            ty: Type,
+            data: Vec<u8>,
+        }
 
-    let mut start = 0;
+        let mut blocks = Vec::new();
 
-    iter::from_fn(move || {
-        let first = *b.get(start)?;
+        for (pos, position) in self.positions.iter().enumerate() {
+            let [types, values @ ..] = &position.streams;
 
-        let len = if first.is_ascii_alphabetic() {
-            b[start..]
+            // A decoder takes a type stream that is missing for the first type of the position's
+            // first stream, then matches.
+            let is_implicit = types
+                .split_first()
+                .is_some_and(|(_, rest)| rest.iter().all(|&ty| ty == u8::from(Type::Match)))
+                && values.iter().any(|stream| !stream.is_empty());
+
+            for (&ty, stream) in STREAM_TYPES.iter().zip(&position.streams) {
+                if stream.is_empty() || (ty == Type::Type && is_implicit) {
+                    continue;
+                }
+
+                blocks.push(Block {
+                    pos: pos as u8,
+                    ty,
+                    data: compress(ty, stream, level)?,
+                });
+            }
+        }
+
+        let mut prev_pos = None;
+
+        for (i, block) in blocks.iter().enumerate() {
+            let mut ty = u8::from(block.ty);
+
+            if prev_pos != Some(block.pos) {
+                ty |= NEW_POSITION;
+                prev_pos = Some(block.pos);
+            }
+
+            // A stream coded the same as an earlier one refers to it.
+            let original = blocks[..i]
                 .iter()
-                .take_while(|c| c.is_ascii_alphabetic())
-                .count()
-        } else if first.is_ascii_digit() {
-            b[start..].iter().take_while(|c| c.is_ascii_digit()).count()
-        } else {
-            1
-        };
+                .find(|other| block.data.len() > 4 && other.data == block.data);
 
-        let token = &b[start..start + len];
-        start += len;
-        Some(token)
-    })
-}
-
-/// A token for `raw` on its own: zero-padded digits, digits, a character, or a string.
-fn new_token(raw: &[u8]) -> (Token<'_>, Resolved) {
-    if let Some(n) = parse_digits0(raw) {
-        (
-            Token::PaddedDigits(n, raw.len()),
-            Resolved::PaddedDigits(n, raw.len()),
-        )
-    } else if let Some(n) = parse_digits(raw) {
-        (Token::Digits(n), Resolved::Digits(n))
-    } else if let [c] = raw {
-        (Token::Char(*c), Resolved::Other)
-    } else {
-        (Token::String(raw), Resolved::Other)
-    }
-}
-
-/// A token for `raw` given the previous name's token in the same position: a match, a delta
-/// from its number, or a new token.
-fn token_after<'a>(raw: &'a [u8], prev_raw: &[u8], prev: Resolved) -> (Token<'a>, Resolved) {
-    if raw == prev_raw {
-        return (Token::Match, prev);
-    }
-
-    match prev {
-        // Printed without padding, so the number must have no leading zero (a `0` is padded
-        // digits).
-        Resolved::Digits(n) if raw.first() != Some(&b'0') => {
-            if let Some(m) = parse_digits(raw)
-                && let Some(delta) = small_delta(n, m)
-            {
-                return (Token::Delta(delta), Resolved::Digits(m));
+            match original {
+                Some(original) => {
+                    dst.extend([ty | DUPLICATE, original.pos, u8::from(original.ty)]);
+                }
+                None => {
+                    dst.push(ty);
+                    dst.extend_from_slice(&block.data);
+                }
             }
-        }
-        // Printed in exactly the previous width (htscodecs keeps it fixed), which must give back
-        // `raw`: a number that grows wider starts a new token.
-        Resolved::PaddedDigits(n, width) => {
-            if let Some(m) = parse_digits(raw)
-                && let Some(delta) = small_delta(n, m)
-                && raw.len() == width
-                && digit_count(m) <= width
-            {
-                return (Token::Delta0(delta), Resolved::PaddedDigits(m, width));
-            }
-        }
-        _ => {}
-    }
-
-    new_token(raw)
-}
-
-fn small_delta(n: u32, m: u32) -> Option<u8> {
-    m.checked_sub(n).and_then(|delta| u8::try_from(delta).ok())
-}
-
-fn digit_count(n: u32) -> usize {
-    n.checked_ilog10().map_or(1, |log| log as usize + 1)
-}
-
-/// Zero-padded digits: digits with a leading zero, including a lone `0` (which htscodecs decodes
-/// to nothing as plain digits).
-fn parse_digits0(s: &[u8]) -> Option<u32> {
-    if s.starts_with(b"0") {
-        parse_u32(s).ok()
-    } else {
-        None
-    }
-}
-
-fn parse_digits(s: &[u8]) -> Option<u32> {
-    if s.iter().all(u8::is_ascii_digit) {
-        parse_u32(s).ok()
-    } else {
-        None
-    }
-}
-
-fn parse_u32(src: &[u8]) -> io::Result<u32> {
-    lexical_core::parse(src).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-#[derive(Default)]
-struct TokenWriter {
-    type_writer: Vec<u8>,
-    string_writer: Vec<u8>,
-    char_writer: Vec<u8>,
-    digits0_writer: Vec<u8>,
-    dz_len_writer: Vec<u8>,
-    dup_writer: Vec<u8>,
-    diff_writer: Vec<u8>,
-    digits_writer: Vec<u8>,
-    delta_writer: Vec<u8>,
-    delta0_writer: Vec<u8>,
-}
-
-impl TokenWriter {
-    fn write_token(&mut self, token: &Token<'_>) -> io::Result<()> {
-        write_type(&mut self.type_writer, token.ty())?;
-
-        match token {
-            Token::String(s) => {
-                self.string_writer.write_all(s)?;
-                self.string_writer.write_all(&[NUL])?;
-            }
-            Token::Char(b) => write_u8(&mut self.char_writer, *b)?,
-            Token::PaddedDigits(n, width) => {
-                // d
-                write_u32_le(&mut self.digits0_writer, *n)?;
-
-                let l = u8::try_from(*width)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                write_u8(&mut self.dz_len_writer, l)?;
-            }
-            // ...
-            Token::Dup(delta) => {
-                let n = u32::try_from(*delta)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                write_u32_le(&mut self.dup_writer, n)?;
-            }
-            Token::Diff(delta) => {
-                let n = u32::try_from(*delta)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                write_u32_le(&mut self.diff_writer, n)?;
-            }
-            Token::Digits(n) => {
-                write_u32_le(&mut self.digits_writer, *n)?;
-            }
-            Token::Delta(delta) => {
-                write_u8(&mut self.delta_writer, *delta)?;
-            }
-            Token::Delta0(delta) => {
-                write_u8(&mut self.delta0_writer, *delta)?;
-            }
-            Token::Match => {}
-            // ...
-            Token::End => {}
         }
 
         Ok(())
     }
 }
 
-fn write_type<W>(writer: &mut W, ty: Type) -> io::Result<()>
-where
-    W: Write,
-{
-    let n = match ty {
-        Type::Type => 0,
-        Type::String => 1,
-        Type::Char => 2,
-        Type::Digits0 => 3,
-        Type::DZLen => 4,
-        Type::Dup => 5,
-        Type::Diff => 6,
-        Type::Digits => 7,
-        Type::Delta => 8,
-        Type::Delta0 => 9,
-        Type::Match => 10,
-        Type::Nop => 11,
-        Type::End => 12,
-    };
+/// The streams of token position `pos`, which follows those so far.
+fn position(positions: &mut Vec<Position>, pos: usize) -> io::Result<&mut Position> {
+    if pos == positions.len() {
+        if pos >= MAX_TOKENS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many tokens in a read name",
+            ));
+        }
 
-    write_u8(writer, n)
-}
-
-fn encode_token_byte_streams<W>(
-    writer: &mut W,
-    token_writer: &TokenWriter,
-    level: u8,
-) -> io::Result<()>
-where
-    W: Write,
-{
-    let streams = [
-        (Type::Type, &token_writer.type_writer),
-        (Type::String, &token_writer.string_writer),
-        (Type::Char, &token_writer.char_writer),
-        (Type::Digits0, &token_writer.digits0_writer),
-        (Type::DZLen, &token_writer.dz_len_writer),
-        (Type::Dup, &token_writer.dup_writer),
-        (Type::Diff, &token_writer.diff_writer),
-        (Type::Digits, &token_writer.digits_writer),
-        (Type::Delta, &token_writer.delta_writer),
-        (Type::Delta0, &token_writer.delta0_writer),
-    ];
-
-    for (ty, buf) in streams {
-        encode_token_byte_stream(writer, ty, buf, level)?;
+        positions.push(Position::default());
     }
 
-    Ok(())
+    Ok(&mut positions[pos])
+}
+
+/// Encodes the token of `name` at `start` against the token in the same position of the previous
+/// name, if any, returning the token and its end.
+fn push_token(
+    position: &mut Position,
+    name: &[u8],
+    start: usize,
+    prev_name: &[u8],
+    prev: Option<Token>,
+) -> (Token, usize) {
+    let rest = &name[start..];
+    let b = rest[0];
+
+    if b.is_ascii_alphabetic() {
+        let len = 1 + rest[1..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphabetic() || c.is_ascii_punctuation())
+            .count();
+
+        // A single letter is a character.
+        if len > 1 {
+            let s = &rest[..len];
+
+            match prev {
+                Some(Token::Alpha { start, len })
+                    if prev_name.get(start..start + len) == Some(s) =>
+                {
+                    position.push_type(Type::Match);
+                }
+                _ => position.push_string(s),
+            }
+
+            return (Token::Alpha { start, len }, start + len);
+        }
+    } else if b.is_ascii_digit() {
+        let (len, value) = parse_digits(rest);
+
+        // A number with a leading zero keeps its width, as does one as wide as a padded number
+        // before it.
+        let token = match prev {
+            Some(Token::Digits0 { value: prev, width }) if width == len => {
+                match value.checked_sub(prev) {
+                    Some(0) => position.push_type(Type::Match),
+                    Some(delta @ 1..=255) => position.push_u8(Type::Delta0, delta as u8),
+                    _ => position.push_digits0(value, len),
+                }
+
+                Token::Digits0 { value, width: len }
+            }
+            _ if b == b'0' => {
+                position.push_digits0(value, len);
+                Token::Digits0 { value, width: len }
+            }
+            Some(Token::Digits(prev)) => {
+                match value.checked_sub(prev) {
+                    Some(0) => position.push_type(Type::Match),
+                    Some(delta @ 1..=255) if position.digits_count < position.delta_count + 5 => {
+                        position.push_u8(Type::Delta, delta as u8);
+                        position.delta_count += 1;
+                    }
+                    _ => {
+                        position.push_u32(Type::Digits, value);
+                        position.digits_count += 1;
+                    }
+                }
+
+                Token::Digits(value)
+            }
+            _ => {
+                position.push_u32(Type::Digits, value);
+                Token::Digits(value)
+            }
+        };
+
+        return (token, start + len);
+    }
+
+    match prev {
+        Some(Token::Char(c)) if c == b => position.push_type(Type::Match),
+        _ => position.push_char(b),
+    }
+
+    (Token::Char(b), start + 1)
+}
+
+/// Reads up to [`MAX_DIGITS`] digits at the start of `src`, returning their count and value.
+fn parse_digits(src: &[u8]) -> (usize, u32) {
+    let len = src
+        .iter()
+        .take(MAX_DIGITS)
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+
+    let value = src[..len]
+        .iter()
+        .fold(0, |n, &b| n * 10 + u32::from(b - b'0'));
+
+    (len, value)
+}
+
+impl Position {
+    fn stream(&mut self, ty: Type) -> &mut Vec<u8> {
+        &mut self.streams[usize::from(ty)]
+    }
+
+    fn push_type(&mut self, ty: Type) {
+        self.stream(Type::Type).push(u8::from(ty));
+    }
+
+    fn push_string(&mut self, s: &[u8]) {
+        self.push_type(Type::String);
+
+        let stream = self.stream(Type::String);
+        stream.extend_from_slice(s);
+        stream.push(NUL);
+    }
+
+    fn push_char(&mut self, c: u8) {
+        self.push_u8(Type::Char, c);
+    }
+
+    fn push_digits0(&mut self, value: u32, width: usize) {
+        self.push_u32(Type::Digits0, value);
+        // At most `MAX_DIGITS`.
+        self.stream(Type::DZLen).push(width as u8);
+    }
+
+    fn push_u8(&mut self, ty: Type, n: u8) {
+        self.push_type(ty);
+        self.stream(ty).push(n);
+    }
+
+    fn push_u32(&mut self, ty: Type, n: u32) {
+        self.push_type(ty);
+        self.stream(ty).extend(n.to_le_bytes());
+    }
+}
+
+/// What htscodecs guesses of a name's format from its shape (in `search_trie`): how long a prefix
+/// to look for an earlier name sharing, and whether it is a token of its own.
+#[derive(Debug, Eq, PartialEq)]
+struct Format {
+    prefix_len: usize,
+    is_fixed: bool,
+}
+
+impl Format {
+    fn guess(name: &[u8]) -> Self {
+        let d = name.strip_prefix(b"@").unwrap_or(name);
+        let f = usize::from(name.first() == Some(&b'>'));
+        let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+
+        if d.len() > 70 && d[f] == b'm' && d[7] == b'_' && d[f + 14] == b'_' && d[f + 61] == b'/' {
+            // PacBio
+            Self {
+                prefix_len: 60,
+                is_fixed: false,
+            }
+        } else if d.len() == 17 && d[f + 5] == b':' && d[f + 11] == b':' {
+            // Ion Torrent
+            Self {
+                prefix_len: 6,
+                is_fixed: true,
+            }
+        } else if d.len() > 37
+            && [8, 13, 18, 23].iter().all(|&i| d[f + i] == b'-')
+            && is_hex(d[f])
+            && is_hex(d[f + 35])
+        {
+            // Oxford Nanopore: a UUID.
+            Self {
+                prefix_len: 37,
+                is_fixed: true,
+            }
+        } else {
+            // Illumina: the prefix before the lane, tile and coordinates.
+            let end = name.iter().position(|&b| b <= b' ').unwrap_or(name.len());
+
+            let fourth_last_colon = name[..end]
+                .iter()
+                .rposition(|&b| b == b':')
+                .and_then(|i| name[..i].iter().rposition(|&b| b == b':'))
+                .and_then(|i| name[..i].iter().rposition(|&b| b == b':'))
+                .and_then(|i| name[..i].iter().rposition(|&b| b == b':'));
+
+            match fourth_last_colon {
+                Some(i) => Self {
+                    prefix_len: i + 1,
+                    is_fixed: true,
+                },
+                None => Self {
+                    prefix_len: usize::MAX,
+                    is_fixed: false,
+                },
+            }
+        }
+    }
 }
 
 /// The rANS Nx16 flags htscodecs tries on a token stream of type `ty` (the table `R` of
@@ -439,11 +501,6 @@ where
 /// (`cram_compress_by_method`), so only two of the table's rows apply: one for levels 1 and 2,
 /// and one for 3 and above. The number streams hold 4-byte values, which striping (`0x08`)
 /// splits into a stream per byte.
-///
-/// One difference remains: htscodecs codes each striped stream's chunks with whichever of order
-/// 1, RLE and PACK the flags allow comes out smallest, where pasta's rANS encoder codes them with
-/// order 0. On 2 million Illumina read names that search saved 0.1% of the CRAM file for 4.5% more
-/// time writing it.
 fn rans_flags(ty: Type, level: u8) -> &'static [u8] {
     if level < 3 {
         match ty {
@@ -466,34 +523,22 @@ fn rans_flags(ty: Type, level: u8) -> &'static [u8] {
     }
 }
 
-fn encode_token_byte_stream<W>(writer: &mut W, ty: Type, buf: &[u8], level: u8) -> io::Result<()>
-where
-    W: Write,
-{
+/// Codes a token stream with each of htscodecs' flags for its type and keeps the smallest, after
+/// its length.
+fn compress(ty: Type, src: &[u8], level: u8) -> io::Result<Vec<u8>> {
     use crate::cram::codecs::rans_nx16::{self, Flags};
 
-    if buf.is_empty() {
-        return Ok(());
-    }
-
-    if ty == Type::Type {
-        write_u8(writer, 0x80)?;
-    } else {
-        write_type(writer, ty)?;
-    }
-
-    // Try htscodecs' flags for the stream and keep the smallest result. Striping needs a length
-    // that divides by 4, which the number streams always have; plain order 0 stands in if no flags
-    // are left.
+    // Striping needs a length that divides by 4, which the number streams always have; plain
+    // order 0 stands in if no flags are left.
     let flags = rans_flags(ty, level)
         .iter()
         .copied()
-        .filter(|&flags| buf.len().is_multiple_of(4) || flags & Flags::STRIPE.bits() == 0);
+        .filter(|&flags| src.len().is_multiple_of(4) || flags & Flags::STRIPE.bits() == 0);
 
     let mut cdata: Option<Vec<u8>> = None;
 
     for flags in flags {
-        let data = rans_nx16::encode(Flags::from_bits_truncate(flags), buf)?;
+        let data = rans_nx16::encode(Flags::from_bits_truncate(flags), src)?;
 
         if cdata.as_ref().is_none_or(|best| data.len() < best.len()) {
             cdata = Some(data);
@@ -502,16 +547,23 @@ where
 
     let cdata = match cdata {
         Some(cdata) => cdata,
-        None => rans_nx16::encode(Flags::empty(), buf)?,
+        None => rans_nx16::encode(Flags::empty(), src)?,
     };
 
-    let clen =
-        u32::try_from(cdata.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    write_uint7(writer, clen)?;
+    let clen = u32::try_from(cdata.len()).map_err(invalid_input)?;
 
-    writer.write_all(&cdata)?;
+    let mut dst = Vec::with_capacity(cdata.len() + 5);
+    write_uint7(&mut dst, clen)?;
+    dst.extend(cdata);
 
-    Ok(())
+    Ok(dst)
+}
+
+fn invalid_input<E>(e: E) -> io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    io::Error::new(io::ErrorKind::InvalidInput, e)
 }
 
 #[cfg(test)]
@@ -599,11 +651,10 @@ mod tests {
         use crate::cram::codecs::rans_nx16;
 
         let buf = [1, 2, 3, 4, 5, 6];
-        let mut dst = Vec::new();
-        super::encode_token_byte_stream(&mut dst, super::Type::Digits, &buf, 1)?;
+        let dst = super::compress(super::Type::Digits, &buf, 1)?;
 
-        // A type byte and a 1-byte length precede the rANS stream.
-        let data = &dst[2..];
+        // A 1-byte length precedes the rANS stream.
+        let data = &dst[1..];
         assert_eq!(data[0] & rans_nx16::Flags::STRIPE.bits(), 0);
         assert_eq!(rans_nx16::decode(data, buf.len())?, buf);
 
@@ -642,6 +693,93 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// The output is htscodecs' byte for byte, which picks the same names to encode against,
+    /// the same tokens, and the same ways of coding their streams.
+    #[test]
+    fn test_encode_matches_htscodecs() -> std::io::Result<()> {
+        let src = include_bytes!("../fixtures/names-formats.bin");
+
+        for (level, expected) in [
+            (
+                1,
+                &include_bytes!("../fixtures/tok3-rans-formats-1.bin")[..],
+            ),
+            (
+                3,
+                &include_bytes!("../fixtures/tok3-rans-formats-3.bin")[..],
+            ),
+        ] {
+            assert_eq!(super::encode(src, level)?, expected, "level {level}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_format_guess() {
+        use super::Format;
+
+        let fixed = |prefix_len| Format {
+            prefix_len,
+            is_fixed: true,
+        };
+
+        assert_eq!(
+            Format::guess(b"A00744:46:HV3C3DSXX:2:1131:20076:26021"),
+            fixed(20)
+        );
+        assert_eq!(Format::guess(b"A:1:2:3:4"), fixed(2));
+        assert_eq!(Format::guess(b"ZEN10:00027:00321"), fixed(6));
+        assert_eq!(
+            Format::guess(b"f33d30d5-6eb8-4115-8f46-154c2620a5da_Basecall_1D_template"),
+            fixed(37)
+        );
+        assert_eq!(
+            Format::guess(b"m64011_190830_220126/1/ccs"),
+            Format {
+                prefix_len: usize::MAX,
+                is_fixed: false
+            }
+        );
+        assert_eq!(
+            Format::guess(
+                b"m140415_143853_42175_c100635972550000001823121909121417_s1_p0/553/3100_11230"
+            ),
+            Format {
+                prefix_len: 60,
+                is_fixed: false
+            }
+        );
+        assert_eq!(
+            Format::guess(b""),
+            Format {
+                prefix_len: usize::MAX,
+                is_fixed: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_encode_with_too_many_tokens() -> std::io::Result<()> {
+        // Each "a1" is a character and a number: two tokens.
+        let name = |n| "a1".repeat(n) + "\0";
+
+        assert!(super::encode(name(63).as_bytes(), 3).is_ok());
+        assert!(super::encode(name(64).as_bytes(), 3).is_err());
+
+        let src = name(63) + &name(63);
+        let encoded = super::encode(src.as_bytes(), 3)?;
+        assert_eq!(super::super::decode(&encoded)?, src.as_bytes());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_empty() -> std::io::Result<()> {
+        assert_eq!(super::encode(b"", 3)?, [0, 0, 0, 0, 0, 0, 0, 0, 0]);
         Ok(())
     }
 }

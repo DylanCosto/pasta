@@ -1,9 +1,6 @@
-use std::{
-    error, fmt, io,
-    num::{NonZero, Saturating},
-};
+use std::{error, fmt, io, num::NonZero};
 
-use super::{super::order_0, write_u8};
+use super::super::order_0;
 use crate::cram::{codecs::rans_nx16::ALPHABET_SIZE, io::writer::num::write_uint7};
 
 pub struct Context {
@@ -27,20 +24,7 @@ impl fmt::Display for BuildContextError {
 }
 
 pub fn build_context(src: &[u8]) -> Result<Context, BuildContextError> {
-    let mut alphabet = [Saturating::default(); ALPHABET_SIZE];
-
-    // htscodecs counts the first symbol as a run break, too.
-    if let Some(&sym) = src.first() {
-        alphabet[usize::from(sym)] -= 1;
-    }
-
-    for window in src.windows(2) {
-        let (prev_sym, sym) = (window[0], window[1]);
-        let delta = if sym == prev_sym { 1 } else { -1 };
-        alphabet[usize::from(sym)] += delta;
-    }
-
-    let alphabet = alphabet.map(|n| n.0 > 0);
+    let alphabet = count_savings(src).map(|n| n > 0);
 
     let n = alphabet.iter().filter(|&&a| a).count();
     let symbol_count = NonZero::new(n).ok_or(BuildContextError::EmptyAlphabet)?;
@@ -49,6 +33,47 @@ pub fn build_context(src: &[u8]) -> Result<Context, BuildContextError> {
     write_alphabet(&mut dst, &alphabet, symbol_count);
 
     Ok(Context { alphabet, dst })
+}
+
+/// Counts, for each symbol, how many more times it repeats the one before than it does not
+/// (htscodecs' `rle_find_syms`, which counts the first symbol as a run break, too). A block is
+/// under 2^32 bytes, so this fits.
+///
+/// Counting into one table, each repeat in a run would wait for the last to be stored. As
+/// htscodecs does, this counts alternate positions into four tables and adds them up.
+fn count_savings(src: &[u8]) -> [i64; ALPHABET_SIZE] {
+    let step = |prev: u8, sym: u8| if sym == prev { 1 } else { -1 };
+
+    let Some((&first, rest)) = src.split_first() else {
+        return [0; ALPHABET_SIZE];
+    };
+
+    let mut tables = [[0; ALPHABET_SIZE]; 4];
+    tables[0][usize::from(first)] = -1;
+
+    let mut prev = first;
+    let (quads, remainder) = rest.as_chunks::<4>();
+
+    for &[a, b, c, d] in quads {
+        tables[0][usize::from(a)] += step(prev, a);
+        tables[1][usize::from(b)] += step(a, b);
+        tables[2][usize::from(c)] += step(b, c);
+        tables[3][usize::from(d)] += step(c, d);
+        prev = d;
+    }
+
+    for &sym in remainder {
+        tables[0][usize::from(sym)] += step(prev, sym);
+        prev = sym;
+    }
+
+    let [mut savings, t1, t2, t3] = tables;
+
+    for (((n, a), b), c) in savings.iter_mut().zip(t1).zip(t2).zip(t3) {
+        *n += a + b + c;
+    }
+
+    savings
 }
 
 fn write_alphabet(
@@ -60,7 +85,7 @@ fn write_alphabet(
 
     for (sym, _) in alphabet.iter().enumerate().filter(|(_, a)| **a) {
         // SAFETY: `sym` < `ALPHABET_SIZE`.
-        write_u8(dst, sym as u8);
+        dst.push(sym as u8);
     }
 }
 
@@ -72,7 +97,7 @@ fn write_symbol_count(dst: &mut Vec<u8>, symbol_count: NonZero<usize>) {
     }
 
     // SAFETY: `n` < `ALPHABET_SIZE`.
-    write_u8(dst, n as u8);
+    dst.push(n as u8);
 }
 
 /// Writes the run-length metadata (the alphabet and run lengths), compressed with order-0 rANS
@@ -90,7 +115,7 @@ pub fn write_context(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let mut buf = Vec::new();
-    let order_0_ctx = order_0::build_context(&ctx.dst);
+    let order_0_ctx = order_0::build_context(&ctx.dst)?;
     order_0::write_context(&mut buf, &order_0_ctx)?;
     order_0::encode(&ctx.dst, &order_0_ctx, state_count, &mut buf)?;
 
@@ -135,6 +160,23 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_count_savings() {
+        for len in [0, 1, 2, 5, 8, 1001] {
+            let src: Vec<u8> = (0..len).map(|i| b"aaab"[(i * 7 / 5) % 4]).collect();
+
+            let mut expected = [0i64; ALPHABET_SIZE];
+            let mut prev = None;
+
+            for &sym in &src {
+                expected[usize::from(sym)] += if prev == Some(sym) { 1 } else { -1 };
+                prev = Some(sym);
+            }
+
+            assert_eq!(count_savings(&src), expected, "len {len}");
+        }
     }
 
     #[test]

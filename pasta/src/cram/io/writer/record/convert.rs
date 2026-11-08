@@ -1,16 +1,18 @@
-use std::{io, sync::Arc};
+use std::{io, ops::Deref};
+
+use bstr::BStr;
 
 use crate::core::Position;
-use crate::fasta;
 use crate::sam::{
     self as sam,
-    alignment::{
-        record::data::field::{Tag, Value},
-        record_buf::{QualityScores, Sequence, data::field::Value as ValueBuf},
+    alignment::record::{
+        MappingQuality,
+        data::field::{Tag, Type, Value},
     },
 };
+use crate::{bam, fasta};
 
-use super::{Feature, Record, ReferenceBases};
+use super::{Data, Feature, Record, ReferenceBases};
 use crate::cram::{
     container::compression_header::preservation_map::substitution_matrix::Base,
     record::{Flags, MateFlags},
@@ -20,62 +22,180 @@ impl Record {
     /// Converts an alignment record, comparing its bases with the sequence that
     /// `get_reference_sequence` returns for its reference sequence name. When that is `None`, the
     /// bases are stored verbatim.
-    pub fn try_from_alignment_record<F>(
+    pub fn try_from_alignment_record<F, R>(
         header: &sam::Header,
         record: &dyn sam::alignment::Record,
         get_reference_sequence: F,
     ) -> io::Result<Self>
     where
-        F: FnOnce(&[u8]) -> io::Result<Option<Arc<fasta::record::Sequence>>>,
+        F: FnOnce(&[u8]) -> io::Result<Option<R>>,
+        R: Deref<Target = fasta::record::Sequence>,
     {
-        let bam_flags = record.flags()?;
-        let mut cram_flags = Flags::QUALITY_SCORES_ARE_STORED_AS_ARRAY;
+        let cigar = record.cigar();
+        let sequence = record.sequence();
+        let quality_scores = record.quality_scores();
+        let (data, read_group_id) =
+            get_filtered_data(header, record.data().as_ref(), &mut ReadGroups::default())?;
 
-        let record_sequence = record.sequence();
-
-        let sequence = if record_sequence.is_empty() {
-            cram_flags.insert(Flags::SEQUENCE_IS_MISSING);
-            Sequence::default()
-        } else {
-            let mut bases = Vec::with_capacity(record_sequence.len());
-            record_sequence.append_to(&mut bases);
-            Sequence::from(bases)
+        let parts = Parts {
+            bam_flags: record.flags()?,
+            reference_sequence_id: record.reference_sequence_id(header).transpose()?,
+            alignment_start: record.alignment_start().transpose()?,
+            mapping_quality: record.mapping_quality().transpose()?,
+            mate_reference_sequence_id: record.mate_reference_sequence_id(header).transpose()?,
+            mate_alignment_start: record.mate_alignment_start().transpose()?,
+            template_length: record.template_length()?,
+            name: record.name(),
+            sequence: sequence.as_ref(),
+            quality_scores: quality_scores.as_ref(),
+            data,
+            read_group_id,
         };
 
-        let reference_sequence_id = record.reference_sequence_id(header).transpose()?;
-        let alignment_start = record.alignment_start().transpose()?;
+        parts.into_record(
+            header,
+            cigar.iter(),
+            || cigar.read_length(),
+            get_reference_sequence,
+        )
+    }
+
+    /// Converts a BAM record, as [`Self::try_from_alignment_record`] does, reading its fields in
+    /// place and taking its tags as encoded. `read_groups` remembers the last read group looked
+    /// up.
+    pub(crate) fn try_from_bam_record<F, R>(
+        header: &sam::Header,
+        record: &bam::Record,
+        read_groups: &mut ReadGroups,
+        get_reference_sequence: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&[u8]) -> io::Result<Option<R>>,
+        R: Deref<Target = fasta::record::Sequence>,
+    {
+        let cigar = record.cigar();
+        let sequence = record.sequence();
+        let quality_scores = record.quality_scores();
+
+        let mut read_group_id = None;
+
+        let data = Data::from_bam(record.data().as_ref(), |field| {
+            if field.tag == Tag::READ_GROUP
+                && read_group_id.is_none()
+                && let Some(name) = field.as_str().filter(|_| field.ty == Type::String)
+                && let Some(id) = read_groups.get(header, name)
+            {
+                read_group_id = Some(id);
+                return false;
+            }
+
+            true
+        })?;
+
+        let parts = Parts {
+            bam_flags: record.flags(),
+            reference_sequence_id: record.reference_sequence_id().transpose()?,
+            alignment_start: record.alignment_start().transpose()?,
+            mapping_quality: record.mapping_quality(),
+            mate_reference_sequence_id: record.mate_reference_sequence_id().transpose()?,
+            mate_alignment_start: record.mate_alignment_start().transpose()?,
+            template_length: record.template_length(),
+            name: record.name(),
+            sequence: &sequence,
+            quality_scores: &quality_scores,
+            data,
+            read_group_id,
+        };
+
+        parts.into_record(
+            header,
+            cigar.iter(),
+            || sam::alignment::record::Cigar::read_length(&cigar),
+            get_reference_sequence,
+        )
+    }
+}
+
+/// The fields of an alignment record that a CRAM record is converted from.
+struct Parts<'a> {
+    bam_flags: sam::alignment::record::Flags,
+    reference_sequence_id: Option<usize>,
+    alignment_start: Option<Position>,
+    mapping_quality: Option<MappingQuality>,
+    mate_reference_sequence_id: Option<usize>,
+    mate_alignment_start: Option<Position>,
+    template_length: i32,
+    name: Option<&'a BStr>,
+    sequence: &'a dyn sam::alignment::record::Sequence,
+    quality_scores: &'a dyn sam::alignment::record::QualityScores,
+    data: Data,
+    read_group_id: Option<usize>,
+}
+
+impl Parts<'_> {
+    /// Builds the record, with the CIGAR operations `cigar` (whose read length
+    /// `cigar_read_length` gives).
+    fn into_record<I, L, F, R>(
+        self,
+        header: &sam::Header,
+        cigar: I,
+        cigar_read_length: L,
+        get_reference_sequence: F,
+    ) -> io::Result<Record>
+    where
+        I: IntoIterator<Item = io::Result<sam::alignment::record::cigar::Op>>,
+        L: FnOnce() -> io::Result<usize>,
+        F: FnOnce(&[u8]) -> io::Result<Option<R>>,
+        R: Deref<Target = fasta::record::Sequence>,
+    {
+        let bam_flags = self.bam_flags;
+        let mut cram_flags = Flags::QUALITY_SCORES_ARE_STORED_AS_ARRAY;
+
+        let record_sequence = self.sequence;
+        let record_quality_scores = self.quality_scores;
+
+        if record_sequence.is_empty() {
+            cram_flags.insert(Flags::SEQUENCE_IS_MISSING);
+        }
 
         // As in HTSlib, a mapped record without a sequence (`*`) has the read length of its
         // CIGAR, so decoders can rebuild the CIGAR from the features.
-        let read_length = if sequence.is_empty() && !bam_flags.is_unmapped() {
-            record.cigar().read_length()?
+        let read_length = if record_sequence.is_empty() && !bam_flags.is_unmapped() {
+            cigar_read_length()?
         } else {
-            sequence.len()
+            record_sequence.len()
         };
 
-        // Quality scores are stored as an array of the read length; missing ones (`*`) are
-        // stored as 0xff, as in HTSlib.
-        let record_quality_scores = record.quality_scores();
-
-        let quality_scores = if record_quality_scores.is_empty() {
-            QualityScores::from(vec![0xff; read_length])
-        } else if record_quality_scores.len() != sequence.len() {
+        if !record_quality_scores.is_empty() && record_quality_scores.len() != record_sequence.len()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "sequence-quality scores length mismatch: expected {}, got {}",
-                    sequence.len(),
+                    record_sequence.len(),
                     record_quality_scores.len()
                 ),
             ));
+        }
+
+        // The bases, the quality scores, then the name, in one buffer. Quality scores are stored
+        // as an array of the read length; missing ones (`*`) are stored as 0xff, as in HTSlib.
+        let name_len = self.name.map(|name| name.len());
+        let mut bases =
+            Vec::with_capacity(record_sequence.len() + read_length + name_len.unwrap_or(0));
+        record_sequence.append_to(&mut bases);
+        let sequence_len = bases.len();
+
+        if record_quality_scores.is_empty() {
+            bases.resize(sequence_len + read_length, 0xff);
         } else {
-            let mut scores = Vec::with_capacity(record_quality_scores.len());
-            record_quality_scores.append_to(&mut scores)?;
-            QualityScores::from(scores)
-        };
+            record_quality_scores.append_to(&mut bases)?;
+        }
+
+        let (sequence, quality_scores) = bases.split_at(sequence_len);
 
         let (features, reference_bases) =
-            if let (Some(id), Some(start)) = (reference_sequence_id, alignment_start) {
+            if let (Some(id), Some(start)) = (self.reference_sequence_id, self.alignment_start) {
                 let (reference_sequence_name, _) =
                     header.reference_sequences().get_index(id).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidData, "invalid reference sequence ID")
@@ -90,12 +210,12 @@ impl Record {
                 };
 
                 let features = cigar_to_features(
-                    record.cigar().as_ref(),
+                    cigar,
                     reference_sequence.as_deref(),
                     cram_flags,
                     start,
-                    &sequence,
-                    &quality_scores,
+                    sequence,
+                    quality_scores,
                 )?;
 
                 (features, reference_bases)
@@ -103,68 +223,96 @@ impl Record {
                 (Vec::new(), ReferenceBases::Unused)
             };
 
-        let data = record.data();
-        let (data_buf, read_group_id) = get_filtered_data(header, data.as_ref())?;
+        if let Some(name) = self.name {
+            bases.extend_from_slice(name);
+        }
 
-        Ok(Self {
+        Ok(Record {
             bam_flags,
             cram_flags,
-            reference_sequence_id,
+            reference_sequence_id: self.reference_sequence_id,
             read_length,
-            alignment_start,
-            read_group_id,
-            name: record.name().map(|s| s.into()),
+            alignment_start: self.alignment_start,
+            read_group_id: self.read_group_id,
             mate_flags: MateFlags::default(),
-            mate_reference_sequence_id: record.mate_reference_sequence_id(header).transpose()?,
-            mate_alignment_start: record.mate_alignment_start().transpose()?,
-            template_length: record.template_length()?,
+            mate_reference_sequence_id: self.mate_reference_sequence_id,
+            mate_alignment_start: self.mate_alignment_start,
+            template_length: self.template_length,
             mate_distance: None,
-            data: data_buf,
+            data: self.data,
             features,
             reference_bases,
-            mapping_quality: record.mapping_quality().transpose()?,
-            sequence: sequence.into(),
-            quality_scores: quality_scores.into(),
+            mapping_quality: self.mapping_quality,
+            bases,
+            sequence_len,
+            name_len,
         })
     }
 }
 
-/// Builds the features of a record's CIGAR. Without a reference sequence, aligned bases are stored
-/// verbatim, as stretches of bases.
+/// The last read group looked up in a header by name, as consecutive records usually share it.
+#[derive(Debug, Default)]
+pub(crate) struct ReadGroups {
+    /// The header (its address), the name, and the read group's index.
+    last: Option<(usize, Vec<u8>, Option<usize>)>,
+}
+
+impl ReadGroups {
+    /// The index in `header` of the read group named `name`.
+    fn get(&mut self, header: &sam::Header, name: &[u8]) -> Option<usize> {
+        let header_address = std::ptr::from_ref(header).addr();
+
+        if let Some((address, last_name, id)) = &self.last
+            && *address == header_address
+            && last_name[..] == name[..]
+        {
+            return *id;
+        }
+
+        let id = header.read_groups().get_index_of(name);
+        self.last = Some((header_address, name.to_vec(), id));
+        id
+    }
+}
+
 /// Returns the read length a record converts with (see [`Record::try_from_alignment_record`])
 /// without converting it.
-pub(crate) fn read_length(record: &dyn sam::alignment::Record) -> io::Result<usize> {
+pub(crate) fn read_length(record: &bam::Record) -> io::Result<usize> {
     let sequence = record.sequence();
 
-    if sequence.is_empty() && !record.flags()?.is_unmapped() {
-        record.cigar().read_length()
+    if sequence.is_empty() && !record.flags().is_unmapped() {
+        sam::alignment::record::Cigar::read_length(&record.cigar())
     } else {
         Ok(sequence.len())
     }
 }
 
-fn cigar_to_features(
-    cigar: &dyn sam::alignment::record::Cigar,
+/// Builds the features of a record's CIGAR. Without a reference sequence, aligned bases are stored
+/// verbatim, as stretches of bases.
+fn cigar_to_features<I>(
+    cigar: I,
     reference_sequence: Option<&fasta::record::Sequence>,
     flags: Flags,
     alignment_start: Position,
-    sequence: &Sequence,
-    quality_scores: &QualityScores,
-) -> io::Result<Vec<Feature>> {
+    bases: &[u8],
+    scores: &[u8],
+) -> io::Result<Vec<Feature>>
+where
+    I: IntoIterator<Item = io::Result<sam::alignment::record::cigar::Op>>,
+{
     use crate::sam::alignment::record::cigar::op::Kind;
 
     let reference_bases: Option<&[u8]> = reference_sequence.map(|sequence| sequence.as_ref());
-    let bases: &[u8] = sequence.as_ref();
-    let scores: &[u8] = quality_scores.as_ref();
     let stores_scores = !flags.quality_scores_are_stored_as_array();
 
+    // Many reads match the reference throughout and have none.
     let mut features = Vec::new();
 
     // 0-based offsets into the reference sequence and the read.
     let mut reference_offset = usize::from(alignment_start) - 1;
     let mut read_offset: usize = 0;
 
-    for result in cigar.iter() {
+    for result in cigar {
         let op = result?;
         let len = op.len();
         let kind = op.kind();
@@ -309,29 +457,41 @@ pub(crate) fn push_mismatches(
     let reference_bases = reference_bases.get(reference_offset..).unwrap_or_default();
     let n = reference_bases.len().min(read_bases.len());
 
-    // Most bases match: compare chunks first, and bases only in chunks that differ.
+    // Most bases match: compare chunks first (whole arrays, which compare inline), and bases only
+    // in chunks that differ.
     const CHUNK_LEN: usize = 16;
 
-    let chunks = reference_bases[..n]
-        .chunks(CHUNK_LEN)
-        .zip(read_bases[..n].chunks(CHUNK_LEN));
-
-    for (chunk_index, (reference_chunk, read_chunk)) in chunks.enumerate() {
-        if reference_chunk == read_chunk {
-            continue;
-        }
-
+    let mut push_chunk = |start: usize, reference_chunk: &[u8], read_chunk: &[u8]| {
         for (j, (&reference_base, &read_base)) in reference_chunk.iter().zip(read_chunk).enumerate()
         {
             if !reference_base.eq_ignore_ascii_case(&read_base) {
-                let i = chunk_index * CHUNK_LEN + j;
+                let i = start + j;
                 let position = read_position(read_offset + i)?;
                 features.push(mismatch(position, reference_base, read_base, || {
                     scores.get(read_offset + i).copied()
                 }));
             }
         }
+
+        Ok::<_, io::Error>(())
+    };
+
+    let (reference_chunks, reference_rest) = reference_bases[..n].as_chunks::<CHUNK_LEN>();
+    let (read_chunks, read_rest) = read_bases[..n].as_chunks::<CHUNK_LEN>();
+
+    for (chunk_index, (reference_chunk, read_chunk)) in
+        reference_chunks.iter().zip(read_chunks).enumerate()
+    {
+        if reference_chunk != read_chunk {
+            push_chunk(chunk_index * CHUNK_LEN, reference_chunk, read_chunk)?;
+        }
     }
+
+    push_chunk(
+        reference_chunks.len() * CHUNK_LEN,
+        reference_rest,
+        read_rest,
+    )?;
 
     // Bases past the end of the reference.
     for (i, &base) in read_bases.iter().enumerate().skip(n) {
@@ -365,16 +525,17 @@ where
     }
 }
 
-/// Returns the data fields to store as tags, and the read group ID of the `RG` field.
+/// Returns the record's tags as encoded, but for an `RG` tag naming a read group in the header,
+/// whose index is returned instead.
 ///
 /// As in HTSlib, an `RG` field naming a read group that the header lacks (or that is not a
 /// string) is stored verbatim as a tag.
-#[allow(clippy::type_complexity)]
 fn get_filtered_data(
     header: &sam::Header,
     data: &dyn sam::alignment::record::Data<'_>,
-) -> io::Result<(Vec<(Tag, ValueBuf)>, Option<usize>)> {
-    let mut data_buf = Vec::new();
+    read_groups: &mut ReadGroups,
+) -> io::Result<(Data, Option<usize>)> {
+    let mut data_buf = Data::default();
     let mut read_group_id = None;
 
     for result in data.iter() {
@@ -383,13 +544,13 @@ fn get_filtered_data(
         if tag == Tag::READ_GROUP
             && read_group_id.is_none()
             && let Value::String(name) = &value
-            && let Some(id) = header.read_groups().get_index_of(*name)
+            && let Some(id) = read_groups.get(header, name)
         {
             read_group_id = Some(id);
             continue;
         }
 
-        data_buf.push((tag, value.try_into()?));
+        data_buf.push(tag, &value.try_into()?)?;
     }
 
     Ok((data_buf, read_group_id))
@@ -397,12 +558,15 @@ fn get_filtered_data(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::sam::alignment::{
         record::cigar::{Op, op::Kind},
-        record_buf::Cigar,
+        record_buf::{Cigar, data::field::Value as ValueBuf},
     };
 
     use super::*;
+    use crate::sam::alignment::record_buf::{QualityScores, Sequence};
 
     fn mapped_record(
         cigar: &str,
@@ -452,7 +616,43 @@ mod tests {
             fasta::record::Sequence::from(b"ACGT".to_vec()),
         )]);
 
-        Record::try_from_alignment_record(&header, record, |name| repository.get(name).transpose())
+        convert_both(&header, record, |name| repository.get(name).transpose())
+    }
+
+    /// Converts `record` as an alignment record and as the BAM record it encodes to, which must
+    /// give the same record.
+    fn convert_both<F>(
+        header: &sam::Header,
+        record: &sam::alignment::RecordBuf,
+        get_reference_sequence: F,
+    ) -> io::Result<Record>
+    where
+        F: Fn(&[u8]) -> io::Result<Option<Arc<fasta::record::Sequence>>>,
+    {
+        let actual = Record::try_from_alignment_record(header, record, &get_reference_sequence)?;
+
+        let mut buf = Vec::new();
+        crate::bam::record::codec::encoder::encode(&mut buf, header, record)?;
+        let bam_record = bam::Record::try_from(buf)?;
+        let from_bam = Record::try_from_bam_record(
+            header,
+            &bam_record,
+            &mut ReadGroups::default(),
+            &get_reference_sequence,
+        )?;
+        assert_eq!(from_bam, actual);
+
+        Ok(actual)
+    }
+
+    fn data_of(fields: &[(Tag, ValueBuf)]) -> Data {
+        let mut data = Data::default();
+
+        for (tag, value) in fields {
+            data.push(*tag, value).unwrap();
+        }
+
+        data
     }
 
     #[test]
@@ -463,7 +663,7 @@ mod tests {
 
         assert!(record.cram_flags.contains(Flags::SEQUENCE_IS_MISSING));
         assert_eq!(record.read_length, 5);
-        assert_eq!(record.quality_scores, [0xff; 5]);
+        assert_eq!(record.quality_scores(), [0xff; 5]);
         assert_eq!(
             record.features,
             [
@@ -485,7 +685,7 @@ mod tests {
     fn missing_quality_scores_are_stored_as_0xff() -> io::Result<()> {
         let record = convert(&mapped_record("2M", b"AC", b""))?;
         assert_eq!(record.read_length, 2);
-        assert_eq!(record.quality_scores, [0xff; 2]);
+        assert_eq!(record.quality_scores(), [0xff; 2]);
         assert!(record.features.is_empty());
         Ok(())
     }
@@ -543,9 +743,12 @@ mod tests {
             .map(|(tag, s)| (tag, ValueBuf::from(s)))
             .collect();
         let record = sam::alignment::RecordBuf::builder().set_data(data).build();
-        let actual = Record::try_from_alignment_record(&header, &record, |_| Ok(None))?;
+        let actual = convert_both(&header, &record, |_| Ok(None))?;
         assert_eq!(actual.read_group_id, Some(0));
-        assert_eq!(actual.data, [(Tag::COMMENT, ValueBuf::from("note"))]);
+        assert_eq!(
+            actual.data,
+            data_of(&[(Tag::COMMENT, ValueBuf::from("note"))])
+        );
         Ok(())
     }
 
@@ -562,14 +765,13 @@ mod tests {
         let record = sam::alignment::RecordBuf::builder()
             .set_data(data.clone())
             .build();
-        let actual = Record::try_from_alignment_record(&header, &record, |_| Ok(None))?;
+        let actual = convert_both(&header, &record, |_| Ok(None))?;
         assert_eq!(actual.read_group_id, None);
-        assert_eq!(
-            actual.data,
-            data.iter()
-                .map(|(tag, value)| (tag, value.clone()))
-                .collect::<Vec<_>>()
-        );
+        let expected: Vec<_> = data
+            .iter()
+            .map(|(tag, value)| (tag, value.clone()))
+            .collect();
+        assert_eq!(actual.data, data_of(&expected));
         Ok(())
     }
 
@@ -582,14 +784,14 @@ mod tests {
 
         let cigar: Cigar = [Op::new(Kind::Match, 1)].into_iter().collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![Feature::QualityScore {
             position: Position::try_from(1)?,
@@ -599,14 +801,14 @@ mod tests {
 
         let cigar: Cigar = [Op::new(Kind::Match, 1)].into_iter().collect();
         let sequence = Sequence::from(b"C");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::QualityScore {
@@ -623,14 +825,14 @@ mod tests {
 
         let cigar: Cigar = [Op::new(Kind::Match, 2)].into_iter().collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![Feature::Scores {
             position: Position::try_from(1)?,
@@ -640,14 +842,14 @@ mod tests {
 
         let cigar: Cigar = [Op::new(Kind::Match, 2)].into_iter().collect();
         let sequence = Sequence::from(b"AT");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::Scores {
@@ -666,14 +868,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::InsertBase {
@@ -700,14 +902,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"ACG");
-        let quality_scores = [45, 35, 43].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::Insertion {
@@ -734,14 +936,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::Deletion {
@@ -769,14 +971,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::ReferenceSkip {
@@ -799,14 +1001,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::SoftClip {
@@ -833,14 +1035,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"ACG");
-        let quality_scores = [45, 35, 43].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::SoftClip {
@@ -867,14 +1069,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::HardClip {
@@ -892,14 +1094,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::Padding {
@@ -926,28 +1128,28 @@ mod tests {
 
         let cigar: Cigar = [Op::new(Kind::Match, 1)].into_iter().collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![];
         assert_eq!(actual, expected);
 
         let cigar: Cigar = [Op::new(Kind::Match, 1)].into_iter().collect();
         let sequence = Sequence::from(b"C");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![Feature::Substitution {
             position: Position::try_from(1)?,
@@ -958,28 +1160,28 @@ mod tests {
 
         let cigar: Cigar = [Op::new(Kind::Match, 2)].into_iter().collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![];
         assert_eq!(actual, expected);
 
         let cigar: Cigar = [Op::new(Kind::Match, 2)].into_iter().collect();
         let sequence = Sequence::from(b"AT");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![Feature::Substitution {
             position: Position::try_from(2)?,
@@ -992,14 +1194,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::InsertBase {
@@ -1018,14 +1220,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"ACG");
-        let quality_scores = [45, 35, 43].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::Insertion {
@@ -1044,14 +1246,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::Deletion {
@@ -1075,14 +1277,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::ReferenceSkip {
@@ -1101,14 +1303,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"AC");
-        let quality_scores = [45, 35].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::SoftClip {
@@ -1127,14 +1329,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"ACG");
-        let quality_scores = [45, 35, 43].into_iter().collect();
+        let quality_scores: QualityScores = [45, 35, 43].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![
             Feature::SoftClip {
@@ -1153,14 +1355,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![Feature::HardClip {
             position: Position::try_from(1)?,
@@ -1172,14 +1374,14 @@ mod tests {
             .into_iter()
             .collect();
         let sequence = Sequence::from(b"A");
-        let quality_scores = [45].into_iter().collect();
+        let quality_scores: QualityScores = [45].into_iter().collect();
         let actual = cigar_to_features(
-            &cigar,
+            cigar.as_ref().iter().copied().map(Ok),
             Some(&reference_sequence),
             flags,
             alignment_start,
-            &sequence,
-            &quality_scores,
+            sequence.as_ref(),
+            quality_scores.as_ref(),
         )?;
         let expected = vec![Feature::Padding {
             position: Position::try_from(1)?,
