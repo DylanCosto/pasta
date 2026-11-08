@@ -28,6 +28,11 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   zlib-style 5): 1.3–1.4 times as fast as at HTSlib's default, libdeflate's level 7, and 5%
   larger. Given levels keep their meaning; `-O z6`, `-O b6` and `bgzip -l 6` give HTSlib's size.
   `CompressionLevel::default()` is 5.
+- ntools: on Linux, `sort` and `collate` free the disk space of their temporary files while
+  merging them, as far as the merge has read. A pipeline of commands that spill then needs
+  temporary space for about one copy of the reads instead of one per command: on GIAB HG003
+  chr20 (1.1 GB BAM), `collate | fixmate | sort | markdup` peaks at 2.0 GB of temporary files
+  instead of 3.7 GB (samtools: 2.4 GB), in the same time.
 - Library: `bgzf::io::writer::CompressionLevel` is on libdeflate's scale, 0 to 12, in every build.
   Builds without the `libdeflate` feature took zlib's 0 to 9, so `CompressionLevel::new(9)`
   there was the highest level and is now 9 of 12 (`CompressionLevel::BEST` is 12). The

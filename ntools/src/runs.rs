@@ -257,13 +257,91 @@ pub trait RecordSource {
 }
 
 /// A spill file written by [`spill`].
-pub struct SpillFile(BgzfReader<BufReader<File>>);
+pub struct SpillFile(BgzfReader<BufReader<ReleasingFile>>);
 
 impl SpillFile {
+    /// Opens a spill file to read once, from start to end. The disk space of what has been read
+    /// is released as reading goes on (see [`ReleasingFile`]), so the file cannot be read again.
     pub fn open(path: &Path, threads: usize) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let file = ReleasingFile::open(path, RELEASE_STEP)?;
         Ok(Self(BgzfReader::new(BufReader::new(file), threads)))
     }
+}
+
+/// How many bytes a [`SpillFile`] reads between releasing their disk space.
+const RELEASE_STEP: u64 = 16 << 20;
+
+/// A file read once, from start to end, that releases the disk space of what it has read.
+///
+/// A merge's temporary files then shrink as the merge goes, so a pipeline such as
+/// `collate | sort` needs temporary space for about one copy of the reads, not one per command.
+/// samtools gets the same by removing each `collate` bucket once it is read. Where releasing is
+/// unsupported, this is a plain file.
+struct ReleasingFile {
+    file: File,
+    /// Bytes read.
+    read: u64,
+    /// Bytes released, from the start of the file.
+    released: u64,
+    /// Bytes to read between releases.
+    step: u64,
+    /// Cleared if releasing fails, after which the file is only read.
+    releasing: bool,
+}
+
+impl ReleasingFile {
+    fn open(path: &Path, step: u64) -> io::Result<Self> {
+        // Punching holes needs write access.
+        let file = File::options().read(true).write(true).open(path)?;
+
+        Ok(Self {
+            file,
+            read: 0,
+            released: 0,
+            step,
+            releasing: cfg!(target_os = "linux"),
+        })
+    }
+}
+
+impl Read for ReleasingFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.read += n as u64;
+
+        if self.releasing && self.read - self.released >= self.step {
+            self.releasing = punch_hole(&self.file, self.released, self.read - self.released);
+            self.released = self.read;
+        }
+
+        Ok(n)
+    }
+}
+
+/// Frees the disk space of `len` bytes at `offset`, keeping the file's size, and returns whether
+/// it could.
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, offset: u64, len: u64) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let (Ok(offset), Ok(len)) = (libc::off_t::try_from(offset), libc::off_t::try_from(len)) else {
+        return false;
+    };
+
+    // SAFETY: `fallocate` only changes the file behind the descriptor, which `file` keeps open.
+    unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset,
+            len,
+        ) == 0
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(_: &File, _: u64, _: u64) -> bool {
+    false
 }
 
 impl RecordSource for SpillFile {
@@ -330,4 +408,47 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_releasing_file_releases_what_it_has_read() -> io::Result<()> {
+        use std::{fs, os::unix::fs::MetadataExt};
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("0000.bam");
+        let data: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
+        fs::write(&path, &data)?;
+        let blocks = fs::metadata(&path)?.blocks();
+
+        let mut file = ReleasingFile::open(&path, 64 << 10)?;
+        let mut read = Vec::new();
+        let mut buf = [0; 8192];
+
+        loop {
+            match file.read(&mut buf)? {
+                0 => break,
+                n => read.extend_from_slice(&buf[..n]),
+            }
+        }
+
+        assert_eq!(read, data);
+
+        // Some filesystems cannot punch holes; the file is then only read.
+        if file.releasing {
+            let metadata = fs::metadata(&path)?;
+            assert_eq!(metadata.len(), data.len() as u64);
+            assert!(
+                metadata.blocks() < blocks / 8,
+                "{} of {blocks} blocks left",
+                metadata.blocks()
+            );
+        }
+
+        Ok(())
+    }
 }
