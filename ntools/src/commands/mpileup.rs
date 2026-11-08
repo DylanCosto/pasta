@@ -41,6 +41,9 @@ use crate::global_args::{IgnoredWriteIndex, InputFormatOptions, Verbosity};
 
 /// Reads per batch sent from a reader thread.
 const BATCH_SIZE: usize = 4096;
+/// Bytes of records at which a batch is sent with fewer reads, so that batches of long reads do
+/// not each hold hundreds of megabytes.
+const BATCH_BYTES: usize = 4 << 20;
 /// Batches queued per input.
 const QUEUE_DEPTH: usize = 4;
 

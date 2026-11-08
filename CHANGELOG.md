@@ -38,6 +38,20 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   The compressed bytes of CRAM output change.
 - ntools: writing CRAM no longer calculates the reference's `M5` checksums before the first
   record; the CRAM writer does, alongside the records.
+- ntools: `collate -m` is the memory for buffering records in all, not per thread: by default
+  768M whatever `-@`, instead of 768M for each thread. On GIAB HG003 chr20 (1.1 GB BAM) at
+  `-@ 16`, `collate -Ou` peaks at 910 MB instead of 7.7 GB and takes 17.9 s instead of 15.8 s
+  (samtools: 34.2 s, 348 MB); at `-@ 4`, 860 MB instead of 4.1 GB, in 31.5 s instead of 21.6 s
+  (samtools: 39.8 s). Inputs whose records fit in 768M are collated in memory, as before.
+- ntools: `mpileup` sends records from its reader in batches of at most 4 MB as well as 4,096
+  reads, so long reads no longer fill batches of hundreds of megabytes. On 9,784 nanopore reads,
+  `mpileup -M` peaks at 70 MB instead of 520 MB (samtools: 44 MB), and `mpileup` at 57 MB
+  instead of 430 MB, a little faster and with the same output.
+- ntools: merging sorted runs (the temporary files of `sort` and `collate`, and `merge`'s inputs)
+  compares records by a key computed once per record, as sorting in memory does, instead of, for
+  `collate`, hashing both read names in every comparison. `collate -Ou -@ 4 -m 640M` of GIAB
+  HG003 chr20 (1.1 GB BAM) to `/dev/null`, which spills, takes 27.0 s instead of 33.3 s
+  (samtools: 27.9 s), with the same output.
 
 ## [0.9.0] - 2026-11-08
 

@@ -26,7 +26,9 @@ use crate::{
     sort_order::Order,
 };
 
-/// Memory for buffering records before spilling to temporary files.
+/// Memory for buffering records before spilling to temporary files, in all, whatever the number
+/// of threads: inputs that fit are collated without temporary files, and larger ones in runs few
+/// enough to merge in one pass up to about 190 GB of records.
 const DEFAULT_MEMORY: &str = "768M";
 
 #[derive(Debug, clap::Args)]
@@ -58,8 +60,8 @@ pub struct Args {
     #[arg(short = 'l', default_value_t = 1)]
     level: u8,
 
-    /// Memory for buffering records before spilling to temporary files (K/M/G suffixes; at
-    /// least 1M).
+    /// Memory for buffering records before spilling to temporary files, in all, not per thread
+    /// (K/M/G suffixes; at least 1M).
     #[arg(short = 'm', default_value = DEFAULT_MEMORY, value_parser = parse_memory)]
     memory: usize,
 
@@ -159,7 +161,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         &mut reader,
         &header,
         Order::Collate,
-        args.memory.saturating_mul(args.threads + 1),
+        args.memory,
         args.threads,
         temp_dir.path(),
         |record| Ok(keep(record.flags()?)),

@@ -6,7 +6,7 @@ use anyhow::{Context, bail};
 use pasta::pileup::{Pileup, Read, baq};
 use pasta::sam;
 
-use super::{Args, BATCH_SIZE, Conf, reference::ReferenceCache};
+use super::{Args, BATCH_BYTES, BATCH_SIZE, Conf, reference::ReferenceCache};
 use crate::alignment::{AlignmentReader, Queries, RawEncoder, ReadOptions, Rec};
 
 /// `mplp_func`: filters a read and adjusts its qualities, or returns `None` to skip it.
@@ -116,6 +116,9 @@ pub(super) fn end_pos(read: &Read) -> i64 {
     read.position() + span.max(1)
 }
 
+/// The fewest bytes of records prepared on several threads when they are fewer than 64.
+const MIN_PARALLEL_BYTES: usize = 256 << 10;
+
 /// Prepares a batch of records, on `workers` threads when there are several, keeping their
 /// order.
 pub(super) fn prepare_batch(
@@ -125,7 +128,10 @@ pub(super) fn prepare_batch(
     references: &ReferenceCache,
     workers: usize,
 ) -> anyhow::Result<Vec<Read>> {
-    if workers <= 1 || batch.len() < 64 {
+    // Small batches are not worth the threads; a few long reads can be.
+    let bytes: usize = batch.iter().map(Vec::len).sum();
+
+    if workers <= 1 || (batch.len() < 64 && bytes < MIN_PARALLEL_BYTES) {
         let mut reads = Vec::with_capacity(batch.len());
 
         for raw in batch {
@@ -302,10 +308,12 @@ pub(super) fn read_input(
 
     let _ = header_tx.send(Some(header.clone()));
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch_bytes = 0;
     let mut encoder = RawEncoder::new();
 
     // An `Err` with no cause signals that the consumer hung up.
-    let send = |batch: &mut Vec<Vec<u8>>| -> anyhow::Result<()> {
+    let send = |batch: &mut Vec<Vec<u8>>, batch_bytes: &mut usize| -> anyhow::Result<()> {
+        *batch_bytes = 0;
         let reads = prepare_batch(std::mem::take(batch), conf, &names, references, workers)?;
 
         if tx.send(Ok(reads)).is_err() {
@@ -318,10 +326,11 @@ pub(super) fn read_input(
     let mut visit = |rec: Rec<'_>| -> anyhow::Result<()> {
         let raw = rec.encode_raw(&header, &mut encoder)?.to_vec();
 
+        batch_bytes += raw.len();
         batch.push(raw);
 
-        if batch.len() >= BATCH_SIZE {
-            send(&mut batch)?;
+        if batch.len() >= BATCH_SIZE || batch_bytes >= BATCH_BYTES {
+            send(&mut batch, &mut batch_bytes)?;
         }
 
         Ok(())
@@ -348,7 +357,7 @@ pub(super) fn read_input(
     }
 
     if !batch.is_empty() {
-        match send(&mut batch) {
+        match send(&mut batch, &mut batch_bytes) {
             Err(e) if e.is::<Disconnected>() => {}
             result => result?,
         }
