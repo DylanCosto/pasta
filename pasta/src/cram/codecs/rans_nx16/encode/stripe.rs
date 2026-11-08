@@ -29,6 +29,11 @@ pub(super) fn encode(flags: Flags, src: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 fn encode_chunk(flags: Flags, chunk: &[u8]) -> io::Result<Vec<u8>> {
+    let base = Flags::NO_SIZE | (flags & Flags::N32);
+
+    // The coding without RLE or PACK, made once: trying a transform that does not apply gives
+    // the same bytes.
+    let mut plain: Option<Vec<u8>> = None;
     let mut best: Option<Vec<u8>> = None;
 
     for chunk_flags in CHUNK_FLAGS {
@@ -36,7 +41,24 @@ fn encode_chunk(flags: Flags, chunk: &[u8]) -> io::Result<Vec<u8>> {
             continue;
         }
 
-        let data = super::encode(chunk_flags | Flags::NO_SIZE | (flags & Flags::N32), chunk)?;
+        let packs = || super::bit_pack::build_context(chunk).is_ok();
+
+        let data = if chunk_flags.is_empty() || (chunk_flags == Flags::PACK && !packs()) {
+            match &plain {
+                Some(data) => data.clone(),
+                None => super::encode(base, chunk)?,
+            }
+        } else {
+            super::encode(chunk_flags | base, chunk)?
+        };
+
+        // The flags written say whether RLE or PACK was applied.
+        if chunk_flags != Flags::ORDER
+            && plain.is_none()
+            && (Flags::from_bits_truncate(data[0]) & (Flags::RLE | Flags::PACK)).is_empty()
+        {
+            plain = Some(data.clone());
+        }
 
         if best.as_ref().is_none_or(|best| data.len() < best.len()) {
             best = Some(data);

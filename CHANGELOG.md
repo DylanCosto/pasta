@@ -53,6 +53,13 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   HG003 chr20 (1.1 GB BAM) to `/dev/null`, which spills, takes 27.0 s instead of 33.3 s
   (samtools: 27.9 s), with the same output.
 
+### Fixed
+
+- pasta: read names that take more than 127 tokens are no longer coded with the name tokenizer,
+  whose blocks HTSlib then could not read (it accepts 128 token positions); the method trials
+  pick another method, and an `Encoder::NameTokenizer` chosen for the block gzips them.
+- ntools: `mpileup --help` no longer says that `-M` is unsupported.
+
 ## [0.9.0] - 2026-11-08
 
 ### Added
