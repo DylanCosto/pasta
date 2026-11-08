@@ -423,11 +423,11 @@ at `-@ 8`, at its default level 6, for a file 5% larger than HTSlib's default.
 
 ### Where samtools is faster
 
-- Writing CRAM (`view -C`) takes more time than HTSlib: on 2 million of the 35x short reads,
-  single-threaded, 1.25x samtools' time (8.9 s against 7.1 s), for a file 0.3% smaller than
-  samtools'; on the whole 35x genome at `-@ 16`, 1.19x (270 s against 227 s), with 1.6 times its
-  CPU time. ntools 0.2.0 took 2.1x on both, and 1.05x on the Revio long reads; since then, read
-  names are compressed as HTSlib compresses them.
+- Writing CRAM (`view -C`) takes more time than HTSlib, and the files are larger: on 2 million
+  of the 35x short reads (chr20), single-threaded, 1.35x samtools' time (9.0 s against 6.6 s),
+  for a file 5% larger, mostly in the quality scores and read names; on the whole 35x genome at
+  `-@ 16`, 1.19x (270 s against 227 s), with 1.6 times its CPU time. ntools 0.2.0 took 2.1x on
+  the whole genome, and 1.05x on the Revio long reads.
 - `view` CRAM to SAM of the short reads is slightly slower single-threaded (0.94x). On the 69 GB
   ONT CRAM, `view -c` and `flagstat` (0.86x and 0.89x in 0.2.0) mostly wait for the file to be
   read and use less CPU time than samtools.
@@ -438,5 +438,5 @@ at `-@ 8`, at its default level 6, for a file 5% larger than HTSlib's default.
   against 153 s. `markdup` stops speeding up past `-@ 4`, limited by the thread that matches
   duplicates.
 - Memory: `collate -Ou` takes 350 MB against samtools' 26 MB on the corpus, `mpileup -M` on the
-  long reads 509 MB against 43 MB, `stats` on the long reads at `-@ 8` 843 MB against 660 MB,
-  and writing CRAM 113 MB against 28 MB on the 2 million short reads.
+  long reads 509 MB against 43 MB, and `stats` on the long reads at `-@ 8` 843 MB against
+  660 MB.
