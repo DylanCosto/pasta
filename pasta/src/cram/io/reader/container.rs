@@ -44,7 +44,12 @@ impl Container {
             .copied()
             .unwrap_or(self.src.len());
 
-        let mut src = &self.src[..end];
+        let mut src = self.src.get(..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid compression header bounds",
+            )
+        })?;
 
         read_compression_header(&mut src)
     }
@@ -57,12 +62,7 @@ impl Container {
             .iter()
             .position(|&n| n == landmark)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slice landmark"))?;
-        let end = landmarks.get(i + 1).copied().unwrap_or(self.src.len());
-        let mut src = self
-            .src
-            .get(landmark..end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slice bounds"))?;
-        read_slice(&mut src)
+        self.slice(i)
     }
 
     /// Returns the number of slices.
@@ -126,6 +126,18 @@ mod tests {
         assert_eq!(results.len(), 2);
 
         let e = results[1].as_ref().err().expect("an error");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_compression_header_with_a_landmark_past_the_end() {
+        let mut container = Container {
+            src: vec![0; 8],
+            ..Default::default()
+        };
+        container.header.landmarks = vec![16];
+
+        let e = container.compression_header().expect_err("an error");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 }
