@@ -78,8 +78,16 @@ impl Record {
         let quality_scores = record.quality_scores();
 
         let mut read_group_id = None;
+        let bam_data = record.data();
+        // A `CG` field holding the CIGAR (more than 65,535 operations) is part of `cigar`, not a
+        // tag, as in HTSlib.
+        let holds_cigar = bam_data.holds_cigar();
 
-        let data = Data::from_bam(record.data().as_ref(), |field| {
+        let data = Data::from_bam(bam_data.as_ref(), |field| {
+            if holds_cigar && field.tag == Tag::CIGAR {
+                return false;
+            }
+
             if field.tag == Tag::READ_GROUP
                 && read_group_id.is_none()
                 && let Some(name) = field.as_str().filter(|_| field.ty == Type::String)
@@ -660,6 +668,47 @@ mod tests {
         }
 
         data
+    }
+
+    #[test]
+    fn a_cigar_held_in_cg_is_not_also_a_tag() -> io::Result<()> {
+        // More than 65,535 operations: BAM keeps them in a `CG` field behind a `kSmN` placeholder,
+        // and the CRAM record takes them as its CIGAR, so `CG` is not one of its tags.
+        let n = 70_000;
+        let cigar: Cigar = (0..n)
+            .map(|i| {
+                Op::new(
+                    if i % 2 == 0 {
+                        Kind::Match
+                    } else {
+                        Kind::Insertion
+                    },
+                    1,
+                )
+            })
+            .collect();
+        let record = sam::alignment::RecordBuf::builder()
+            .set_flags(sam::alignment::record::Flags::empty())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::MIN)
+            .set_cigar(cigar)
+            .set_sequence(Sequence::from(vec![b'A'; n]))
+            .set_quality_scores(QualityScores::from(vec![30; n]))
+            .build();
+        let header =
+            sam::Header::builder()
+                .add_reference_sequence(
+                    "sq0",
+                    sam::header::record::value::Map::<
+                        sam::header::record::value::map::ReferenceSequence,
+                    >::new(std::num::NonZero::new(100_000).unwrap()),
+                )
+                .build();
+
+        let actual = convert_both(&header, &record, |_| Ok(None))?;
+        assert!(actual.data.iter().all(|field| field.tag != Tag::CIGAR));
+
+        Ok(())
     }
 
     #[test]
