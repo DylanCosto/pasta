@@ -5,6 +5,8 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-10
+
 ### Fixed
 
 - pasta: a BAM record with more than 65,535 CIGAR operations, which BAM keeps in a `CG` field, was
