@@ -47,10 +47,7 @@ struct Decoder {
 /// slice. After an error, the iterator ends.
 pub struct MultithreadedRecords<'r, R> {
     reader: &'r mut Reader<R>,
-    decoder: Arc<Decoder>,
-    /// The workers, or `None` when not even one could be started, so that slices are decoded on
-    /// the calling thread.
-    pool: Option<threads::Pool>,
+    workers: Workers,
     /// The most slices sent for decoding and not yet given out.
     max_in_flight: usize,
     /// The slices sent for decoding, in file order.
@@ -60,8 +57,6 @@ pub struct MultithreadedRecords<'r, R> {
     records: vec::IntoIter<RecordBuf>,
     /// Whether no more containers are read: the stream ended, or reading or decoding failed.
     is_done: bool,
-    /// Tells the jobs left when the iterator is dropped to skip their slices.
-    is_dropped: Arc<AtomicBool>,
 }
 
 impl<'r, R> MultithreadedRecords<'r, R>
@@ -81,22 +76,17 @@ where
             tags: reader.required_tags.clone(),
         };
 
-        // Without workers, each slice is decoded on this thread once it is needed.
-        let pool = threads::pool(worker_count).ok();
-        let max_in_flight = pool
-            .as_ref()
-            .map_or(1, |pool| pool.current_num_threads() * IN_FLIGHT_PER_WORKER);
+        let workers = Workers::new(decoder, worker_count);
+        let max_in_flight = workers.max_in_flight();
 
         Self {
             reader,
-            decoder: Arc::new(decoder),
-            pool,
+            workers,
             max_in_flight,
             in_flight: VecDeque::with_capacity(max_in_flight),
             container: None,
             records: Vec::new().into_iter(),
             is_done: false,
-            is_dropped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -105,61 +95,32 @@ where
     /// every slice before it.
     fn send_slices(&mut self) {
         while self.in_flight.len() < self.max_in_flight {
-            let (container, i) = match self.container.take() {
-                Some((container, i)) if i < container.slice_count() => (container, i),
-                _ if self.is_done => return,
-                _ => {
-                    let mut container = Container::default();
+            if let Some((container, i)) = &mut self.container
+                && *i < container.slice_count()
+            {
+                let rx = self.workers.send(Arc::clone(container), *i);
+                self.in_flight.push_back(rx);
+                *i += 1;
+                continue;
+            }
 
-                    match self.reader.read_container(&mut container) {
-                        Ok(0) => {
-                            self.is_done = true;
-                            return;
-                        }
-                        Ok(_) => {
-                            // A container without slices is passed over by the next pass.
-                            self.container = Some((Arc::new(container), 0));
-                            continue;
-                        }
-                        Err(e) => {
-                            self.is_done = true;
-                            self.in_flight.push_back(ready(Ok(Err(e))));
-                            return;
-                        }
-                    }
-                }
-            };
-
-            let rx = self.send_slice(Arc::clone(&container), i);
-            self.in_flight.push_back(rx);
-            self.container = Some((container, i + 1));
-        }
-    }
-
-    /// Decodes the `i`th slice of `container` on a worker, or here without workers, and returns
-    /// the channel of its records.
-    fn send_slice(&self, container: Arc<Container>, i: usize) -> Receiver<Decoded> {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let decoder = Arc::clone(&self.decoder);
-        let is_dropped = Arc::clone(&self.is_dropped);
-
-        let job = move || {
-            if is_dropped.load(Ordering::Relaxed) {
+            if self.is_done {
                 return;
             }
 
-            // A panic is sent on to be raised on the calling thread: a pool thread aborts the
-            // process on a panic, and a slice that never arrives would end the records early.
-            let decoded = worker::catch(|| decoder.decode(&container, i));
-            let _ = tx.send(decoded);
-        };
+            self.container = None;
+            let mut container = Container::default();
 
-        match &self.pool {
-            Some(pool) => pool.spawn(job),
-            None => job(),
+            match self.reader.read_container(&mut container) {
+                Ok(0) => self.is_done = true,
+                // A container without slices is passed over on the next pass.
+                Ok(_) => self.container = Some((Arc::new(container), 0)),
+                Err(e) => {
+                    self.is_done = true;
+                    self.in_flight.push_back(ready(Ok(Err(e))));
+                }
+            }
         }
-
-        rx
     }
 
     /// Stops reading, after an error or a panic.
@@ -167,7 +128,7 @@ where
         self.is_done = true;
         self.container = None;
         self.in_flight.clear();
-        self.is_dropped.store(true, Ordering::Relaxed);
+        self.workers.cancel();
     }
 }
 
@@ -187,7 +148,7 @@ where
             self.send_slices();
             let rx = self.in_flight.pop_front()?;
 
-            // Every job sends its result, a panic included, unless the iterator was dropped.
+            // Every job sends its result, a panic included, unless the jobs were cancelled.
             let result = match rx.recv() {
                 Ok(Ok(result)) => result,
                 Ok(Err(payload)) => {
@@ -208,9 +169,67 @@ where
     }
 }
 
-impl<R> Drop for MultithreadedRecords<'_, R> {
+/// Decodes slices on a pool of workers, or on the calling thread when not even one worker could
+/// be started. Dropping it cancels the jobs that have not started.
+struct Workers {
+    pool: Option<threads::Pool>,
+    decoder: Arc<Decoder>,
+    /// Tells the jobs left to skip their slices.
+    is_cancelled: Arc<AtomicBool>,
+}
+
+impl Workers {
+    fn new(decoder: Decoder, worker_count: NonZero<usize>) -> Self {
+        Self {
+            pool: threads::pool(worker_count).ok(),
+            decoder: Arc::new(decoder),
+            is_cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The most slices to have in flight: a few per worker, or one, decoded once it is needed,
+    /// without workers.
+    fn max_in_flight(&self) -> usize {
+        self.pool
+            .as_ref()
+            .map_or(1, |pool| pool.current_num_threads() * IN_FLIGHT_PER_WORKER)
+    }
+
+    /// Decodes the `i`th slice of `container` on a worker, or here without workers, and returns
+    /// the channel of its records.
+    fn send(&self, container: Arc<Container>, i: usize) -> Receiver<Decoded> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let decoder = Arc::clone(&self.decoder);
+        let is_cancelled = Arc::clone(&self.is_cancelled);
+
+        let job = move || {
+            if is_cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+
+            // A panic is sent on to be raised on the calling thread: a pool thread aborts the
+            // process on a panic, and a slice that never arrives would end the records early.
+            let decoded = worker::catch(|| decoder.decode(&container, i));
+            let _ = tx.send(decoded);
+        };
+
+        match &self.pool {
+            Some(pool) => pool.spawn(job),
+            None => job(),
+        }
+
+        rx
+    }
+
+    /// Makes the jobs that have not started skip their slices.
+    fn cancel(&self) {
+        self.is_cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Workers {
     fn drop(&mut self) {
-        self.is_dropped.store(true, Ordering::Relaxed);
+        self.cancel();
     }
 }
 

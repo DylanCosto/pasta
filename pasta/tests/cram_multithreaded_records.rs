@@ -224,7 +224,12 @@ fn test_dropping_the_records_early_leaves_the_reader_usable() -> Result<(), Box<
     let rest: Vec<_> = reader
         .multithreaded_records(&header, workers)
         .collect::<io::Result<_>>()?;
-    assert!(rest.len() < records.len() - 3);
+    let all = read(&src, &repository, None)?;
+    assert!(rest.len() < all.len() - 3, "{} records", rest.len());
+    assert!(
+        all.ends_with(&rest),
+        "the rest follow the records read ahead"
+    );
 
     Ok(())
 }

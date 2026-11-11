@@ -16,8 +16,8 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ### Fixed
 
-- pasta: `cram::io::reader::Container::slices` panicked on a container whose landmarks put a
-  slice past its end; it now returns an error for that slice.
+- pasta: `cram::io::reader::Container::slices` and `compression_header` panicked on a container
+  whose landmarks point past its end; they now return an error.
 
 ## [0.9.1] - 2026-11-10
 
