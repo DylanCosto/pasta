@@ -3,10 +3,7 @@ pub mod compression_header;
 pub mod header;
 pub mod slice;
 
-use std::{
-    io::{self, Read},
-    iter,
-};
+use std::io::{self, Read};
 
 use self::{block::read_block_as, header::read_header};
 pub use self::{
@@ -68,22 +65,34 @@ impl Container {
         read_slice(&mut src)
     }
 
+    /// Returns the number of slices.
+    pub(crate) fn slice_count(&self) -> usize {
+        self.header.landmarks.len()
+    }
+
+    /// Returns the `i`th slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the landmarks put the slice outside the container.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not less than [`Self::slice_count`].
+    pub(crate) fn slice(&self, i: usize) -> io::Result<Slice<'_>> {
+        let landmarks = &self.header.landmarks;
+        let start = landmarks[i];
+        let end = landmarks.get(i + 1).copied().unwrap_or(self.src.len());
+        let mut src = self
+            .src
+            .get(start..end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid slice bounds"))?;
+        read_slice(&mut src)
+    }
+
     /// Returns the iterator over slices.
     pub fn slices(&self) -> impl Iterator<Item = io::Result<Slice<'_>>> + '_ {
-        let landmarks = &self.header.landmarks;
-        let mut i = 0;
-
-        iter::from_fn(move || {
-            if i < landmarks.len() {
-                let start = landmarks[i];
-                i += 1;
-                let end = landmarks.get(i).copied().unwrap_or(self.src.len());
-                let mut src = &self.src[start..end];
-                Some(read_slice(&mut src))
-            } else {
-                None
-            }
-        })
+        (0..self.slice_count()).map(|i| self.slice(i))
     }
 }
 
@@ -98,5 +107,25 @@ where
             reader.read_exact(&mut container.src)?;
             Ok(len)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_slices_with_a_landmark_past_the_end() {
+        let mut container = Container {
+            src: vec![0; 8],
+            ..Default::default()
+        };
+        container.header.landmarks = vec![4, 16];
+
+        let results: Vec<_> = container.slices().collect();
+        assert_eq!(results.len(), 2);
+
+        let e = results[1].as_ref().err().expect("an error");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -6,11 +6,15 @@ pub(crate) mod container;
 mod fields;
 pub mod header;
 mod md_nm;
+mod multithreaded_records;
 pub(crate) mod num;
 pub(crate) mod query;
 mod records;
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::{
+    io::{self, Read, Seek, SeekFrom},
+    num::NonZero,
+};
 
 use crate::core::Region;
 use crate::fasta;
@@ -21,6 +25,7 @@ pub use self::{
     container::{Block, Container, read_block},
     fields::{Fields, Tags},
     md_nm::MdNm,
+    multithreaded_records::MultithreadedRecords,
     query::{Query, SuspendedQuery, UnmappedQuery},
     records::Records,
 };
@@ -360,6 +365,46 @@ where
     /// ```
     pub fn records<'r, 'h: 'r>(&'r mut self, header: &'h sam::Header) -> Records<'r, 'h, R> {
         Records::new(self, header)
+    }
+
+    /// Returns an iterator over records starting from the current stream position that decodes
+    /// slices on `worker_count` threads.
+    ///
+    /// It gives the records [`Self::records`] gives, in the same order; when a slice cannot be
+    /// decoded, it gives the records of the slices before it in its container first, where
+    /// [`Self::records`] gives none of that container's records. Containers are read on
+    /// the calling thread, and each slice is decoded by a job on a pool of workers (fewer of them
+    /// when the system cannot start that many threads, or none, decoding on the calling thread,
+    /// when it cannot start any). A few slices per worker are read ahead of the records given
+    /// out, so the stream is past them when the iterator is dropped.
+    ///
+    /// The stream is expected to be at the start of a container.
+    ///
+    /// A panic of a decoding job is re-raised on the calling thread when the iterator reaches
+    /// that slice. After an error, the iterator ends.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::{fs::File, io, num::NonZero};
+    /// use pasta::cram;
+    ///
+    /// let mut reader = File::open("sample.cram").map(cram::io::Reader::new)?;
+    /// let header = reader.read_header()?;
+    /// let worker_count = NonZero::new(4).unwrap();
+    ///
+    /// for result in reader.multithreaded_records(&header, worker_count) {
+    ///     let record = result?;
+    ///     // ...
+    /// }
+    /// # Ok::<_, io::Error>(())
+    /// ```
+    pub fn multithreaded_records(
+        &mut self,
+        header: &sam::Header,
+        worker_count: NonZero<usize>,
+    ) -> MultithreadedRecords<'_, R> {
+        MultithreadedRecords::new(self, header, worker_count)
     }
 }
 
