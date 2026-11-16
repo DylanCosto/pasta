@@ -79,7 +79,16 @@ impl Record {
 
         let mut read_group_id = None;
 
-        let data = Data::from_bam(record.data().as_ref(), |field| {
+        let bam_data = record.data();
+        // A `CG` field that holds the CIGAR is part of the CIGAR, which is stored as such, and
+        // not a tag, as in HTSlib (and as `bam::record::Data::iter` leaves it out).
+        let holds_cigar = bam_data.holds_cigar();
+
+        let data = Data::from_bam(bam_data.as_ref(), |field| {
+            if holds_cigar && field.tag == Tag::CIGAR {
+                return false;
+            }
+
             if field.tag == Tag::READ_GROUP
                 && read_group_id.is_none()
                 && let Some(name) = field.as_str().filter(|_| field.ty == Type::String)
@@ -795,6 +804,98 @@ mod tests {
             .map(|(tag, value)| (tag, value.clone()))
             .collect();
         assert_eq!(actual.data, data_of(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_from_bam_record_with_a_long_cigar() -> io::Result<()> {
+        // A record whose CIGAR is the `kSmN` placeholder 4S2N, with the real CIGAR in a `CG`
+        // field between two other tags. The `CG` field is the CIGAR, not a tag to store: as
+        // HTSlib does, CRAM stores the real CIGAR and no `CG` tag.
+        fn record_with_long_cigar(cg: &[u8]) -> io::Result<bam::Record> {
+            let mut src = vec![
+                0x00, 0x00, 0x00, 0x00, // ref_id = 0
+                0x00, 0x00, 0x00, 0x00, // pos = 0
+                0x02, // l_read_name = 2
+                0xff, // mapq = 255
+                0x48, 0x12, // bin = 4680
+                0x02, 0x00, // n_cigar_op = 2
+                0x00, 0x00, // flag = 0
+                0x04, 0x00, 0x00, 0x00, // l_seq = 4
+                0xff, 0xff, 0xff, 0xff, // next_ref_id = -1
+                0xff, 0xff, 0xff, 0xff, // next_pos = -1
+                0x00, 0x00, 0x00, 0x00, // tlen = 0
+                b'*', 0x00, // read_name = "*\x00"
+                0x44, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00, // cigar = 4S2N
+                0x12, 0x48, // sequence = ACGT
+                b'N', b'D', b'L', b'S', // quality scores
+            ];
+            src.extend_from_slice(b"COZx\x00");
+            src.extend_from_slice(cg);
+            src.extend_from_slice(b"NHC\x01");
+            bam::Record::try_from(src)
+        }
+
+        let header =
+            sam::Header::builder()
+                .add_reference_sequence(
+                    "sq0",
+                    sam::header::record::value::Map::<
+                        sam::header::record::value::map::ReferenceSequence,
+                    >::new(std::num::NonZero::new(4).unwrap()),
+                )
+                .build();
+        let reference_sequence = Arc::new(fasta::record::Sequence::from(b"ACGT".to_vec()));
+        let get_reference_sequence = |_: &[u8]| Ok(Some(Arc::clone(&reference_sequence)));
+
+        let expected_data = data_of(&[
+            (Tag::COMMENT, ValueBuf::from("x")),
+            (Tag::ALIGNMENT_HIT_COUNT, ValueBuf::UInt8(1)),
+        ]);
+
+        // CG:B:I,[4M] and CG:B:i,[4M]
+        for cg in [
+            &b"CGBI\x01\x00\x00\x00\x40\x00\x00\x00"[..],
+            &b"CGBi\x01\x00\x00\x00\x40\x00\x00\x00"[..],
+        ] {
+            let bam_record = record_with_long_cigar(cg)?;
+
+            let from_bam = Record::try_from_bam_record(
+                &header,
+                &bam_record,
+                &mut ReadGroups::default(),
+                get_reference_sequence,
+            )?;
+            assert_eq!(from_bam.read_length, 4);
+            assert_eq!(from_bam.alignment_span(), 4);
+            assert!(from_bam.features.is_empty());
+            assert_eq!(from_bam.data, expected_data);
+
+            let generic =
+                Record::try_from_alignment_record(&header, &bam_record, get_reference_sequence)?;
+            assert_eq!(generic, from_bam);
+        }
+
+        // An array of another subtype cannot hold a CIGAR: the placeholder stays, and `CG` is a
+        // tag like any other.
+        let cg = b"CGBC\x04\x00\x00\x00\x40\x00\x00\x00";
+        let bam_record = record_with_long_cigar(cg)?;
+        let from_bam = Record::try_from_bam_record(
+            &header,
+            &bam_record,
+            &mut ReadGroups::default(),
+            get_reference_sequence,
+        )?;
+        assert_eq!(from_bam.alignment_span(), 2);
+        assert_eq!(
+            from_bam
+                .data
+                .iter()
+                .map(|field| field.tag)
+                .collect::<Vec<_>>(),
+            [Tag::COMMENT, Tag::CIGAR, Tag::ALIGNMENT_HIT_COUNT]
+        );
+
         Ok(())
     }
 

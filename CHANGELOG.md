@@ -25,9 +25,16 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   well as by `CG:B:I`, in `pileup::Read` (which piled up the placeholder) and in `bam::Record`
   alike. In `bam::Record`, a `CG` array of another subtype no longer replaces it, and only the
   first `CG` field counts.
+- pasta: the CRAM writer no longer also stores, as a tag, the `CG` field that holds a BAM
+  record's CIGAR in place of a `kSmN` placeholder; it stores the CIGAR alone, as HTSlib does.
+  Before, HTSlib read such a CRAM record back with a leftover `CG` tag.
 - ntools: `mpileup --output-extra` prints a `d` tag's value as samtools does, instead of `*`;
   `fastq -d TAG:VALUE` matches one as it matches an `f` tag; `view` and `fastq -T` print a
   `d` of -0 as `-0`, as samtools does.
+- ntools: `mpileup` piles up the CIGAR in a `CG:B:i` field of a record whose CIGAR is a `kSmN`
+  placeholder, as samtools does, instead of the placeholder.
+- ntools: `view -C` of a BAM record whose CIGAR is held in a `CG` field writes no `CG` tag, as
+  `samtools view -C` does.
 - ntools: `checksum` rejects a `B` array of subtype `d` or `A` as invalid auxiliary data,
   instead of skipping 8 or 1 bytes per element.
 
