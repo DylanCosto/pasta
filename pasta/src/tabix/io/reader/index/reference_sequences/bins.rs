@@ -10,9 +10,8 @@ where
     R: Read,
 {
     use crate::csi::io::reader::index::reference_sequences::{
-        MAX_INITIAL_CAPACITY,
         bins::{invalid_bin_id_error, read_chunks},
-        read_metadata,
+        initial_capacity, read_metadata,
     };
 
     use crate::tabix::index::DEPTH;
@@ -22,7 +21,7 @@ where
 
     let bin_count = read_bin_count(reader)?;
 
-    let mut bins = IndexMap::with_capacity(bin_count.min(MAX_INITIAL_CAPACITY));
+    let mut bins = IndexMap::with_capacity(initial_capacity(bin_count));
     let mut metadata = None;
 
     for _ in 0..bin_count {

@@ -10,9 +10,8 @@ where
     R: Read,
 {
     use crate::csi::io::reader::index::reference_sequences::{
-        MAX_INITIAL_CAPACITY,
         bins::{invalid_bin_id_error, read_chunks},
-        read_metadata,
+        initial_capacity, read_metadata,
     };
 
     use crate::bam::bai::DEPTH;
@@ -31,7 +30,7 @@ where
         usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     })?;
 
-    let mut bins = IndexMap::with_capacity(n_bin.min(MAX_INITIAL_CAPACITY));
+    let mut bins = IndexMap::with_capacity(initial_capacity(n_bin));
     let mut metadata = None;
 
     for _ in 0..n_bin {

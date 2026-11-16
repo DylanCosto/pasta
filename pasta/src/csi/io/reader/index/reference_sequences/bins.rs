@@ -10,7 +10,7 @@ use crate::bgzf;
 use indexmap::IndexMap;
 
 pub use self::chunks::read_chunks;
-use super::{MAX_INITIAL_CAPACITY, read_metadata};
+use super::{initial_capacity, read_metadata, reserve_map_entry};
 use crate::csi::{
     binning_index::index::reference_sequence::{Bin, Metadata, index::BinnedIndex},
     io::reader::num::{read_i32_le, read_u32_le, read_u64_le},
@@ -79,8 +79,8 @@ where
 {
     let bin_count = read_bin_count(reader)?;
 
-    let mut bins = IndexMap::with_capacity(bin_count.min(MAX_INITIAL_CAPACITY));
-    let mut index = BinnedIndex::with_capacity(bin_count.min(MAX_INITIAL_CAPACITY));
+    let mut bins = IndexMap::with_capacity(initial_capacity(bin_count));
+    let mut index = BinnedIndex::with_capacity(initial_capacity(bin_count));
 
     let max_id = Bin::max_id(depth).ok_or(ReadError::InvalidDepth)?;
     let metadata_id = Bin::metadata_id(depth).ok_or(ReadError::InvalidDepth)?;
@@ -101,10 +101,12 @@ where
             let m = read_metadata(reader).map_err(ReadError::InvalidMetadata)?;
             metadata.replace(m).is_some()
         } else {
+            reserve_map_entry(&mut index, "bins")?;
             index.insert(id, loffset);
 
             let chunks = read_chunks(reader).map_err(ReadError::InvalidChunks)?;
             let bin = Bin::new(chunks);
+            reserve_map_entry(&mut bins, "bins")?;
             bins.insert(id, bin).is_some()
         };
 

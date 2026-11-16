@@ -5,7 +5,7 @@ use std::io::{self, Read};
 
 use crate::csi::{
     binning_index::index::{ReferenceSequence, reference_sequence::index::LinearIndex},
-    io::reader::index::reference_sequences::MAX_INITIAL_CAPACITY,
+    io::reader::index::reference_sequences::{initial_capacity, reserve_entry},
 };
 
 use self::{bins::read_bins, intervals::read_intervals};
@@ -21,11 +21,12 @@ where
         usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     })?;
 
-    let mut references = Vec::with_capacity(n_ref.min(MAX_INITIAL_CAPACITY));
+    let mut references = Vec::with_capacity(initial_capacity(n_ref));
 
     for _ in 0..n_ref {
         let (bins, metadata) = read_bins(reader)?;
         let intervals = read_intervals(reader)?;
+        reserve_entry(&mut references, "reference sequences")?;
         references.push(ReferenceSequence::new(bins, intervals, metadata));
     }
 

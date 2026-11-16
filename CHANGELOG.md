@@ -18,6 +18,20 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 - pasta: `variant::index::Index::parse` fails with `InvalidData` on a target, bin, chunk, or
   linear index count that the remaining data cannot hold, instead of reserving memory for it
   and aborting.
+- pasta: reading a BAI, CSI, tabix, or VCF index (`variant::index::Index::parse`) with more
+  reference sequences or bins than fit in memory, such as a small file of compressed zeros that
+  states 100 million empty reference sequences, fails with `OutOfMemory` ("could not allocate
+  N reference sequences: out of memory"; from `csi::io::Reader`, an `InvalidData` error caused
+  by it) instead of aborting on a failed allocation. The lists grow as the entries are read.
+- ntools, vtools: such an index makes the command fail with that error (vtools, as bcftools
+  does: `Could not load local index file ... : Cannot allocate memory`) instead of aborting.
+- pasta: `variant::index::report_load_error` reports an index too large to fit in memory as
+  HTSlib does, `Cannot allocate memory`, not `Invalid argument`.
+- ntools: a BAI, CSI, or tabix index with a bin ID past the last bin of its depth no longer
+  loads, where samtools 1.24 ignores the bin. A region query (`view`, `mpileup -r`, and the
+  others) fails with "invalid bin ID" instead of panicking, where samtools returns records; and
+  `idxstats` warns that it cannot load the index and counts the records by reading the whole
+  file, where samtools prints the counts in the index's metadata.
 
 ## [0.9.0] - 2026-11-08
 
