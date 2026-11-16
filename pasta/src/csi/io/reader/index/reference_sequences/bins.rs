@@ -10,7 +10,7 @@ use crate::bgzf;
 use indexmap::IndexMap;
 
 pub use self::chunks::read_chunks;
-use super::read_metadata;
+use super::{MAX_INITIAL_CAPACITY, read_metadata};
 use crate::csi::{
     binning_index::index::reference_sequence::{Bin, Metadata, index::BinnedIndex},
     io::reader::num::{read_i32_le, read_u32_le, read_u64_le},
@@ -79,9 +79,10 @@ where
 {
     let bin_count = read_bin_count(reader)?;
 
-    let mut bins = IndexMap::with_capacity(bin_count);
-    let mut index = BinnedIndex::with_capacity(bin_count);
+    let mut bins = IndexMap::with_capacity(bin_count.min(MAX_INITIAL_CAPACITY));
+    let mut index = BinnedIndex::with_capacity(bin_count.min(MAX_INITIAL_CAPACITY));
 
+    let max_id = Bin::max_id(depth).ok_or(ReadError::InvalidDepth)?;
     let metadata_id = Bin::metadata_id(depth).ok_or(ReadError::InvalidDepth)?;
     let mut metadata = None;
 
@@ -89,6 +90,10 @@ where
         let id = read_u32_le(reader)
             .map_err(ReadError::Io)
             .and_then(|n| usize::try_from(n).map_err(ReadError::InvalidBinId))?;
+
+        if id > max_id && id != metadata_id {
+            return Err(ReadError::Io(invalid_bin_id_error(id, max_id)));
+        }
 
         let loffset = read_u64_le(reader).map(bgzf::VirtualPosition::from)?;
 
@@ -109,6 +114,17 @@ where
     }
 
     Ok((bins, index, metadata))
+}
+
+/// Returns the error for a bin ID past the last bin that is not the metadata pseudo-bin.
+///
+/// A query cannot match such a bin, and HTSlib never does, but it only comes from a corrupt
+/// index.
+pub(crate) fn invalid_bin_id_error(id: usize, max_id: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("invalid bin ID: {id} (max {max_id})"),
+    )
 }
 
 fn read_bin_count<R>(reader: &mut R) -> Result<usize, ReadError>
@@ -233,5 +249,37 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_read_bins_with_an_out_of_range_bin_id() {
+        // At depth 2, the last bin is 72 and the metadata pseudo-bin is 74.
+        const DEPTH: u8 = 2;
+
+        for id in [73u32, 75, 37450] {
+            let mut data = vec![0x01, 0x00, 0x00, 0x00]; // n_bin = 1
+            data.extend(id.to_le_bytes()); // bins[0].id
+            data.extend([0x00; 8]); // bins[0].loffset = 0
+            data.extend([0x00, 0x00, 0x00, 0x00]); // bins[0].n_chunk = 0
+
+            let mut reader = &data[..];
+            assert!(matches!(
+                read_bins(&mut reader, DEPTH),
+                Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::InvalidData
+                    && e.to_string() == format!("invalid bin ID: {id} (max 72)")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_read_bins_with_a_bin_count_past_the_data() {
+        let data = [
+            0xff, 0xff, 0xff, 0x7f, // n_bin = 2147483647
+        ];
+        let mut reader = &data[..];
+        assert!(matches!(
+            read_bins(&mut reader, 5),
+            Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
     }
 }

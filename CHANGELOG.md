@@ -5,6 +5,20 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- pasta: a BAI, CSI, or tabix index with a bin ID past the last bin of its depth (other than the
+  metadata pseudo-bin) fails to load with `InvalidData` ("invalid bin ID"), instead of loading
+  and then panicking on the first query of that reference sequence.
+- pasta: `ReferenceSequence::query` skips bins past the last bin of the depth instead of
+  panicking on them.
+- pasta: reading a BAI, CSI, or tabix index no longer reserves memory for the reference
+  sequence or bin count it states before reading them (at most 65,536 up front), so a corrupt
+  count fails with an error instead of aborting on a failed allocation of up to hundreds of GB.
+- pasta: `variant::index::Index::parse` fails with `InvalidData` on a target, bin, chunk, or
+  linear index count that the remaining data cannot hold, instead of reserving memory for it
+  and aborting.
+
 ## [0.9.0] - 2026-11-08
 
 ### Added

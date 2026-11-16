@@ -16,6 +16,13 @@ use crate::csi::{
     io::reader::num::read_i32_le,
 };
 
+/// The most entries reserved up front for a count read from an index.
+///
+/// Counts in an index are untrusted, and a corrupt one would otherwise reserve gigabytes before
+/// any entry is read. A longer list grows as its entries are read. Every bin of a BAI or tabix
+/// index (37,450 at most) fits.
+pub(crate) const MAX_INITIAL_CAPACITY: usize = 1 << 16;
+
 /// An error returned when CSI reference sequences fail to be read.
 #[derive(Debug)]
 pub enum ReadError {

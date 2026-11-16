@@ -103,10 +103,11 @@ where
 
         reg2bins(start, end, min_shift, depth, &mut region_bins);
 
+        // A bin past the last one, which only a corrupt index has, is in no region.
         let query_bins = self
             .bins()
             .iter()
-            .filter(|(id, _)| region_bins[**id])
+            .filter(|(id, _)| region_bins.get(**id).unwrap_or(false))
             .map(|(_, bin)| bin)
             .collect();
 
@@ -603,6 +604,24 @@ mod tests {
             const { Position::new(143).unwrap() },
             &[0, 1, 2, 12, 13, 14, 15, 16, 17],
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_with_an_out_of_range_bin_id() -> io::Result<()> {
+        // A bin past the last one (37448 at depth 5), as a corrupt index can hold, is in no
+        // region.
+        let bins = [(0, Bin::new(Vec::new())), (37449, Bin::new(Vec::new()))]
+            .into_iter()
+            .collect();
+        let reference_sequence = ReferenceSequence::new(bins, Vec::new(), None);
+        let start = const { Position::new(1).unwrap() };
+        let end = const { Position::new(1 << 20).unwrap() };
+
+        let query_bins = reference_sequence.query(MIN_SHIFT, DEPTH, start..=end)?;
+        assert_eq!(query_bins.len(), 1);
+        assert!(std::ptr::eq(query_bins[0], &reference_sequence.bins()[&0]));
 
         Ok(())
     }
