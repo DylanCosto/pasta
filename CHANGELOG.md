@@ -5,6 +5,29 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- pasta: `pileup::Read::quality_score`, the quality of one base: 0xff (missing) past the stored
+  qualities, as for every base of a read whose `SEQ` is `*`.
+
+### Changed
+
+- pasta: `pileup::Read::base` gives 15 (`N`) past the stored sequence instead of panicking, so
+  a read whose `SEQ` is `*` and whose CIGAR consumes query bases piles up as unknown bases.
+
+### Fixed
+
+- pasta: the pileup no longer panics on a read whose CIGAR is a single deletion or skip (`5D`,
+  `5N`), which HTSlib reads from before its CIGAR; it covers its positions as a deletion or skip
+  at query position 0, as one that starts a longer CIGAR does.
+- pasta: overlapping mates of which one has no sequence (`SEQ` `*`) are left as they are,
+  instead of failing the pileup ("invalid CIGAR in overlapping mates") or panicking.
+- pasta: `pileup::baq::cap_mapq` (`mpileup -C`) no longer panics on a read without its
+  sequence; its bases are unknown and their qualities missing.
+- pasta: `pileup::Read::new` refuses a mapped read whose CIGAR and sequence differ in length
+  ("CIGAR and query sequence lengths differ", as HTSlib refuses to read it), on which
+  `vtools mpileup` panicked; a read without its sequence is still accepted.
+
 ## [0.9.0] - 2026-11-08
 
 ### Added
