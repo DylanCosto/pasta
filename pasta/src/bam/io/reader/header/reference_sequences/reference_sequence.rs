@@ -8,6 +8,9 @@ use bstr::BString;
 
 use crate::bam::io::reader::{bytes_with_nul_to_bstring, num::read_u32_le};
 
+/// The most bytes of a reference sequence name reserved before they have been read.
+const MAX_RESERVED_NAME_LEN: usize = 1 << 8;
+
 pub(super) fn read_reference_sequence<R>(
     reader: &mut R,
 ) -> io::Result<(BString, Map<ReferenceSequence>)>
@@ -26,10 +29,22 @@ fn read_name<R>(reader: &mut R) -> io::Result<BString>
 where
     R: Read,
 {
-    let len = read_u32_le_as_nonzero_usize(reader)?;
+    let len = read_u32_le_as_nonzero_usize(reader)?.get();
 
-    let mut c_name = vec![0; len.get()];
-    reader.read_exact(&mut c_name)?;
+    // `l_name` is untrusted: the name grows with the bytes read.
+    let mut c_name = Vec::with_capacity(len.min(MAX_RESERVED_NAME_LEN));
+    let limit = u64::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    reader.take(limit).read_to_end(&mut c_name)?;
+
+    if c_name.len() < len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "truncated reference sequence name: expected {len} bytes, got {}",
+                c_name.len()
+            ),
+        ));
+    }
 
     bytes_with_nul_to_bstring(&c_name)
 }

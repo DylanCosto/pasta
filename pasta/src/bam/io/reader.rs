@@ -206,7 +206,8 @@ where
     /// buffer.
     ///
     /// If successful, the record block size is returned. If a block size of 0 is returned, the
-    /// stream reached EOF.
+    /// stream reached EOF. A `block_size` in the stream below 32, the length of a record's
+    /// fixed-length fields, is an error, 0 included.
     ///
     /// # Examples
     ///
@@ -241,7 +242,8 @@ where
     /// another record.
     ///
     /// If successful, the record block size is returned. If a block size of 0 is returned, the
-    /// stream reached EOF.
+    /// stream reached EOF. A `block_size` in the stream below 32, the length of a record's
+    /// fixed-length fields, is an error, 0 included.
     ///
     /// # Examples
     ///

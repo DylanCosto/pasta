@@ -22,6 +22,9 @@ use crate::{
 /// The fixed-size prefix of every encoded BAM record, up to the read name.
 const MIN_RECORD_LEN: usize = 32;
 
+/// The most a record buffer grows before the bytes to fill it have been read.
+const MAX_RECORD_STEP: usize = 1 << 20;
+
 /// Reads one `block_size`-prefixed raw record into `buf`. Returns `false` at end of stream.
 pub fn read_raw_record<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<bool> {
     let mut len = [0; 4];
@@ -34,11 +37,29 @@ pub fn read_raw_record<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result
     let len = usize::try_from(u32::from_le_bytes(len))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    buf.resize(len, 0);
-    reader.read_exact(buf)?;
+    if len < MIN_RECORD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid BAM record block size: {len} (expected at least {MIN_RECORD_LEN})"),
+        ));
+    }
+
+    // A corrupt `block_size` can be up to 4 GiB, so the buffer grows with the bytes read.
+    if len <= MAX_RECORD_STEP {
+        buf.resize(len, 0);
+        reader.read_exact(buf)?;
+    } else {
+        buf.clear();
+
+        while buf.len() < len {
+            let start = buf.len();
+            buf.resize(start + (len - start).min(MAX_RECORD_STEP), 0);
+            reader.read_exact(&mut buf[start..])?;
+        }
+    }
 
     // Keys are read from fixed offsets and the name, so those must be in bounds.
-    if len < MIN_RECORD_LEN || MIN_RECORD_LEN + usize::from(buf[8]) > len {
+    if MIN_RECORD_LEN + usize::from(buf[8]) > len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated BAM record",
@@ -454,5 +475,66 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_read_raw_record() -> io::Result<()> {
+        let mut record = vec![0; MIN_RECORD_LEN];
+        record[8] = 2; // l_read_name
+        record.extend(b"*\x00");
+
+        let mut src = Vec::new();
+        write_raw_record(&mut src, &record)?;
+        write_raw_record(&mut src, &record)?;
+
+        // A record larger than one read step.
+        let mut large = record.clone();
+        large.resize(3 * MAX_RECORD_STEP + 5, 0x01);
+        write_raw_record(&mut src, &large)?;
+
+        let mut reader = &src[..];
+        let mut buf = Vec::new();
+        assert!(read_raw_record(&mut reader, &mut buf)?);
+        assert_eq!(buf, record);
+        assert!(read_raw_record(&mut reader, &mut buf)?);
+        assert_eq!(buf, record);
+        assert!(read_raw_record(&mut reader, &mut buf)?);
+        assert_eq!(buf, large);
+        assert!(!read_raw_record(&mut reader, &mut buf)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_raw_record_with_invalid_block_size() {
+        let mut record = vec![0; MIN_RECORD_LEN];
+        record[8] = 2; // l_read_name
+        record.extend(b"*\x00");
+
+        // Below the fixed-length fields, 0 included.
+        for block_size in [0u32, 31] {
+            let mut src = block_size.to_le_bytes().to_vec();
+            src.extend(&record);
+            let mut buf = Vec::new();
+
+            assert!(matches!(
+                read_raw_record(&mut &src[..], &mut buf),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData
+            ));
+        }
+
+        // Larger than the rest of the stream: memory grows with the bytes read, not with
+        // `block_size`.
+        for block_size in [35, 1 << 24, u32::MAX] {
+            let mut src = block_size.to_le_bytes().to_vec();
+            src.extend(&record);
+            let mut buf = Vec::new();
+
+            assert!(matches!(
+                read_raw_record(&mut &src[..], &mut buf),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+            assert!(buf.capacity() <= MAX_RECORD_STEP, "{}", buf.capacity());
+        }
     }
 }

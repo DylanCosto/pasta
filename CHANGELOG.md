@@ -5,6 +5,18 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- pasta: a BAM record `block_size` below 32, the length of a record's fixed fields, is an error
+  (`InvalidData`), as in HTSlib; a `block_size` of 0 ended the records as if at EOF.
+- pasta: a corrupt BAM record `block_size` no longer allocates and zero-fills up to 4 GiB before
+  the record is read; the record buffer grows with the bytes read, so a truncated record is an
+  `UnexpectedEof` error at the cost of the bytes present. `ntools merge` reads its BAM inputs
+  the same way.
+- pasta: a corrupt BAM header `n_ref` or reference sequence `l_name` no longer reserves memory
+  for the count it states (up to tens of GB, which aborted the process); a header that ends
+  early is an `UnexpectedEof` error.
+
 ## [0.9.0] - 2026-11-08
 
 ### Added
