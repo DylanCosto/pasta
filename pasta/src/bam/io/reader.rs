@@ -206,8 +206,10 @@ where
     /// buffer.
     ///
     /// If successful, the record block size is returned. If a block size of 0 is returned, the
-    /// stream reached EOF. A `block_size` in the stream below 32, the length of a record's
-    /// fixed-length fields, is an error, 0 included.
+    /// stream reached EOF. As in HTSlib, a `block_size` in the stream below 32, the length of a
+    /// record's fixed-length fields (0 included), or above `i32::MAX` is an error, as is a record
+    /// whose fixed-length fields give an `l_read_name` of 0 or field lengths that do not fit in
+    /// its `block_size`.
     ///
     /// # Examples
     ///
@@ -242,8 +244,10 @@ where
     /// another record.
     ///
     /// If successful, the record block size is returned. If a block size of 0 is returned, the
-    /// stream reached EOF. A `block_size` in the stream below 32, the length of a record's
-    /// fixed-length fields, is an error, 0 included.
+    /// stream reached EOF. As in HTSlib, a `block_size` in the stream below 32, the length of a
+    /// record's fixed-length fields (0 included), or above `i32::MAX` is an error, as is a record
+    /// whose fixed-length fields give an `l_read_name` of 0 or field lengths that do not fit in
+    /// its `block_size`.
     ///
     /// # Examples
     ///

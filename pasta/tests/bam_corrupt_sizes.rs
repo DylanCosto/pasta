@@ -7,7 +7,8 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    io, ptr,
+    io::{self, Read},
+    ptr,
 };
 
 use pasta::bam;
@@ -119,11 +120,78 @@ fn test_read_header_with_huge_l_name() {
     assert_unexpected_eof(read_header(&src));
 }
 
+/// A record's fixed-length fields, with every other field 0.
+fn fixed_fields(l_read_name: u8, l_seq: u32) -> Vec<u8> {
+    let mut src = vec![0; 32];
+    src[8] = l_read_name;
+    src[16..20].copy_from_slice(&l_seq.to_le_bytes());
+    src
+}
+
+/// Reads one record from `src` followed by `pad` zero bytes, through both `read_record` and
+/// `record_bufs`, and returns the errors.
+fn read_padded_record(src: &[u8], pad: u64) -> io::Result<(io::Error, io::Error)> {
+    let reader = || src.chain(io::repeat(0).take(pad));
+
+    let mut reader1 = bam::io::Reader::from(reader());
+    reader1.read_header()?;
+    let mut record = bam::Record::default();
+    let e1 = reader1
+        .read_record(&mut record)
+        .expect_err("expected an error");
+
+    let mut reader2 = bam::io::Reader::from(reader());
+    let header = reader2.read_header()?;
+    let e2 = reader2
+        .record_bufs(&header)
+        .next()
+        .expect("a record")
+        .expect_err("expected an error");
+
+    Ok((e1, e2))
+}
+
+/// More zero bytes than [`MAX_ALLOCATION`], so a reader that reads a whole corrupt block before
+/// it checks the block size and fixed fields aborts.
+const PAD: u64 = 2 * MAX_ALLOCATION as u64;
+
+#[test]
+fn test_read_record_with_block_size_above_i32_max() -> io::Result<()> {
+    // A small BGZF file can decompress to gigabytes of zeros, so the bytes present do not bound
+    // the record. As in htslib, a `block_size` above `i32::MAX` is an error at once.
+    let mut src = header();
+    put_u32_le(&mut src, u32::MAX); // block_size
+    src.extend(fixed_fields(2, 0));
+
+    let (e1, e2) = read_padded_record(&src, PAD)?;
+    assert_eq!(e1.kind(), io::ErrorKind::InvalidData, "{e1}");
+    assert_eq!(e2.kind(), io::ErrorKind::InvalidData, "{e2}");
+
+    Ok(())
+}
+
+#[test]
+fn test_read_record_with_fixed_fields_beyond_block_size() -> io::Result<()> {
+    // As in htslib, the fixed fields are checked before the rest of the record is read.
+    for fields in [fixed_fields(0, 0), fixed_fields(2, u32::MAX)] {
+        let mut src = header();
+        put_u32_le(&mut src, i32::MAX.unsigned_abs()); // block_size
+        src.extend(fields);
+
+        let (e1, e2) = read_padded_record(&src, PAD)?;
+        assert_eq!(e1.kind(), io::ErrorKind::InvalidData, "{e1}");
+        assert_eq!(e2.kind(), io::ErrorKind::InvalidData, "{e2}");
+    }
+
+    Ok(())
+}
+
 #[test]
 fn test_read_record_with_huge_block_size() -> io::Result<()> {
     let mut src = header();
-    put_u32_le(&mut src, u32::MAX); // block_size
-    src.extend([0; 64]);
+    put_u32_le(&mut src, i32::MAX.unsigned_abs()); // block_size
+    src.extend(fixed_fields(2, 0));
+    src.extend([0; 32]);
 
     let mut reader = bam::io::Reader::from(&src[..]);
     reader.read_header()?;
