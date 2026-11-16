@@ -17,6 +17,7 @@ pub fn encode(ty: Type) -> u8 {
         Type::Int32 => b'i',
         Type::UInt32 => b'I',
         Type::Float => b'f',
+        Type::Double => b'd',
         Type::String => b'Z',
         Type::Hex => b'H',
         Type::Array => b'B',
@@ -44,6 +45,7 @@ mod tests {
         assert_eq!(encode(Type::Int32), b'i');
         assert_eq!(encode(Type::UInt32), b'I');
         assert_eq!(encode(Type::Float), b'f');
+        assert_eq!(encode(Type::Double), b'd');
         assert_eq!(encode(Type::String), b'Z');
         assert_eq!(encode(Type::Hex), b'H');
         assert_eq!(encode(Type::Array), b'B');

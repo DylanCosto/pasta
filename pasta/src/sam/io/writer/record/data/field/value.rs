@@ -25,6 +25,7 @@ where
         Value::Int32(n) => num::write_i32(writer, *n),
         Value::UInt32(n) => num::write_u32(writer, *n),
         Value::Float(n) => write_float(writer, *n),
+        Value::Double(n) => num::write_f64(writer, *n),
         Value::String(s) => write_string(writer, s),
         Value::Hex(s) => write_hex(writer, s),
         Value::Array(array) => write_array(writer, array),
@@ -59,6 +60,7 @@ mod tests {
         t(&mut buf, &Value::Int32(8), b"8")?;
         t(&mut buf, &Value::UInt32(13), b"13")?;
         t(&mut buf, &Value::Float(8.0), b"8")?;
+        t(&mut buf, &Value::Double(0.125), b"0.125")?;
         t(&mut buf, &Value::String(b"ndls".as_bstr()), b"ndls")?;
         t(&mut buf, &Value::Hex(b"CAFE".as_bstr()), b"CAFE")?;
         t(

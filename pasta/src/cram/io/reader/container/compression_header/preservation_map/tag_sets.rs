@@ -54,6 +54,8 @@ fn decode_type(n: u8) -> io::Result<Type> {
         b'i' => Ok(Type::Int32),
         b'I' => Ok(Type::UInt32),
         b'f' => Ok(Type::Float),
+        // Not a CRAM type, but HTSlib reads it.
+        b'd' => Ok(Type::Double),
         b'Z' => Ok(Type::String),
         b'H' => Ok(Type::Hex),
         b'B' => Ok(Type::Array),
@@ -94,6 +96,7 @@ mod tests {
         assert_eq!(decode_type(b'i')?, Type::Int32);
         assert_eq!(decode_type(b'I')?, Type::UInt32);
         assert_eq!(decode_type(b'f')?, Type::Float);
+        assert_eq!(decode_type(b'd')?, Type::Double);
         assert_eq!(decode_type(b'Z')?, Type::String);
         assert_eq!(decode_type(b'H')?, Type::Hex);
         assert_eq!(decode_type(b'B')?, Type::Array);

@@ -160,9 +160,10 @@ impl<'a> Record<'a> {
             return Ok(None);
         }
 
-        Ok(self
-            .find_field(*b"CG")?
-            .filter(|range| self.buf[range.start + 2] == b'B' && self.buf[range.start + 3] == b'I'))
+        // HTSlib accepts `B:i` as well as `B:I`.
+        Ok(self.find_field(*b"CG")?.filter(|range| {
+            self.buf[range.start + 2] == b'B' && matches!(self.buf[range.start + 3], b'I' | b'i')
+        }))
     }
 
     /// Reads the CIGAR operations into `dst`, replacing a `kSmN` placeholder with the `CG` tag's

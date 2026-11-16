@@ -393,6 +393,10 @@ fn write_bam_value(dst: &mut Vec<u8>, value: &Value<'_>) -> Option<()> {
             dst.push(b'f');
             dst.extend(n.to_le_bytes());
         }
+        Value::Double(n) => {
+            dst.push(b'd');
+            dst.extend(n.to_le_bytes());
+        }
         Value::String(s) => {
             dst.push(b'Z');
             write_string(dst, s)?;

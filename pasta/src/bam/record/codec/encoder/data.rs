@@ -67,6 +67,11 @@ fn validate(src: &mut &[u8]) -> io::Result<()> {
                 src.split_off(..mem::size_of::<u32>())
                     .ok_or_else(unexpected_eof)?;
             }
+            // HTSlib's non-standard double.
+            b'd' => {
+                src.split_off(..mem::size_of::<f64>())
+                    .ok_or_else(unexpected_eof)?;
+            }
             b'Z' => {
                 let i = memchr(NUL, src).ok_or_else(unexpected_eof)?;
 
@@ -224,9 +229,25 @@ mod tests {
             b'Z', b'P', b'B', b'I', 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             // ZQ:B:f,0
             b'Z', b'Q', b'B', b'f', 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // ZR:d:0.0
+            b'Z', b'R', b'd', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         write_typed_map_encoded_data(&mut dst, &src)?;
         assert_eq!(dst, src);
+
+        // A truncated double.
+        let src = [b'Z', b'R', b'd', 0x00, 0x00, 0x00, 0x00];
+        assert!(matches!(
+            write_typed_map_encoded_data(&mut dst, &src),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // A double is not an array subtype (HTSlib cannot print such an array either).
+        let src = [b'Z', b'S', b'B', b'd', 0x00, 0x00, 0x00, 0x00];
+        assert!(matches!(
+            write_typed_map_encoded_data(&mut dst, &src),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput
+        ));
 
         Ok(())
     }

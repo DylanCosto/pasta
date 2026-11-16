@@ -283,6 +283,10 @@ pub(super) fn push_tag_value(line: &mut Vec<u8>, read: &Read, tag: [u8; 2], empt
             line,
             f64::from(f32::from_le_bytes([value[0], value[1], value[2], value[3]])),
         ),
+        b'd' => push_kputd(
+            line,
+            f64::from_le_bytes(value[..8].try_into().expect("a double field has 8 bytes")),
+        ),
         b'A' => line.push(value[0]),
         _ => line.push(b'*'),
     }

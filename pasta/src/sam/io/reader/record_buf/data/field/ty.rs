@@ -21,7 +21,7 @@ impl fmt::Display for ParseError {
             Self::UnexpectedEof => write!(f, "unexpected EOF"),
             Self::Invalid(actual) => write!(
                 f,
-                "invalid type: expected {{A, i, f, Z, H, B}}, got {}",
+                "invalid type: expected {{A, i, f, d, Z, H, B}}, got {}",
                 char::from(*actual)
             ),
         }
@@ -37,6 +37,8 @@ pub(crate) fn parse_type(src: &mut &[u8]) -> Result<Type, ParseError> {
         b'A' => Ok(Type::Character),
         b'i' => Ok(Type::Int32),
         b'f' => Ok(Type::Float),
+        // HTSlib's double, which is not in the SAM specification.
+        b'd' => Ok(Type::Double),
         b'Z' => Ok(Type::String),
         b'H' => Ok(Type::Hex),
         b'B' => Ok(Type::Array),
@@ -58,6 +60,7 @@ mod tests {
         t(b"A", Type::Character)?;
         t(b"i", Type::Int32)?;
         t(b"f", Type::Float)?;
+        t(b"d", Type::Double)?;
         t(b"Z", Type::String)?;
         t(b"H", Type::Hex)?;
         t(b"B", Type::Array)?;

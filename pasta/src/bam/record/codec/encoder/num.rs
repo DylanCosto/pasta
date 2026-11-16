@@ -25,3 +25,7 @@ pub(super) fn write_u32_le(dst: &mut Vec<u8>, n: u32) {
 pub(super) fn write_f32_le(dst: &mut Vec<u8>, n: f32) {
     dst.extend(n.to_le_bytes());
 }
+
+pub(super) fn write_f64_le(dst: &mut Vec<u8>, n: f64) {
+    dst.extend(n.to_le_bytes());
+}

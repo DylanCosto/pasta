@@ -52,6 +52,7 @@ pub fn read_value(src: &mut &[u8], ty: Type) -> Result<Value, DecodeError> {
         Type::Int32 => read_u32_le(src).map(|n| Value::Int32(n as i32)),
         Type::UInt32 => read_u32_le(src).map(Value::UInt32),
         Type::Float => read_f32_le(src).map(Value::Float),
+        Type::Double => read_f64_le(src).map(Value::Double),
         Type::String => read_string(src).map(Value::String),
         Type::Hex => read_string(src).map(Value::Hex),
         Type::Array => get_array(src).map_err(DecodeError::InvalidArray),
@@ -80,6 +81,12 @@ fn read_f32_le(src: &mut &[u8]) -> Result<f32, DecodeError> {
     let (buf, rest) = src.split_first_chunk().ok_or(DecodeError::UnexpectedEof)?;
     *src = rest;
     Ok(f32::from_le_bytes(*buf))
+}
+
+fn read_f64_le(src: &mut &[u8]) -> Result<f64, DecodeError> {
+    let (buf, rest) = src.split_first_chunk().ok_or(DecodeError::UnexpectedEof)?;
+    *src = rest;
+    Ok(f64::from_le_bytes(*buf))
 }
 
 fn read_string(src: &mut &[u8]) -> Result<BString, DecodeError> {
@@ -113,6 +120,7 @@ mod tests {
         t(&[0x00, 0x00, 0x00, 0x00], Type::Int32, Value::Int32(0))?;
         t(&[0x00, 0x00, 0x00, 0x00], Type::UInt32, Value::UInt32(0))?;
         t(&[0x00, 0x00, 0x00, 0x00], Type::Float, Value::Float(0.0))?;
+        t(&1.5f64.to_le_bytes(), Type::Double, Value::Double(1.5))?;
         t(
             &[b'n', b'd', b'l', b's', 0x00],
             Type::String,

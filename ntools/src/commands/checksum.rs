@@ -757,7 +757,16 @@ fn field_len(src: &[u8]) -> io::Result<usize> {
             let subtype = *src.get(3).ok_or_else(invalid)?;
             let n = src.get(4..8).ok_or_else(invalid)?;
             let n = u32::from_le_bytes([n[0], n[1], n[2], n[3]]) as usize;
-            8 + n * size(subtype).ok_or_else(invalid)?
+
+            // An array holds integers or floats: `A` and HTSlib's `d` are not array subtypes.
+            let size = match subtype {
+                b'A' | b'd' => None,
+                t => size(t),
+            };
+
+            n.checked_mul(size.ok_or_else(invalid)?)
+                .and_then(|len| len.checked_add(8))
+                .ok_or_else(invalid)?
         }
         t => 3 + size(t).ok_or_else(invalid)?,
     };
@@ -1253,6 +1262,29 @@ fn add_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_field_len() {
+        let mut double = b"XDd".to_vec();
+        double.extend(1.5f64.to_le_bytes());
+        assert_eq!(field_len(&double).ok(), Some(11));
+
+        assert_eq!(
+            field_len(b"XBBf\x01\x00\x00\x00\x00\x00\x00\x00").ok(),
+            Some(12)
+        );
+
+        // HTSlib's double and characters are not array subtypes.
+        for &subtype in b"dA" {
+            let mut array = vec![b'X', b'B', b'B', subtype];
+            array.extend(1u32.to_le_bytes());
+            array.extend([0; 8]);
+            assert!(matches!(
+                field_len(&array),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData
+            ));
+        }
+    }
 
     #[test]
     fn test_canonical_crcs_of_a_long_cigar() -> anyhow::Result<()> {

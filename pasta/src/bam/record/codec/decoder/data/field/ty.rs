@@ -19,7 +19,7 @@ impl fmt::Display for DecodeError {
             Self::UnexpectedEof => write!(f, "unexpected EOF"),
             Self::Invalid { actual } => write!(
                 f,
-                "invalid type: expected {{A, c, C, s, S, i, I, f, Z, H, B}}, got {}",
+                "invalid type: expected {{A, c, C, s, S, i, I, f, d, Z, H, B}}, got {}",
                 char::from(*actual)
             ),
         }
@@ -38,6 +38,7 @@ pub fn read_type(src: &mut &[u8]) -> Result<Type, DecodeError> {
         b'i' => Ok(Type::Int32),
         b'I' => Ok(Type::UInt32),
         b'f' => Ok(Type::Float),
+        b'd' => Ok(Type::Double),
         b'Z' => Ok(Type::String),
         b'H' => Ok(Type::Hex),
         b'B' => Ok(Type::Array),
@@ -64,6 +65,7 @@ mod tests {
         t(b"i", Type::Int32)?;
         t(b"I", Type::UInt32)?;
         t(b"f", Type::Float)?;
+        t(b"d", Type::Double)?;
         t(b"Z", Type::String)?;
         t(b"H", Type::Hex)?;
         t(b"B", Type::Array)?;

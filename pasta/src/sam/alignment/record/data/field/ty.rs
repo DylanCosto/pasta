@@ -17,6 +17,11 @@ pub enum Type {
     UInt32,
     /// Single-precision floating-point (`f`).
     Float,
+    /// Double-precision floating-point (`d`).
+    ///
+    /// Not in the SAM specification, but HTSlib reads and writes it, and samtools writes it to
+    /// BAM.
+    Double,
     /// String (`Z`).
     String,
     /// Hex string (`H`).

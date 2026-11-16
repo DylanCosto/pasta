@@ -9,7 +9,10 @@ use std::io::{self, Write};
 
 use self::header::write_header;
 pub(crate) use self::record::write_record;
-pub use self::{builder::Builder, num::write_f32};
+pub use self::{
+    builder::Builder,
+    num::{write_f32, write_f64},
+};
 use crate::sam::{Header, Record};
 
 /// A SAM writer.
