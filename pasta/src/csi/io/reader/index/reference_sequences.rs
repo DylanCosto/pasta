@@ -16,6 +16,48 @@ use crate::csi::{
     io::reader::num::read_i32_le,
 };
 
+/// The most entries reserved up front for a count read from an index.
+///
+/// Counts in an index are untrusted, and a corrupt one would otherwise reserve gigabytes before
+/// any entry is read. A longer list grows as its entries are read. Every bin of a BAI or tabix
+/// index (37,450 at most) fits.
+pub(crate) const MAX_INITIAL_CAPACITY: usize = 1 << 16;
+
+/// Returns the number of entries to reserve up front for a count read from an index: the
+/// count, up to [`MAX_INITIAL_CAPACITY`].
+pub(crate) fn initial_capacity(count: usize) -> usize {
+    count.min(MAX_INITIAL_CAPACITY)
+}
+
+/// Makes room in `entries` for one more entry read from an index.
+///
+/// The list grows as `push` grows it, but a failed allocation returns an `OutOfMemory` error
+/// instead of aborting: each entry takes more memory than the bytes it is read from, so a
+/// corrupt count over a long run of compressed zeros can hold more entries than fit in memory.
+pub(crate) fn reserve_entry<T>(entries: &mut Vec<T>, what: &str) -> io::Result<()> {
+    entries
+        .try_reserve(1)
+        .map_err(|_| out_of_memory_error(entries.len() + 1, what))
+}
+
+/// Makes room in `entries` for one more entry read from an index, as [`reserve_entry`] does for
+/// a list.
+pub(crate) fn reserve_map_entry<K, V, S>(
+    entries: &mut indexmap::IndexMap<K, V, S>,
+    what: &str,
+) -> io::Result<()> {
+    entries
+        .try_reserve(1)
+        .map_err(|_| out_of_memory_error(entries.len() + 1, what))
+}
+
+fn out_of_memory_error(count: usize, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!("could not allocate {count} {what}: out of memory"),
+    )
+}
+
 /// An error returned when CSI reference sequences fail to be read.
 #[derive(Debug)]
 pub enum ReadError {
@@ -56,9 +98,15 @@ where
 {
     let reference_sequence_count = read_reference_sequence_count(reader)?;
 
-    (0..reference_sequence_count)
-        .map(|_| read_reference_sequence(reader, depth))
-        .collect()
+    let mut reference_sequences = Vec::with_capacity(initial_capacity(reference_sequence_count));
+
+    for _ in 0..reference_sequence_count {
+        let reference_sequence = read_reference_sequence(reader, depth)?;
+        reserve_entry(&mut reference_sequences, "reference sequences").map_err(ReadError::Io)?;
+        reference_sequences.push(reference_sequence);
+    }
+
+    Ok(reference_sequences)
 }
 
 fn read_reference_sequence_count<R>(reader: &mut R) -> Result<usize, ReadError>

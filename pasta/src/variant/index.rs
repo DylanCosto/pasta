@@ -21,6 +21,9 @@ use indexmap::IndexMap;
 
 use self::khash::BinTable;
 use crate::bgzf;
+use crate::csi::io::reader::index::reference_sequences::{
+    initial_capacity, reserve_entry, reserve_map_entry,
+};
 use crate::variant::{
     io::{bgzf_out::BlockWriter, writer::htslib_level},
     log,
@@ -818,9 +821,24 @@ impl Index {
     /// Returns an error for malformed data.
     pub fn parse(data: &[u8]) -> io::Result<Self> {
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed index");
+        // Checks, before reserving for them, that the data can hold `n` entries of at least
+        // `size` bytes each, so that a corrupt count does not reserve gigabytes.
+        let fits = |c: &Cursor<'_>, what: &str, n: usize, size: usize| {
+            if n.checked_mul(size).is_some_and(|len| len <= c.remaining()) {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "malformed index: {n} {what} need more than the {} bytes left",
+                        c.remaining()
+                    ),
+                ))
+            }
+        };
         let mut c = Cursor { data, pos: 0 };
         let magic = c.take(4).ok_or_else(bad)?;
-        let mut idx = match magic {
+        let (mut idx, n_targets) = match magic {
             b"CSI\x01" => {
                 let min_shift = c.u32().ok_or_else(bad)?;
                 let n_lvls = c.u32().ok_or_else(bad)?;
@@ -830,9 +848,11 @@ impl Index {
                 if n > i32::MAX as u32 {
                     return Err(bad());
                 }
-                let mut idx = Self::new(n as usize, IndexFormat::Csi, 0, min_shift, n_lvls);
+                // Each target has at least `n_bin`.
+                fits(&c, "targets", n as usize, 4)?;
+                let mut idx = Self::new(0, IndexFormat::Csi, 0, min_shift, n_lvls);
                 idx.meta = meta;
-                idx
+                (idx, n as usize)
             }
             b"TBI\x01" => {
                 let n = c.u32().ok_or_else(bad)?;
@@ -842,20 +862,29 @@ impl Index {
                 let conf = c.take(TBX_CONF_LEN).ok_or_else(bad)?.to_vec();
                 let l_nm = u32::from_le_bytes(conf[TBX_L_NM].try_into().expect("4 bytes")) as usize;
                 let names = c.take(l_nm).ok_or_else(bad)?;
-                let mut idx = Self::new(n as usize, IndexFormat::Tbi, 0, TBI_MIN_SHIFT, TBI_N_LVLS);
+                // Each target has at least `n_bin` and `n_intv`.
+                fits(&c, "targets", n as usize, 8)?;
+                let mut idx = Self::new(0, IndexFormat::Tbi, 0, TBI_MIN_SHIFT, TBI_N_LVLS);
                 idx.meta = conf;
                 idx.meta.extend_from_slice(names);
-                idx
+                (idx, n as usize)
             }
             _ => return Err(bad()),
         };
         let fmt = idx.fmt;
-        for i in 0..idx.bidx.len() {
+        // The targets are added as they are read: each one takes far more memory than the 4 or
+        // 8 bytes it can be read from, so the count alone must not decide what is reserved.
+        idx.bidx.reserve(initial_capacity(n_targets));
+        idx.lidx.reserve(initial_capacity(n_targets));
+        for i in 0..n_targets {
             let n = c.i32().ok_or_else(bad)?;
             if n < 0 {
                 return Err(bad());
             }
-            let mut bins = IndexMap::with_capacity(n as usize);
+            // Each bin has at least its number and `n_chunk`, and in CSI `loffset`.
+            let bin_size = if fmt == IndexFormat::Csi { 16 } else { 8 };
+            fits(&c, "bins", n as usize, bin_size)?;
+            let mut bins = IndexMap::with_capacity(initial_capacity(n as usize));
             for _ in 0..n {
                 let key = c.u32().ok_or_else(bad)?;
                 let loff = if fmt == IndexFormat::Csi {
@@ -867,22 +896,28 @@ impl Index {
                 if nc < 0 {
                     return Err(bad());
                 }
+                fits(&c, "chunks", nc as usize, 16)?;
                 let mut chunks = Vec::with_capacity(nc as usize);
                 for _ in 0..nc {
                     let u = c.u64().ok_or_else(bad)?;
                     let v = c.u64().ok_or_else(bad)?;
                     chunks.push((u, v));
                 }
+                reserve_map_entry(&mut bins, "bins")?;
                 if bins.insert(key, Bin { loff, chunks }).is_some() {
                     return Err(bad());
                 }
             }
-            idx.bidx[i] = Some(bins);
+            reserve_entry(&mut idx.bidx, "targets")?;
+            idx.bidx.push(Some(bins));
+            reserve_entry(&mut idx.lidx, "targets")?;
+            idx.lidx.push(Vec::new());
             if fmt != IndexFormat::Csi {
                 let nl = c.i32().ok_or_else(bad)?;
                 if nl < 0 {
                     return Err(bad());
                 }
+                fits(&c, "linear index offsets", nl as usize, 8)?;
                 let mut l = Vec::with_capacity(nl as usize);
                 for _ in 0..nl {
                     l.push(c.u64().ok_or_else(bad)?);
@@ -1224,6 +1259,10 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let s = self.data.get(self.pos..self.pos.checked_add(n)?)?;
         self.pos += n;
@@ -1270,14 +1309,10 @@ pub fn warn_if_older(data: &Path, index: &Path) {
 }
 
 /// Reports an index that could not be loaded, as HTSlib's `hts_idx_load3` does: with the
-/// system error, or `Invalid argument` for a file that is not an index.
+/// system error, `Cannot allocate memory` for an index too large to fit in memory, or
+/// `Invalid argument` for a file that is not an index.
 pub fn report_load_error(index: &Path, e: &io::Error) {
-    let reason = if e.raw_os_error().is_some() {
-        let msg = e.to_string();
-        msg.split(" (os error").next().unwrap_or(&msg).to_owned()
-    } else {
-        "Invalid argument".to_owned()
-    };
+    let reason = load_error_reason(e);
     log::error(
         "hts_idx_load3",
         format_args!(
@@ -1285,6 +1320,19 @@ pub fn report_load_error(index: &Path, e: &io::Error) {
             index.display()
         ),
     );
+}
+
+/// The reason [`report_load_error`] gives for an error.
+fn load_error_reason(e: &io::Error) -> String {
+    if e.raw_os_error().is_some() {
+        let msg = e.to_string();
+        msg.split(" (os error").next().unwrap_or(&msg).to_owned()
+    } else if e.kind() == io::ErrorKind::OutOfMemory {
+        // `strerror(ENOMEM)`, as HTSlib reports a failed allocation.
+        "Cannot allocate memory".to_owned()
+    } else {
+        "Invalid argument".to_owned()
+    }
 }
 
 /// Finds the index file of a data file as HTSlib does (`hts_idx_check_local`): `FILE.csi`,
@@ -1369,6 +1417,51 @@ mod tests {
         assert_eq!(reg2bin(0, 1, 14, 5), 4681);
         assert_eq!(reg2bin(0, 1 << 29, 14, 5), 0);
         assert_eq!(reg2bin(16384, 16385, 14, 5), 4682);
+    }
+
+    #[test]
+    fn parse_rejects_counts_past_the_data() {
+        // CSI: min_shift 14, depth 5, no aux data, then `n_ref`.
+        let csi = |rest: &[u8]| {
+            let mut data = b"CSI\x01".to_vec();
+            for n in [14u32, 5, 0] {
+                data.extend(n.to_le_bytes());
+            }
+            data.extend(rest);
+            data
+        };
+        // TBI: `n_ref`, then the 28-byte configuration with no names.
+        let tbi = |n_ref: u32, rest: &[u8]| {
+            let mut data = b"TBI\x01".to_vec();
+            data.extend(n_ref.to_le_bytes());
+            data.extend([0; 28]);
+            data.extend(rest);
+            data
+        };
+        let i32_max = i32::MAX.to_le_bytes();
+        let cases = [
+            ("targets", csi(&i32_max)),
+            ("targets", tbi(i32::MAX as u32, &[])),
+            ("bins", csi(&[&1u32.to_le_bytes()[..], &i32_max].concat())),
+            (
+                "chunks",
+                csi(&[&1u32.to_le_bytes()[..], &[1, 0, 0, 0], &[0; 12], &i32_max].concat()),
+            ),
+            ("linear index", tbi(1, &[&[0; 4][..], &i32_max].concat())),
+        ];
+        for (what, data) in cases {
+            let e = Index::parse(&data).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{what}");
+            assert!(e.to_string().contains(what), "{what}: {e}");
+        }
+    }
+
+    #[test]
+    fn load_errors_are_reported_as_htslib_reports_them() {
+        let e = io::Error::new(io::ErrorKind::OutOfMemory, "could not allocate 3 targets");
+        assert_eq!(load_error_reason(&e), "Cannot allocate memory");
+        let e = io::Error::new(io::ErrorKind::InvalidData, "malformed index");
+        assert_eq!(load_error_reason(&e), "Invalid argument");
     }
 
     #[test]

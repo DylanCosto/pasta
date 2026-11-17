@@ -3,7 +3,10 @@ mod intervals;
 
 use std::io::{self, Read};
 
-use crate::csi::binning_index::index::{ReferenceSequence, reference_sequence::index::LinearIndex};
+use crate::csi::{
+    binning_index::index::{ReferenceSequence, reference_sequence::index::LinearIndex},
+    io::reader::index::reference_sequences::{initial_capacity, reserve_entry},
+};
 
 use self::{bins::read_bins, intervals::read_intervals};
 
@@ -14,9 +17,15 @@ pub(super) fn read_reference_sequences<R>(
 where
     R: Read,
 {
-    (0..reference_sequence_count)
-        .map(|_| read_reference_sequence(reader))
-        .collect()
+    let mut reference_sequences = Vec::with_capacity(initial_capacity(reference_sequence_count));
+
+    for _ in 0..reference_sequence_count {
+        let reference_sequence = read_reference_sequence(reader)?;
+        reserve_entry(&mut reference_sequences, "reference sequences")?;
+        reference_sequences.push(reference_sequence);
+    }
+
+    Ok(reference_sequences)
 }
 
 fn read_reference_sequence<R>(reader: &mut R) -> io::Result<ReferenceSequence<LinearIndex>>

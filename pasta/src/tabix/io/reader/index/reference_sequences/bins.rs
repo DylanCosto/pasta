@@ -9,15 +9,19 @@ pub(super) fn read_bins<R>(reader: &mut R) -> io::Result<(IndexMap<usize, Bin>, 
 where
     R: Read,
 {
-    use crate::csi::io::reader::index::reference_sequences::{bins::read_chunks, read_metadata};
+    use crate::csi::io::reader::index::reference_sequences::{
+        bins::{invalid_bin_id_error, read_chunks},
+        initial_capacity, read_metadata,
+    };
 
     use crate::tabix::index::DEPTH;
 
+    const MAX_ID: usize = Bin::max_id(DEPTH).unwrap();
     const METADATA_ID: usize = Bin::metadata_id(DEPTH).unwrap();
 
     let bin_count = read_bin_count(reader)?;
 
-    let mut bins = IndexMap::with_capacity(bin_count);
+    let mut bins = IndexMap::with_capacity(initial_capacity(bin_count));
     let mut metadata = None;
 
     for _ in 0..bin_count {
@@ -30,6 +34,8 @@ where
                 read_metadata(reader).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             metadata.replace(m).is_some()
+        } else if id > MAX_ID {
+            return Err(invalid_bin_id_error(id, MAX_ID));
         } else {
             let chunks =
                 read_chunks(reader).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -128,5 +134,31 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_read_bins_with_an_out_of_range_bin_id() {
+        for id in [37449u32, 37451, 201364042] {
+            let mut src = vec![0x01, 0x00, 0x00, 0x00]; // n_bin = 1
+            src.extend(id.to_le_bytes()); // bins[0].bin
+            src.extend([0x00, 0x00, 0x00, 0x00]); // bins[0].n_chunk = 0
+
+            assert!(matches!(
+                read_bins(&mut &src[..]),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData
+                    && e.to_string() == format!("invalid bin ID: {id} (max 37448)")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_read_bins_with_a_bin_count_past_the_data() {
+        let src = [
+            0xff, 0xff, 0xff, 0x7f, // n_bin = 2147483647
+        ];
+        assert!(matches!(
+            read_bins(&mut &src[..]),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
     }
 }
