@@ -588,9 +588,9 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// [`record`] with the `kSmN` placeholder CIGAR 4S10N and the auxiliary data `aux`.
+    /// [`r1`] with the `kSmN` placeholder CIGAR 4S10N and the auxiliary data `aux`.
     fn placeholder_record(aux: &[u8]) -> Vec<u8> {
-        let mut raw = record();
+        let mut raw = r1();
         raw[12..14].copy_from_slice(&2u16.to_le_bytes()); // n_cigar_op
         raw.splice(
             35..39,
