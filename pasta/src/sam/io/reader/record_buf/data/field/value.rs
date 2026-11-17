@@ -47,7 +47,7 @@ impl fmt::Display for ParseError {
             Self::UnexpectedEof => write!(f, "unexpected EOF"),
             Self::InvalidType(actual) => write!(
                 f,
-                "invalid type: expected {{Character, Int32, Float, String, Hex, Array}}, got {actual:?}"
+                "invalid type: expected {{Character, Int32, Float, Double, String, Hex, Array}}, got {actual:?}"
             ),
             Self::InvalidCharacter => write!(f, "invalid character"),
             Self::InvalidInteger(_) => write!(f, "invalid integer"),
@@ -65,6 +65,7 @@ pub(super) fn parse_value(src: &mut &[u8], ty: Type) -> Result<Value, ParseError
         Type::Character => parse_char(src),
         Type::Int32 => parse_int(src),
         Type::Float => parse_float(src),
+        Type::Double => parse_double(src),
         Type::String => parse_string(src),
         Type::Hex => parse_hex(src),
         Type::Array => parse_array(src)
@@ -93,6 +94,12 @@ fn parse_int(src: &[u8]) -> Result<Value, ParseError> {
 fn parse_float(src: &[u8]) -> Result<Value, ParseError> {
     lexical_core::parse(src)
         .map(Value::Float)
+        .map_err(ParseError::InvalidFloat)
+}
+
+fn parse_double(src: &[u8]) -> Result<Value, ParseError> {
+    lexical_core::parse(src)
+        .map(Value::Double)
         .map_err(ParseError::InvalidFloat)
 }
 
@@ -159,6 +166,12 @@ mod tests {
         ));
         assert!(matches!(
             parse_value(&mut &b"ndls"[..], Type::Float),
+            Err(ParseError::InvalidFloat(_))
+        ));
+
+        t(b"0.1", Type::Double, Value::Double(0.1));
+        assert!(matches!(
+            parse_value(&mut &b"ndls"[..], Type::Double),
             Err(ParseError::InvalidFloat(_))
         ));
 

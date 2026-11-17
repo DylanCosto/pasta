@@ -131,7 +131,8 @@ impl<'a> RecordRef<'a> {
     /// Returns the CIGAR operations.
     ///
     /// For more than 65,535 operations, BAM stores a `kSmN` placeholder and the operations in a
-    /// `CG` field; these are the operations from the `CG` field.
+    /// `CG` field; these are the operations from the `CG` field (`B:I`, or `B:i`, which HTSlib
+    /// also accepts).
     pub fn cigar(&self) -> Cigar<'a> {
         match self.long_cigar() {
             Some(buf) => Cigar::new(buf),
@@ -463,6 +464,60 @@ mod tests {
         assert_eq!(data.as_bytes().len(), 12);
 
         Ok(())
+    }
+
+    /// An unmapped record with 4 bases, the `kSmN` placeholder 4S2N, and the data `data`.
+    fn placeholder_record(data: &[u8]) -> Vec<u8> {
+        let mut src = vec![
+            0xff, 0xff, 0xff, 0xff, // ref_id = -1
+            0xff, 0xff, 0xff, 0xff, // pos = -1
+            0x02, // l_read_name = 2
+            0xff, // mapq = 255
+            0x48, 0x12, // bin = 4680
+            0x02, 0x00, // n_cigar_op = 2
+            0x04, 0x00, // flag = 4
+            0x04, 0x00, 0x00, 0x00, // l_seq = 4
+            0xff, 0xff, 0xff, 0xff, // next_ref_id = -1
+            0xff, 0xff, 0xff, 0xff, // next_pos = -1
+            0x00, 0x00, 0x00, 0x00, // tlen = 0
+            b'*', 0x00, // read_name = "*\x00"
+            0x44, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00, // cigar = 4S2N
+            0x12, 0x48, // sequence = ACGT
+            b'N', b'D', b'L', b'S', // quality scores
+        ];
+        src.extend_from_slice(data);
+        src
+    }
+
+    #[test]
+    fn test_cigar_with_a_signed_long_cigar() {
+        // data["CG"] = [4M] as `B:i`, which HTSlib reads as it does `B:I`.
+        let src = placeholder_record(b"CGBi\x01\x00\x00\x00\x40\x00\x00\x00");
+        let record = RecordRef::new_unchecked(&src);
+        assert_eq!(record.cigar().as_ref(), [0x40, 0x00, 0x00, 0x00]);
+        assert!(record.data().is_empty());
+
+        // An array of another subtype cannot hold a CIGAR: the placeholder stays, and `CG` is
+        // a data field.
+        let src = placeholder_record(b"CGBC\x04\x00\x00\x00\x40\x00\x00\x00");
+        let record = RecordRef::new_unchecked(&src);
+        assert_eq!(
+            record.cigar().as_ref(),
+            [0x44, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00]
+        );
+        assert!(record.data().get(b"CG").is_some());
+    }
+
+    #[test]
+    fn test_cigar_with_a_double_field_before_the_long_cigar() {
+        let mut data = b"XDd".to_vec();
+        data.extend(1.5f64.to_le_bytes());
+        data.extend(b"CGBI\x01\x00\x00\x00\x40\x00\x00\x00");
+        let src = placeholder_record(&data);
+        let record = RecordRef::new_unchecked(&src);
+
+        assert_eq!(record.cigar().as_ref(), [0x40, 0x00, 0x00, 0x00]);
+        assert!(record.data().get(b"CG").is_none());
     }
 
     #[test]

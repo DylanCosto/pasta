@@ -632,6 +632,10 @@ impl TagFilter {
                 raw[..4].try_into().expect("a float field has 4 bytes"),
             )))
             .into_bytes(),
+            b'd' => format_f(f64::from_le_bytes(
+                raw[..8].try_into().expect("a double field has 8 bytes"),
+            ))
+            .into_bytes(),
             b'A' => raw.to_vec(),
             b'Z' | b'H' => raw[..raw.len() - 1].to_vec(),
             // Anything else fails the match.
@@ -1203,7 +1207,8 @@ fn write_field(data: &[u8], dst: &mut Vec<u8>) -> io::Result<usize> {
         b'd' => {
             let n = f64::from_le_bytes(value.try_into().map_err(|_| invalid())?);
             dst.extend_from_slice(b"d:");
-            dst.extend_from_slice(crate::depth::format_g(n, 6).as_bytes());
+            // `%g`, as for `f`.
+            pasta::sam::io::writer::write_f64(dst, n)?;
         }
         b'Z' | b'H' => {
             dst.extend_from_slice(&[ty, b':']);

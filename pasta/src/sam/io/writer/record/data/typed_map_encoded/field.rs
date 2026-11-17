@@ -16,6 +16,8 @@ const UINT16_TYPE_VALUE: u8 = b'S';
 const INT32_TYPE_VALUE: u8 = b'i';
 const UINT32_TYPE_VALUE: u8 = b'I';
 const FLOAT_TYPE_VALUE: u8 = b'f';
+// HTSlib's double, which is not in the SAM specification.
+const DOUBLE_TYPE_VALUE: u8 = b'd';
 const STRING_TYPE_VALUE: u8 = b'Z';
 const HEX_TYPE_VALUE: u8 = b'H';
 const ARRAY_TYPE_VALUE: u8 = b'B';
@@ -42,6 +44,7 @@ where
         INT32_TYPE_VALUE => write_i32_field(writer, src, tag)?,
         UINT32_TYPE_VALUE => write_u32_field(writer, src, tag)?,
         FLOAT_TYPE_VALUE => write_f32_field(writer, src, tag)?,
+        DOUBLE_TYPE_VALUE => write_f64_field(writer, src, tag)?,
         STRING_TYPE_VALUE => write_string_field(writer, src, tag)?,
         HEX_TYPE_VALUE => write_hex_field(writer, src, tag)?,
         ARRAY_TYPE_VALUE => write_array_field(writer, src, tag)?,
@@ -164,6 +167,20 @@ where
     let buf = split_off_first_chunk(src).ok_or_else(unexpected_eof)?;
     let n = f32::from_le_bytes(*buf);
     num::write_f32(writer, n)?;
+
+    Ok(())
+}
+
+/// A double, which HTSlib writes as `d:%g`.
+fn write_f64_field<W>(writer: &mut W, src: &mut &[u8], tag: Tag) -> io::Result<()>
+where
+    W: Write,
+{
+    write_field_prefix(writer, tag, DOUBLE_TYPE_VALUE)?;
+
+    let buf = split_off_first_chunk(src).ok_or_else(unexpected_eof)?;
+    let n = f64::from_le_bytes(*buf);
+    num::write_f64(writer, n)?;
 
     Ok(())
 }
@@ -591,6 +608,34 @@ mod tests {
         let src = 1e30f32.to_le_bytes();
         write_f32_field(&mut buf, &mut &src[..], tag)?;
         assert_eq!(buf, b"\tZZ:f:1e+30");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_f64_field() -> io::Result<()> {
+        let mut buf = Vec::new();
+        let tag = *b"ZZ";
+
+        let src = 0.125f64.to_le_bytes();
+        write_f64_field(&mut buf, &mut &src[..], tag)?;
+        assert_eq!(buf, b"\tZZ:d:0.125");
+
+        buf.clear();
+        assert!(matches!(
+            write_f64_field(&mut buf, &mut &src[..7], tag),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        // A double is written through `write_field`, and the field after it too.
+        buf.clear();
+        let mut src = b"ZZd".to_vec();
+        src.extend((-1e300f64).to_le_bytes());
+        src.extend(b"HPC\x01");
+        let mut src = &src[..];
+        write_field(&mut buf, &mut src)?;
+        write_field(&mut buf, &mut src)?;
+        assert_eq!(buf, b"\tZZ:d:-1e+300\tHP:i:1");
 
         Ok(())
     }

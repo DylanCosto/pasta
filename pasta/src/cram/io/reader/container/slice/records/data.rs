@@ -18,6 +18,7 @@ pub(super) fn read_value(src: Cow<'_, [u8]>, ty: Type) -> io::Result<Value<'_>> 
         Type::Int32 => read_u32_le(&src).map(|n| Value::Int32(n as i32)),
         Type::UInt32 => read_u32_le(&src).map(Value::UInt32),
         Type::Float => read_f32_le(&src).map(Value::Float),
+        Type::Double => read_f64_le(&src).map(Value::Double),
         Type::String => read_string(src).map(Value::String),
         Type::Hex => read_string(src).map(Value::Hex),
         Type::Array => read_array(src).map(Value::Array),
@@ -46,6 +47,12 @@ fn read_u32_le(src: &[u8]) -> io::Result<u32> {
 fn read_f32_le(src: &[u8]) -> io::Result<f32> {
     src.split_first_chunk()
         .map(|(buf, _)| f32::from_le_bytes(*buf))
+        .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
+}
+
+fn read_f64_le(src: &[u8]) -> io::Result<f64> {
+    src.split_first_chunk()
+        .map(|(buf, _)| f64::from_le_bytes(*buf))
         .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))
 }
 
@@ -103,6 +110,23 @@ fn read_array(src: Cow<'_, [u8]>) -> io::Result<Array<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_value_with_a_double() -> io::Result<()> {
+        let buf = 1.5f64.to_le_bytes();
+        assert_eq!(
+            read_value(Cow::from(&buf[..]), Type::Double)?,
+            Value::Double(1.5)
+        );
+
+        let src = Cow::from(&[0; 7][..]);
+        assert!(matches!(
+            read_value(src, Type::Double),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        Ok(())
+    }
 
     #[test]
     fn test_read_string() -> io::Result<()> {

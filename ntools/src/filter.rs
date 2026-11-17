@@ -497,7 +497,7 @@ impl TagFilter {
             Value::UInt16(n) => n.to_string().into(),
             Value::Int32(n) => n.to_string().into(),
             Value::UInt32(n) => n.to_string().into(),
-            Value::Float(_) | Value::Array(_) => return Ok(false),
+            Value::Float(_) | Value::Double(_) | Value::Array(_) => return Ok(false),
         };
 
         Ok(values.contains(&text))

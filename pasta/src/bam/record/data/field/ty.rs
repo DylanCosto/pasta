@@ -16,6 +16,7 @@ pub(crate) fn decode_type(src: &mut &[u8]) -> io::Result<Type> {
         b'i' => Ok(Type::Int32),
         b'I' => Ok(Type::UInt32),
         b'f' => Ok(Type::Float),
+        b'd' => Ok(Type::Double),
         b'Z' => Ok(Type::String),
         b'H' => Ok(Type::Hex),
         b'B' => Ok(Type::Array),
@@ -42,6 +43,7 @@ mod tests {
         t(b"i", Type::Int32)?;
         t(b"I", Type::UInt32)?;
         t(b"f", Type::Float)?;
+        t(b"d", Type::Double)?;
         t(b"Z", Type::String)?;
         t(b"H", Type::Hex)?;
         t(b"B", Type::Array)?;

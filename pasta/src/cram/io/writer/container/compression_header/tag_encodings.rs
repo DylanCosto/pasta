@@ -93,6 +93,8 @@ fn build_tag_encoding(
         Type::Character | Type::Int8 | Type::UInt8 => Some(1),
         Type::Int16 | Type::UInt16 => Some(2),
         Type::Int32 | Type::UInt32 | Type::Float => Some(4),
+        // `Data` refuses doubles, but this is what one would take.
+        Type::Double => Some(8),
         Type::String | Type::Hex | Type::Array => None,
     };
 

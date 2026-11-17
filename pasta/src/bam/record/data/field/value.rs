@@ -19,6 +19,7 @@ pub(crate) fn decode_value<'a>(src: &mut &'a [u8], ty: Type) -> io::Result<Value
         Type::Int32 => read_u32_le(src).map(|n| Value::Int32(n as i32)),
         Type::UInt32 => read_u32_le(src).map(Value::UInt32),
         Type::Float => read_f32_le(src).map(Value::Float),
+        Type::Double => read_f64_le(src).map(Value::Double),
         Type::String => read_string(src).map(Value::String),
         Type::Hex => read_string(src).map(Value::Hex),
         Type::Array => decode_array(src).map(Value::Array),
@@ -61,6 +62,16 @@ fn read_f32_le(src: &mut &[u8]) -> io::Result<f32> {
     Ok(f32::from_le_bytes(*buf))
 }
 
+fn read_f64_le(src: &mut &[u8]) -> io::Result<f64> {
+    let Some((buf, rest)) = src.split_first_chunk() else {
+        return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+    };
+
+    *src = rest;
+
+    Ok(f64::from_le_bytes(*buf))
+}
+
 fn read_string<'a>(src: &mut &'a [u8]) -> io::Result<&'a BStr> {
     const NUL: u8 = 0x00;
 
@@ -92,6 +103,7 @@ mod tests {
         assert_eq!(Value::Int32(0).ty(), Type::Int32);
         assert_eq!(Value::UInt32(0).ty(), Type::UInt32);
         assert_eq!(Value::Float(0.0).ty(), Type::Float);
+        assert_eq!(Value::Double(0.0).ty(), Type::Double);
         assert_eq!(Value::String(b"ndls".as_bstr()).ty(), Type::String);
         assert_eq!(Value::Hex(b"CAFE".as_bstr()).ty(), Type::Hex);
         assert_eq!(
@@ -148,6 +160,12 @@ mod tests {
         assert!(matches!(
             decode_value(&mut src, Type::Float)?,
             Value::Float(n) if n == 0.0
+        ));
+
+        let mut src = &1.5f64.to_le_bytes()[..];
+        assert!(matches!(
+            decode_value(&mut src, Type::Double)?,
+            Value::Double(n) if n == 1.5
         ));
 
         let mut src = &[b'n', b'd', b'l', b's', 0x00][..];

@@ -9,6 +9,10 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 - pasta: `pileup::Read::quality_score`, the quality of one base: 0xff (missing) past the stored
   qualities, as for every base of a read whose `SEQ` is `*`.
+- pasta: `Type::Double` and `Value::Double(f64)` (`sam::alignment::record::data::field`, and
+  `Value::Double` in `sam::alignment::record_buf::data::field`) for HTSlib's non-standard `d`
+  tag type, and `sam::io::writer::write_f64`. Code that matches these enums exhaustively needs
+  an arm for the new variant.
 
 ### Changed
 
@@ -75,6 +79,29 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 - vtools: `mpileup` no longer panics on a read with a zero-length match (`2M0M2D`, `0M2D` with
   `SEQ` `*`), which puts it in the pileup just past its last base; the base there is an `N` of
   quality 0, as samtools shows it, so the default `-Q 1` leaves it out.
+- pasta: BAM, SAM, and CRAM records with a `d` (double) tag, which samtools writes to BAM, are
+  read instead of failing; before, `bam::Record::data` found no tag after one. The SAM writer
+  prints them as HTSlib does (`XD:d:%g`), and the BAM writer keeps their 8 bytes.
+- pasta: the CRAM writer refuses a `d` tag with an error that names it, as HTSlib does: CRAM
+  has no such type.
+- pasta: a `pileup::Read` with a `d` tag no longer fails to decode (stopping the pileup), and
+  finds the `CG` field and other tags after it.
+- pasta: a `kSmN` placeholder CIGAR is replaced by a `CG:B:i` field, as HTSlib replaces it, as
+  well as by `CG:B:I`, in `pileup::Read` (which piled up the placeholder) and in `bam::Record`
+  alike. In `bam::Record`, a `CG` array of another subtype no longer replaces it, and only the
+  first `CG` field counts.
+- pasta: the CRAM writer no longer also stores, as a tag, the `CG` field that holds a BAM
+  record's CIGAR in place of a `kSmN` placeholder; it stores the CIGAR alone, as HTSlib does.
+  Before, HTSlib read such a CRAM record back with a leftover `CG` tag.
+- ntools: `mpileup --output-extra` prints a `d` tag's value as samtools does, instead of `*`;
+  `fastq -d TAG:VALUE` matches one as it matches an `f` tag; `view` and `fastq -T` print a
+  `d` of -0 as `-0`, as samtools does.
+- ntools: `mpileup` piles up the CIGAR in a `CG:B:i` field of a record whose CIGAR is a `kSmN`
+  placeholder, as samtools does, instead of the placeholder.
+- ntools: `view -C` of a BAM record whose CIGAR is held in a `CG` field writes no `CG` tag, as
+  `samtools view -C` does.
+- ntools: `checksum` rejects a `B` array of subtype `d` or `A` as invalid auxiliary data,
+  instead of skipping 8 or 1 bytes per element.
 
 ## [0.9.0] - 2026-11-08
 

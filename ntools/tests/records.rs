@@ -166,3 +166,31 @@ r\t16\tc1\t100\t60\t4M2S\t*\t0\t0\tGGCGTG\tFEDCBA\tMM:Z:C+m,0,0;\tML:B:C,10,200
         ]
     );
 }
+
+/// HTSlib's non-standard `d` (double) tag type, which samtools writes to BAM, before other tags.
+const DOUBLE_TAG: &str = "@SQ\tSN:c1\tLN:1000
+r0\t0\tc1\t10\t30\t4M\t*\t0\t0\tACGT\tIIII\tXD:d:0.125\tHP:i:1
+r1\t0\tc1\t11\t30\t4M\t*\t0\t0\tACGT\tIIII\tXD:d:-1e+300\tHP:i:2
+";
+
+#[test]
+fn test_double_tags_are_read_and_written() {
+    let records = DOUBLE_TAG.split_once('\n').expect("a header line").1;
+
+    // SAM to SAM, and through BAM, prints a double as samtools does (`d:%g`).
+    let output = ntools(&["view", "-"], DOUBLE_TAG.as_bytes());
+    assert_eq!(stdout(&output), records);
+
+    let bam = ntools(&["view", "-b", "-"], DOUBLE_TAG.as_bytes());
+    let output = ntools(&["view", "-"], &bam.stdout);
+    assert_eq!(stdout(&output), records);
+
+    // The tag after the double is found.
+    let output = ntools(&["view", "-c", "-d", "HP:2", "-"], &bam.stdout);
+    assert_eq!(stdout(&output), "1\n");
+
+    // As samtools prints a float or double tag in a pileup column.
+    let output = ntools(&["mpileup", "--output-extra", "XD,HP", "-"], &bam.stdout);
+    let line = stdout(&output).lines().nth(1).expect("a second column");
+    assert!(line.ends_with("\t0.125,-1e+300\t1,2"), "{line}");
+}

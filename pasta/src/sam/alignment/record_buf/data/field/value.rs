@@ -26,6 +26,8 @@ pub enum Value {
     UInt32(u32),
     /// A single-precision floating-point (`f`).
     Float(f32),
+    /// A double-precision floating-point (`d`), HTSlib's extension to the SAM types.
+    Double(f64),
     /// A string (`Z`).
     String(BString),
     /// A hex string (`H`).
@@ -53,6 +55,7 @@ impl Value {
             Self::Int32(_) => Type::Int32,
             Self::UInt32(_) => Type::UInt32,
             Self::Float(_) => Type::Float,
+            Self::Double(_) => Type::Double,
             Self::String(_) => Type::String,
             Self::Hex(_) => Type::Hex,
             Self::Array(_) => Type::Array,
@@ -263,6 +266,7 @@ impl<'a> From<&'a Value> for crate::sam::alignment::record::data::field::Value<'
             Value::Int32(n) => Self::Int32(*n),
             Value::UInt32(n) => Self::UInt32(*n),
             Value::Float(n) => Self::Float(*n),
+            Value::Double(n) => Self::Double(*n),
             Value::String(s) => Self::String(s.as_ref()),
             Value::Hex(s) => Self::Hex(s.as_ref()),
             Value::Array(array) => Self::Array(array.into()),
@@ -279,6 +283,7 @@ mod tests {
         assert_eq!(Value::Character(b'n').ty(), Type::Character);
         assert_eq!(Value::Int32(0).ty(), Type::Int32);
         assert_eq!(Value::Float(0.0).ty(), Type::Float);
+        assert_eq!(Value::Double(0.0).ty(), Type::Double);
         assert_eq!(Value::from("noodles").ty(), Type::String);
         assert_eq!(Value::Hex(b"CAFE".into()).ty(), Type::Hex);
         assert_eq!(Value::Array(Array::UInt8(vec![0])).ty(), Type::Array);

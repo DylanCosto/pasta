@@ -28,6 +28,8 @@ pub enum Value<'a> {
     UInt32(u32),
     /// A single-precision floating-point (`f`).
     Float(f32),
+    /// A double-precision floating-point (`d`), HTSlib's extension to the SAM types.
+    Double(f64),
     /// A string (`Z`).
     String(&'a BStr),
     /// A hex string (`H`).
@@ -55,6 +57,7 @@ impl Value<'_> {
             Self::Int32(_) => Type::Int32,
             Self::UInt32(_) => Type::UInt32,
             Self::Float(_) => Type::Float,
+            Self::Double(_) => Type::Double,
             Self::String(_) => Type::String,
             Self::Hex(_) => Type::Hex,
             Self::Array(_) => Type::Array,
@@ -100,6 +103,7 @@ impl<'a> TryFrom<Value<'a>> for crate::sam::alignment::record_buf::data::field::
             Value::Int32(n) => Ok(Self::Int32(n)),
             Value::UInt32(n) => Ok(Self::UInt32(n)),
             Value::Float(n) => Ok(Self::Float(n)),
+            Value::Double(n) => Ok(Self::Double(n)),
             Value::String(s) => Ok(Self::String(s.into())),
             Value::Hex(s) => Ok(Self::Hex(s.into())),
             Value::Array(array) => array.try_into().map(Self::Array),

@@ -19,6 +19,7 @@ pub(super) fn parse_value<'a>(src: &mut &'a [u8], ty: Type) -> io::Result<Value<
         Type::Character => parse_character_value(src),
         Type::Integer => parse_integer_value(src),
         Type::Float => parse_float_value(src),
+        Type::Double => parse_double_value(src),
         Type::String => Ok(parse_string_value(src)),
         Type::Hex => Ok(parse_hex_value(src)),
         Type::Array => parse_array(src).map(Value::Array),
@@ -41,6 +42,15 @@ fn parse_float_value<'a>(src: &mut &'a [u8]) -> io::Result<Value<'a>> {
     *src = &src[i..];
 
     Ok(Value::Float(n))
+}
+
+fn parse_double_value<'a>(src: &mut &'a [u8]) -> io::Result<Value<'a>> {
+    let (n, i) = lexical_core::parse_partial(src)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    *src = &src[i..];
+
+    Ok(Value::Double(n))
 }
 
 fn parse_string<'a>(src: &mut &'a [u8]) -> &'a BStr {
@@ -82,6 +92,12 @@ mod tests {
         assert!(matches!(
             parse_value(&mut src, Type::Float)?,
             Value::Float(n) if n == 0.0
+        ));
+
+        let mut src = &b"0.1"[..];
+        assert!(matches!(
+            parse_value(&mut src, Type::Double)?,
+            Value::Double(n) if n == 0.1
         ));
 
         let mut src = &b"ndls"[..];

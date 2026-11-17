@@ -5,6 +5,8 @@ pub(super) enum Type {
     Character,
     Integer,
     Float,
+    /// HTSlib's `d`, not in the SAM specification.
+    Double,
     String,
     Hex,
     Array,
@@ -16,6 +18,7 @@ pub(super) fn parse_type(src: &mut &[u8]) -> io::Result<Type> {
             b'A' => Type::Character,
             b'i' => Type::Integer,
             b'f' => Type::Float,
+            b'd' => Type::Double,
             b'Z' => Type::String,
             b'H' => Type::Hex,
             b'B' => Type::Array,
@@ -44,6 +47,7 @@ mod tests {
         t(b"A", Type::Character)?;
         t(b"i", Type::Integer)?;
         t(b"f", Type::Float)?;
+        t(b"d", Type::Double)?;
         t(b"Z", Type::String)?;
         t(b"H", Type::Hex)?;
         t(b"B", Type::Array)?;

@@ -15,8 +15,8 @@ pub(crate) const CIGAR_SKIP: u32 = 3;
 /// An alignment record as htslib holds it while piling up: its encoded BAM bytes, whose
 /// qualities, sequence, mapping quality, and tags may be changed, and its decoded fixed fields.
 ///
-/// A record whose CIGAR is a `kSmN` placeholder takes its CIGAR from the `CG` tag, as htslib
-/// reads it.
+/// A record whose CIGAR is a `kSmN` placeholder takes its CIGAR from the `CG` tag (`B:I`, or
+/// `B:i`, which htslib also accepts), as htslib reads it.
 #[derive(Clone, Debug)]
 pub struct Read {
     pub(crate) raw: Vec<u8>,
@@ -81,7 +81,7 @@ impl Read {
             && cigar[1] & 0xf == CIGAR_SKIP
             && let Some(range) = find_field(&raw, qual_start + l_seq, *b"CG")?
             && raw[range.start + 2] == b'B'
-            && raw[range.start + 3] == b'I'
+            && matches!(raw[range.start + 3], b'I' | b'i')
         {
             cigar = decode_ops(&raw[range.start + 8..range.end]);
             cigar_in_tag = true;
@@ -403,6 +403,8 @@ fn find_field(raw: &[u8], start: usize, tag: [u8; 2]) -> io::Result<Option<Range
             b'A' | b'c' | b'C' => 1,
             b's' | b'S' => 2,
             b'i' | b'I' | b'f' => 4,
+            // htslib's non-standard double.
+            b'd' => 8,
             b'Z' | b'H' => rest.iter().position(|&b| b == 0).ok_or_else(truncated)? + 1,
             b'B' => {
                 let &[subtype, n0, n1, n2, n3, ..] = rest else {
@@ -586,6 +588,45 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// [`record`] with the `kSmN` placeholder CIGAR 4S10N and the auxiliary data `aux`.
+    fn placeholder_record(aux: &[u8]) -> Vec<u8> {
+        let mut raw = record();
+        raw[12..14].copy_from_slice(&2u16.to_le_bytes()); // n_cigar_op
+        raw.splice(
+            35..39,
+            [(4u32 << 4) | 4, (10u32 << 4) | 3]
+                .map(u32::to_le_bytes)
+                .concat(),
+        );
+        raw.extend_from_slice(aux);
+        raw
+    }
+
+    /// A `CG` field of subtype `subtype` holding 2M2I.
+    fn cg_field(subtype: u8) -> Vec<u8> {
+        let mut field = vec![b'C', b'G', b'B', subtype];
+        field.extend(2u32.to_le_bytes());
+        field.extend((2u32 << 4).to_le_bytes()); // 2M
+        field.extend(((2u32 << 4) | 1).to_le_bytes()); // 2I
+        field
+    }
+
+    #[test]
+    fn test_new_with_a_double_field() -> io::Result<()> {
+        let mut aux = b"XDd".to_vec();
+        aux.extend(1.5f64.to_le_bytes());
+        aux.extend(cg_field(b'I'));
+        aux.extend(b"HPC\x01");
+
+        let read = Read::new(placeholder_record(&aux))?;
+        assert!(read.cigar_in_tag);
+        assert_eq!(read.cigar(), [2 << 4, (2 << 4) | 1]);
+        assert_eq!(read.tag(*b"XD"), Some((b'd', &1.5f64.to_le_bytes()[..])));
+        assert_eq!(read.integer_tag(*b"HP"), Some(1));
+
+        Ok(())
+    }
+
     #[test]
     fn test_cigar_and_sequence_lengths_must_agree() -> io::Result<()> {
         // A CIGAR of 4M for 3 bases, which HTSlib refuses to read.
@@ -604,5 +645,35 @@ pub(crate) mod tests {
         Read::new(raw)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn test_new_with_a_signed_long_cigar() -> io::Result<()> {
+        // HTSlib moves a `CG:B:i` CIGAR as it does a `CG:B:I` one.
+        let read = Read::new(placeholder_record(&cg_field(b'i')))?;
+        assert!(read.cigar_in_tag);
+        assert_eq!(read.cigar(), [2 << 4, (2 << 4) | 1]);
+
+        // Other subtypes cannot hold a CIGAR; the placeholder stays.
+        let read = Read::new(placeholder_record(&cg_field(b'f')))?;
+        assert!(!read.cigar_in_tag);
+        assert_eq!(read.cigar(), [(4 << 4) | 4, (10 << 4) | 3]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_with_an_invalid_array_subtype() {
+        for subtype in [b'd', b'A', b'Z', b'H', b'B', 0] {
+            let mut aux = vec![b'X', b'B', b'B', subtype];
+            aux.extend(1u32.to_le_bytes());
+            aux.extend([0; 8]);
+            aux.extend(cg_field(b'I'));
+
+            assert!(matches!(
+                Read::new(placeholder_record(&aux)),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData
+            ));
+        }
     }
 }

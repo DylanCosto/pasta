@@ -145,32 +145,33 @@ impl<'a> TryFrom<Data<'a>> for sam::alignment::record_buf::Data {
     }
 }
 
+/// The operations of the first `CG` field, if it is an array of 32-bit integers (`B:I`, or
+/// `B:i`, which HTSlib also accepts) that can hold a CIGAR.
 pub(crate) fn get_raw_cigar<'a>(src: &mut &'a [u8]) -> io::Result<Option<&'a [u8]>> {
-    use crate::sam::alignment::record::data::field::Type;
+    use crate::sam::alignment::record::data::field::{Type, value::array::Subtype};
 
     use self::field::{
         decode_tag, decode_type, decode_value,
         value::array::{decode_raw_array, decode_subtype},
     };
 
-    fn get_array_field<'a>(src: &mut &'a [u8]) -> io::Result<Option<(Tag, &'a [u8])>> {
+    while !src.is_empty() {
         let tag = decode_tag(src)?;
         let ty = decode_type(src)?;
 
-        if ty == Type::Array {
-            let subtype = decode_subtype(src)?;
-            let buf = decode_raw_array(src, subtype)?;
-            Ok(Some((tag, buf)))
-        } else {
+        if tag != Tag::CIGAR {
             decode_value(src, ty)?;
-            Ok(None)
+            continue;
         }
-    }
 
-    while !src.is_empty() {
-        if let Some((Tag::CIGAR, buf)) = get_array_field(src)? {
-            return Ok(Some(buf));
+        if ty != Type::Array {
+            return Ok(None);
         }
+
+        let subtype = decode_subtype(src)?;
+        let buf = decode_raw_array(src, subtype)?;
+
+        return Ok(matches!(subtype, Subtype::UInt32 | Subtype::Int32).then_some(buf));
     }
 
     Ok(None)
@@ -216,5 +217,38 @@ mod tests {
         assert!(matches!(actual_value, Value::UInt8(1)));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_get_after_a_double_field() -> io::Result<()> {
+        // HTSlib's non-standard `d` (double) type, which samtools writes.
+        let mut src = b"XDd".to_vec();
+        src.extend(1.5f64.to_le_bytes());
+        src.extend(b"HPC\x01");
+        let data = Data::new(&src);
+
+        assert!(matches!(
+            data.get(b"HP").transpose()?,
+            Some(Value::UInt8(1))
+        ));
+        assert_eq!(data.iter().count(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_with_an_invalid_array_subtype() {
+        for &subtype in b"dAZHB" {
+            let mut src = vec![b'X', b'B', b'B', subtype];
+            src.extend(1u32.to_le_bytes());
+            src.extend([0; 8]);
+            src.extend(b"HPC\x01");
+            let data = Data::new(&src);
+
+            assert!(matches!(
+                data.get(b"HP"),
+                Some(Err(e)) if e.kind() == io::ErrorKind::InvalidData
+            ));
+        }
     }
 }

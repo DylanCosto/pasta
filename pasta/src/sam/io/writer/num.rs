@@ -77,6 +77,16 @@ where
     writer.write_all(&buf[..len])
 }
 
+/// Writes a double as HTSlib does (`%g`), in the same format as [`write_f32`].
+pub fn write_f64<W>(writer: &mut W, n: f64) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut buf = [0; 32];
+    let len = format_g(&mut buf, n);
+    writer.write_all(&buf[..len])
+}
+
 /// Formats `n` as `printf("%g")` does into `buf` and returns the length written.
 fn format_g(buf: &mut [u8; 32], n: f64) -> usize {
     use std::io::Write as _;
@@ -192,6 +202,33 @@ mod tests {
         t(&mut buf, f32::NEG_INFINITY, b"-inf")?;
         t(&mut buf, f32::MAX, b"3.40282e+38")?;
         t(&mut buf, f32::MIN_POSITIVE, b"1.17549e-38")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_f64() -> io::Result<()> {
+        fn t(buf: &mut Vec<u8>, n: f64, expected: &[u8]) -> io::Result<()> {
+            buf.clear();
+            write_f64(buf, n)?;
+            assert_eq!(buf, expected);
+            Ok(())
+        }
+
+        let mut buf = Vec::new();
+
+        // As `printf("%g")` prints them.
+        t(&mut buf, 1.5, b"1.5")?;
+        t(&mut buf, -0.0, b"-0")?;
+        t(&mut buf, 0.1, b"0.1")?;
+        t(&mut buf, 1.234_567_890_1, b"1.23457")?;
+        t(&mut buf, 999_999.5, b"1e+06")?;
+        t(&mut buf, 1e-300, b"1e-300")?;
+        t(&mut buf, f64::MAX, b"1.79769e+308")?;
+        t(&mut buf, -f64::MIN_POSITIVE, b"-2.22507e-308")?;
+        t(&mut buf, 5e-324, b"4.94066e-324")?;
+        t(&mut buf, f64::NAN, b"nan")?;
+        t(&mut buf, f64::NEG_INFINITY, b"-inf")?;
 
         Ok(())
     }

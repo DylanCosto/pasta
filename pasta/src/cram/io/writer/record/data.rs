@@ -59,6 +59,10 @@ impl Data {
 
     /// Adds a tag.
     pub(crate) fn push(&mut self, tag: Tag, value: &ValueBuf) -> io::Result<()> {
+        if let ValueBuf::Double(_) = value {
+            return Err(double_unsupported());
+        }
+
         self.0.extend(tag.as_ref());
         self.0.push(ty::encode(value.ty()));
         write_value(&mut self.0, &value.into())
@@ -145,6 +149,7 @@ fn split_field<'a>(src: &mut &'a [u8]) -> io::Result<Field<'a>> {
         b'i' => Type::Int32,
         b'I' => Type::UInt32,
         b'f' => Type::Float,
+        b'd' => return Err(double_unsupported()),
         b'Z' => Type::String,
         b'H' => Type::Hex,
         b'B' => Type::Array,
@@ -155,6 +160,7 @@ fn split_field<'a>(src: &mut &'a [u8]) -> io::Result<Field<'a>> {
         Type::Character | Type::Int8 | Type::UInt8 => 1,
         Type::Int16 | Type::UInt16 => 2,
         Type::Int32 | Type::UInt32 | Type::Float => 4,
+        Type::Double => 8,
         Type::String | Type::Hex => memchr::memchr(0, rest).ok_or_else(eof)? + 1,
         Type::Array => {
             let (&[subtype], tail) = rest.split_first_chunk::<1>().ok_or_else(eof)?;
@@ -188,6 +194,14 @@ fn split_field<'a>(src: &mut &'a [u8]) -> io::Result<Field<'a>> {
     *src = tail;
 
     Ok(Field { tag, ty, value })
+}
+
+/// CRAM has no `d` (double) type: HTSlib refuses to write one too.
+fn double_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "CRAM cannot store a tag of type 'd' (double)",
+    )
 }
 
 #[cfg(test)]
@@ -235,6 +249,14 @@ mod tests {
             assert!(Data::from_bam(bad, |_| true).is_err(), "{bad:?}");
         }
 
+        // CRAM has no double type.
+        let mut src = b"XDd".to_vec();
+        src.extend(1.5f64.to_le_bytes());
+        assert!(matches!(
+            Data::from_bam(&src, |_| true),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput
+        ));
+
         Ok(())
     }
 
@@ -258,6 +280,12 @@ mod tests {
         assert_eq!(data.0, b"COZnote\0ASC\x03");
 
         data.retain(|_| false);
+        assert!(data.0.is_empty());
+
+        assert!(matches!(
+            data.push(Tag::new(b'X', b'D'), &ValueBuf::Double(1.5)),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput
+        ));
         assert!(data.0.is_empty());
 
         Ok(())
