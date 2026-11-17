@@ -7,6 +7,9 @@ use crate::sam::header::ReferenceSequences;
 use self::reference_sequence::read_reference_sequence;
 use crate::bam::io::reader::num::read_u32_le;
 
+/// The most reference sequences reserved before they have been read.
+const MAX_RESERVED_COUNT: usize = 1 << 12;
+
 pub(super) fn read_reference_sequences<R>(reader: &mut R) -> io::Result<ReferenceSequences>
 where
     R: Read,
@@ -15,7 +18,10 @@ where
         usize::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     })?;
 
-    let mut reference_sequences = ReferenceSequences::with_capacity(reference_sequence_count);
+    // `n_ref` is untrusted: reserve no more than a typical dictionary needs, and grow with the
+    // entries read.
+    let mut reference_sequences =
+        ReferenceSequences::with_capacity(reference_sequence_count.min(MAX_RESERVED_COUNT));
 
     for _ in 0..reference_sequence_count {
         let (name, reference_sequence) = read_reference_sequence(reader)?;

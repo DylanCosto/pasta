@@ -32,6 +32,23 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   others) fails with "invalid bin ID" instead of panicking, where samtools returns records; and
   `idxstats` warns that it cannot load the index and counts the records by reading the whole
   file, where samtools prints the counts in the index's metadata.
+- pasta: a BAM record `block_size` below 32, the length of a record's fixed fields, is an error
+  (`InvalidData`), as in HTSlib; a `block_size` of 0 ended the records as if at EOF.
+- pasta: a corrupt BAM record `block_size` no longer allocates and zero-fills up to 4 GiB before
+  the record is read; the record buffer grows with the bytes read, so a truncated record is an
+  `UnexpectedEof` error at the cost of the bytes present. `ntools merge` reads its BAM inputs
+  the same way.
+- pasta: a corrupt BAM header `n_ref` or reference sequence `l_name` no longer reserves memory
+  for the count it states (up to tens of GB, which aborted the process); a header that ends
+  early is an `UnexpectedEof` error.
+- pasta: a BAM record `block_size` above `i32::MAX` is an error (`InvalidData`), as in HTSlib; a
+  few megabytes of BGZF could decompress to the 4 GiB it states and the reader read it all before
+  failing. `ntools merge` rejects it the same way.
+- pasta: a BAM record whose fixed fields give an `l_read_name` of 0, or lengths of name, CIGAR,
+  sequence and qualities that do not fit in its `block_size`, is an `InvalidData` error found
+  before the rest of the record is read, as in HTSlib; it was read in full (up to 2 GiB) first,
+  then the overrun was an `UnexpectedEof` error and an `l_read_name` of 0 was accepted.
+  `ntools merge` checks its BAM inputs the same way.
 
 ## [0.9.0] - 2026-11-08
 

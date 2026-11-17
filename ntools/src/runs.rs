@@ -22,6 +22,12 @@ use crate::{
 /// The fixed-size prefix of every encoded BAM record, up to the read name.
 const MIN_RECORD_LEN: usize = 32;
 
+/// The largest valid `block_size`. HTSlib reads it as an `int32_t`.
+const MAX_RECORD_LEN: usize = i32::MAX as usize;
+
+/// The most a record buffer grows before the bytes to fill it have been read.
+const MAX_RECORD_STEP: usize = 1 << 20;
+
 /// Reads one `block_size`-prefixed raw record into `buf`. Returns `false` at end of stream.
 pub fn read_raw_record<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result<bool> {
     let mut len = [0; 4];
@@ -34,18 +40,73 @@ pub fn read_raw_record<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> io::Result
     let len = usize::try_from(u32::from_le_bytes(len))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    buf.resize(len, 0);
-    reader.read_exact(buf)?;
-
-    // Keys are read from fixed offsets and the name, so those must be in bounds.
-    if len < MIN_RECORD_LEN || MIN_RECORD_LEN + usize::from(buf[8]) > len {
+    // A BGZF stream of a few megabytes can decompress to gigabytes of zeros, so the bytes present
+    // do not bound a corrupt `block_size`.
+    if !(MIN_RECORD_LEN..=MAX_RECORD_LEN).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "truncated BAM record",
+            format!(
+                "invalid BAM record block size: {len} (expected {MIN_RECORD_LEN} to \
+                 {MAX_RECORD_LEN})"
+            ),
         ));
     }
 
+    // The buffer grows with the bytes read, and the fixed fields of a record larger than one step
+    // are checked before the rest is read.
+    if len <= MAX_RECORD_STEP {
+        buf.resize(len, 0);
+        reader.read_exact(buf)?;
+        check_fixed_fields(buf, len)?;
+    } else {
+        buf.clear();
+        buf.resize(MIN_RECORD_LEN, 0);
+        reader.read_exact(buf)?;
+        check_fixed_fields(buf, len)?;
+
+        while buf.len() < len {
+            // Up to the next multiple of `MAX_RECORD_STEP`.
+            let start = buf.len();
+            let end = len.min((start / MAX_RECORD_STEP + 1) * MAX_RECORD_STEP);
+            buf.resize(end, 0);
+            reader.read_exact(&mut buf[start..])?;
+        }
+    }
+
     Ok(true)
+}
+
+/// Checks that a record's fixed fields, at the start of `record`, describe a read name with its
+/// NUL and variable-length fields that fit in `len` bytes, as HTSlib does. Keys are read from
+/// fixed offsets and the name, so those must be in bounds.
+fn check_fixed_fields(record: &[u8], len: usize) -> io::Result<()> {
+    let l_read_name = record[8];
+    let n_cigar_op = u16::from_le_bytes([record[12], record[13]]);
+    let l_seq = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+
+    // At most 32 + 255 + 4 * (2^16 - 1) + 3 * 2^31, which does not overflow.
+    let need = MIN_RECORD_LEN as u64
+        + u64::from(l_read_name)
+        + 4 * u64::from(n_cigar_op)
+        + u64::from(l_seq).div_ceil(2)
+        + u64::from(l_seq);
+
+    if l_read_name == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid BAM record: l_read_name is 0 (expected at least 1)",
+        ))
+    } else if need > len as u64 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid BAM record: l_read_name = {l_read_name}, n_cigar_op = {n_cigar_op} and \
+                 l_seq = {l_seq} need {need} bytes, more than the block size ({len})"
+            ),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn write_raw_record<W: Write>(writer: &mut W, record: &[u8]) -> io::Result<()> {
@@ -454,5 +515,111 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_read_raw_record() -> io::Result<()> {
+        let mut record = vec![0; MIN_RECORD_LEN];
+        record[8] = 2; // l_read_name
+        record.extend(b"*\x00");
+
+        let mut src = Vec::new();
+        write_raw_record(&mut src, &record)?;
+        write_raw_record(&mut src, &record)?;
+
+        // A record larger than one read step.
+        let mut large = record.clone();
+        large.resize(3 * MAX_RECORD_STEP + 5, 0x01);
+        write_raw_record(&mut src, &large)?;
+
+        let mut reader = &src[..];
+        let mut buf = Vec::new();
+        assert!(read_raw_record(&mut reader, &mut buf)?);
+        assert_eq!(buf, record);
+        assert!(read_raw_record(&mut reader, &mut buf)?);
+        assert_eq!(buf, record);
+        assert!(read_raw_record(&mut reader, &mut buf)?);
+        assert_eq!(buf, large);
+        assert!(!read_raw_record(&mut reader, &mut buf)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_read_raw_record_with_invalid_block_size() {
+        let mut record = vec![0; MIN_RECORD_LEN];
+        record[8] = 2; // l_read_name
+        record.extend(b"*\x00");
+
+        // Below the fixed-length fields, 0 included.
+        for block_size in [0u32, 31] {
+            let mut src = block_size.to_le_bytes().to_vec();
+            src.extend(&record);
+            let mut buf = Vec::new();
+
+            assert!(matches!(
+                read_raw_record(&mut &src[..], &mut buf),
+                Err(e) if e.kind() == io::ErrorKind::InvalidData
+            ));
+        }
+
+        // Larger than the rest of the stream: memory grows with the bytes read, not with
+        // `block_size`.
+        for block_size in [35, 1 << 24, i32::MAX.unsigned_abs()] {
+            let mut src = block_size.to_le_bytes().to_vec();
+            src.extend(&record);
+            let mut buf = Vec::new();
+
+            assert!(matches!(
+                read_raw_record(&mut &src[..], &mut buf),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+            ));
+            assert!(buf.capacity() <= MAX_RECORD_STEP, "{}", buf.capacity());
+        }
+    }
+
+    #[test]
+    fn test_read_raw_record_with_invalid_fixed_fields() {
+        fn fixed_fields(l_read_name: u8, n_cigar_op: u16, l_seq: u32) -> Vec<u8> {
+            let mut src = vec![0; MIN_RECORD_LEN];
+            src[8] = l_read_name;
+            src[12..14].copy_from_slice(&n_cigar_op.to_le_bytes());
+            src[16..20].copy_from_slice(&l_seq.to_le_bytes());
+            src
+        }
+
+        // As in htslib: a `block_size` above `i32::MAX`, a read name without its NUL, or lengths
+        // that need more than `block_size` are errors, found from the block size and the fixed
+        // fields alone, before the rest of the record is read.
+        let cases = [
+            (0x8000_0000, fixed_fields(2, 0, 0)),
+            (u32::MAX, fixed_fields(2, 0, 0)),
+            (34, fixed_fields(0, 0, 0)),
+            (i32::MAX.unsigned_abs(), fixed_fields(0, 0, 0)),
+            (34, fixed_fields(3, 0, 0)),
+            (100, fixed_fields(2, u16::MAX, 0)),
+            (i32::MAX.unsigned_abs(), fixed_fields(2, 0, u32::MAX)),
+            (i32::MAX.unsigned_abs(), fixed_fields(2, 0, 1 << 31)),
+        ];
+
+        for (block_size, fields) in cases {
+            let mut src = block_size.to_le_bytes().to_vec();
+            src.extend(&fields);
+            // Zeros after the fixed fields, which a reader that reads the whole block before it
+            // checks them would read.
+            let mut reader = (&src[..]).chain(io::repeat(0).take(64 << 20));
+            let mut buf = Vec::new();
+
+            let result = read_raw_record(&mut reader, &mut buf);
+            assert!(
+                matches!(&result, Err(e) if e.kind() == io::ErrorKind::InvalidData),
+                "{block_size}: {result:?}"
+            );
+
+            if usize::try_from(block_size).unwrap() > MAX_RECORD_STEP {
+                assert!(buf.capacity() <= MAX_RECORD_STEP, "{}", buf.capacity());
+                assert_eq!(reader.into_inner().1.limit(), 64 << 20, "{block_size}");
+            }
+        }
     }
 }
