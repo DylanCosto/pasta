@@ -13,6 +13,12 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   `Value::Double` in `sam::alignment::record_buf::data::field`) for HTSlib's non-standard `d`
   tag type, and `sam::io::writer::write_f64`. Code that matches these enums exhaustively needs
   an arm for the new variant.
+- pasta: `cram::io::Reader::multithreaded_records`, which gives the records `records` gives, in
+  the same order, decoding slices on a pool of worker threads while containers are read on the
+  calling thread. A few slices per worker are in flight at a time; a worker's panic is raised
+  again on the calling thread when it reaches that slice, and an error ends the records. On a
+  whole GIAB HG003 ONT genome (22.8 GB CRAM), decoding every record takes 86 s with 16 workers
+  and 208 s with 4, against 1,070 s with `records` on a machine busy with other work.
 
 ### Changed
 
@@ -90,9 +96,6 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   well as by `CG:B:I`, in `pileup::Read` (which piled up the placeholder) and in `bam::Record`
   alike. In `bam::Record`, a `CG` array of another subtype no longer replaces it, and only the
   first `CG` field counts.
-- pasta: the CRAM writer no longer also stores, as a tag, the `CG` field that holds a BAM
-  record's CIGAR in place of a `kSmN` placeholder; it stores the CIGAR alone, as HTSlib does.
-  Before, HTSlib read such a CRAM record back with a leftover `CG` tag.
 - ntools: `mpileup --output-extra` prints a `d` tag's value as samtools does, instead of `*`;
   `fastq -d TAG:VALUE` matches one as it matches an `f` tag; `view` and `fastq -T` print a
   `d` of -0 as `-0`, as samtools does.
@@ -102,6 +105,17 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   `samtools view -C` does.
 - ntools: `checksum` rejects a `B` array of subtype `d` or `A` as invalid auxiliary data,
   instead of skipping 8 or 1 bytes per element.
+- pasta: `cram::io::reader::Container::slices` and `compression_header` panicked on a container
+  whose landmarks point past its end; they now return an error.
+
+## [0.9.1] - 2026-11-10
+
+### Fixed
+
+- pasta: a BAM record with more than 65,535 CIGAR operations, which BAM keeps in a `CG` field, was
+  written to CRAM with its CIGAR and also that `CG` field, which HTSlib then read back as an extra
+  tag. The CRAM writer now leaves `CG` out when it holds the CIGAR, as HTSlib does; 0.9.0
+  introduced the extra field with its new tag encoding.
 
 ## [0.9.0] - 2026-11-08
 
