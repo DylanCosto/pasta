@@ -785,7 +785,6 @@ fn extended_baq(cigar: &[u32], pos: i64, xb: i64, state: &[i32], q: &[u8], bq: &
 pub fn cap_mapq(read: &Read, reference: &[u8], thres: i32) -> Option<i32> {
     let thres = if thres < 0 { 40 } else { thres };
     let ref_len = reference.len() as i64;
-    let qual = read.quality_scores();
 
     let (mut mm, mut q, mut len, mut clip_q) = (0i32, 0i32, 0i32, 0i32);
     let (mut x, mut y) = (read.position(), 0usize);
@@ -802,16 +801,19 @@ pub fn cap_mapq(read: &Read, reference: &[u8], thres: i32) -> Option<i32> {
                         break 'cigar;
                     }
 
+                    // Past the stored sequence, the base is unknown (N) and its quality
+                    // missing.
                     let z = y + j;
                     let c1 = read.base(z);
                     let c2 = SEQ_NT16_TABLE[usize::from(reference[pos as usize])];
+                    let qual = read.quality_score(z);
 
-                    if c2 != 15 && c1 != 15 && qual[z] >= 13 {
+                    if c2 != 15 && c1 != 15 && qual >= 13 {
                         len += 1;
 
-                        if c1 != 0 && c1 != c2 && qual[z] >= 13 {
+                        if c1 != 0 && c1 != c2 && qual >= 13 {
                             mm += 1;
-                            q += i32::from(qual[z].min(33));
+                            q += i32::from(qual.min(33));
                         }
                     }
                 }
@@ -832,7 +834,9 @@ pub fn cap_mapq(read: &Read, reference: &[u8], thres: i32) -> Option<i32> {
                 x += l as i64;
             }
             4 => {
-                clip_q += qual[y..y + l].iter().map(|&q| i32::from(q)).sum::<i32>();
+                clip_q += (y..y + l)
+                    .map(|z| i32::from(read.quality_score(z)))
+                    .sum::<i32>();
                 y += l;
             }
             5 => clip_q += 13 * l as i32,
@@ -960,5 +964,23 @@ mod tests {
     fn test_zeroed() {
         assert_eq!(zeroed(3), Some(vec![0.0; 3]));
         assert_eq!(zeroed(usize::MAX / 4), None);
+    }
+
+    #[test]
+    fn test_cap_mapq_of_a_read_without_its_sequence() {
+        use crate::pileup::read::tests::record;
+
+        let reference = b"ACGTACGTACGTACGT";
+
+        // No base can mismatch, so the mapping quality is capped at the threshold, as for a
+        // read that matches; a soft clip of unknown bases weighs as clipped bases with missing
+        // qualities (0xff) do.
+        let read = record(b"r", 0, 2, "4M", b"", -1, 0);
+        assert_eq!(cap_mapq(&read, reference, 50), Some(50));
+        let read = record(b"r", 0, 2, "4M", b"GTAC", -1, 0);
+        assert_eq!(cap_mapq(&read, reference, 50), Some(50));
+
+        let read = record(b"r", 0, 2, "1S4M", b"", -1, 0);
+        assert_eq!(cap_mapq(&read, reference, 50), None);
     }
 }

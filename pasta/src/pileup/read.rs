@@ -7,6 +7,8 @@ use crate::bam;
 const NAME_LENGTH: usize = 8;
 const NAME: usize = 32;
 
+const FLAG_UNMAPPED: u16 = 0x4;
+
 pub(crate) const CIGAR_SOFT_CLIP: u32 = 4;
 pub(crate) const CIGAR_SKIP: u32 = 3;
 
@@ -39,7 +41,8 @@ impl Read {
     ///
     /// # Errors
     ///
-    /// Returns an error if the record is truncated.
+    /// Returns an error if the record is truncated, or if a mapped read's CIGAR and sequence
+    /// differ in length.
     pub fn new(raw: Vec<u8>) -> io::Result<Self> {
         if raw.len() < NAME {
             return Err(truncated());
@@ -82,6 +85,25 @@ impl Read {
         {
             cigar = decode_ops(&raw[range.start + 8..range.end]);
             cigar_in_tag = true;
+        }
+
+        // As HTSlib's `bam_read1`; a read without its sequence (SEQ `*`) has none to check.
+        if l_seq > 0 && flag & FLAG_UNMAPPED == 0 && !cigar.is_empty() {
+            let query_len: u64 = cigar
+                .iter()
+                .filter(|&&op| matches!(op & 0xf, 0 | 1 | 4 | 7 | 8))
+                .map(|&op| u64::from(op >> 4))
+                .sum();
+
+            if query_len != l_seq as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CIGAR and query sequence lengths differ for {}",
+                        String::from_utf8_lossy(&raw[NAME..cigar_start - 1])
+                    ),
+                ));
+            }
         }
 
         Ok(Self {
@@ -198,15 +220,15 @@ impl Read {
         self.flag & 0x10 != 0
     }
 
-    /// The 4-bit code (`=ACMGRSVTWYHKDBN`) of base `i`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `i` is out of bounds.
+    /// The 4-bit code (`=ACMGRSVTWYHKDBN`) of base `i`: 15 (`N`), unknown, past the stored
+    /// sequence, as for every base of a read whose `SEQ` is `*`.
     #[inline]
     pub fn base(&self, i: usize) -> u8 {
-        assert!(i < self.l_seq, "base {i} of {}", self.l_seq);
-        (self.raw[self.seq_start + i / 2] >> ((!i & 1) << 2)) & 0xf
+        if i < self.l_seq {
+            (self.raw[self.seq_start + i / 2] >> ((!i & 1) << 2)) & 0xf
+        } else {
+            15
+        }
     }
 
     /// Sets the 4-bit code of base `i`.
@@ -224,6 +246,13 @@ impl Read {
         } else {
             *byte = (*byte & 0xf0) | (code & 0x0f);
         }
+    }
+
+    /// The quality of base `i`: 0xff, missing (as BAM stores a `QUAL` of `*`), past the stored
+    /// qualities.
+    #[inline]
+    pub fn quality_score(&self, i: usize) -> u8 {
+        self.quality_scores().get(i).copied().unwrap_or(0xff)
     }
 
     /// The base qualities.
@@ -423,11 +452,67 @@ fn invalid(msg: &str) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
+    /// An encoded record on reference 0 at 0-based `pos`, with `cigar` (as in SAM, `""` for
+    /// none), `seq` (`b""` for `*`) and qualities 30.
+    pub(crate) fn record(
+        name: &[u8],
+        flag: u16,
+        pos: i32,
+        cigar: &str,
+        seq: &[u8],
+        mpos: i32,
+        tlen: i32,
+    ) -> Read {
+        let mut ops = Vec::new();
+        let mut len = 0u32;
+
+        for c in cigar.bytes() {
+            if c.is_ascii_digit() {
+                len = len * 10 + u32::from(c - b'0');
+            } else {
+                let op = b"MIDNSHP=X".iter().position(|&o| o == c).expect("CIGAR op");
+                ops.push((len << 4) | op as u32);
+                len = 0;
+            }
+        }
+
+        let mut raw = Vec::new();
+        raw.extend(0i32.to_le_bytes()); // ref_id
+        raw.extend(pos.to_le_bytes());
+        raw.push(u8::try_from(name.len() + 1).expect("short name"));
+        raw.push(60); // mapq
+        raw.extend(0u16.to_le_bytes()); // bin
+        raw.extend(u16::try_from(ops.len()).expect("short CIGAR").to_le_bytes());
+        raw.extend(flag.to_le_bytes());
+        raw.extend(u32::try_from(seq.len()).expect("short read").to_le_bytes());
+        raw.extend((if mpos < 0 { -1i32 } else { 0 }).to_le_bytes());
+        raw.extend(mpos.to_le_bytes());
+        raw.extend(tlen.to_le_bytes());
+        raw.extend(name);
+        raw.push(0);
+
+        for op in ops {
+            raw.extend(op.to_le_bytes());
+        }
+
+        let codes: Vec<u8> = seq
+            .iter()
+            .map(|&b| crate::pileup::baq::SEQ_NT16_TABLE[usize::from(b)])
+            .collect();
+
+        for pair in codes.chunks(2) {
+            raw.push((pair[0] << 4) | pair.get(1).copied().unwrap_or(0));
+        }
+
+        raw.extend(std::iter::repeat_n(30, seq.len()));
+        Read::new(raw).expect("valid record")
+    }
+
     /// A record named `r1` at 100 with CIGAR 4M, sequence ACGT, and qualities 30.
-    pub(crate) fn record() -> Vec<u8> {
+    fn r1() -> Vec<u8> {
         let mut raw = Vec::new();
         raw.extend(0i32.to_le_bytes()); // ref_id
         raw.extend(99i32.to_le_bytes()); // pos
@@ -449,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_tags() -> io::Result<()> {
-        let mut read = Read::new(record())?;
+        let mut read = Read::new(r1())?;
         assert_eq!(read.name(), b"r1");
         assert_eq!(read.cigar(), [4 << 4]);
         assert_eq!(
@@ -473,6 +558,50 @@ mod tests {
         read.set_base(1, 0);
         assert_eq!(read.base(1), 0);
         assert_eq!(read.base(0), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bases_past_the_sequence() -> io::Result<()> {
+        // SEQ `*` with a CIGAR of 4M: the bases are unknown and their qualities missing.
+        let mut raw = r1();
+        raw[16..20].copy_from_slice(&0u32.to_le_bytes());
+        raw.truncate(raw.len() - 6);
+        let read = Read::new(raw)?;
+
+        assert_eq!(read.sequence_len(), 0);
+        assert_eq!((0..4).map(|i| read.base(i)).collect::<Vec<_>>(), [15; 4]);
+        assert_eq!(
+            (0..4).map(|i| read.quality_score(i)).collect::<Vec<_>>(),
+            [0xff; 4]
+        );
+
+        let read = Read::new(r1())?;
+        assert_eq!(read.base(3), 8);
+        assert_eq!(read.quality_score(3), 30);
+        assert_eq!(read.base(4), 15);
+        assert_eq!(read.quality_score(4), 0xff);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_cigar_and_sequence_lengths_must_agree() -> io::Result<()> {
+        // A CIGAR of 4M for 3 bases, which HTSlib refuses to read.
+        let mut raw = r1();
+        raw[16..20].copy_from_slice(&3u32.to_le_bytes());
+        raw.truncate(raw.len() - 1);
+        let e = Read::new(raw.clone()).expect_err("lengths differ");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            e.to_string(),
+            "CIGAR and query sequence lengths differ for r1"
+        );
+
+        // Unless the read is unmapped (or has no sequence: SEQ `*`).
+        raw[14] = 0x4;
+        Read::new(raw)?;
 
         Ok(())
     }

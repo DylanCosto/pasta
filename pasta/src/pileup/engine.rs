@@ -585,33 +585,27 @@ fn resolve_cigar(b: &Read, pos: i64, s: &mut CigarState, node: usize) -> Entry {
     };
 
     if s.k == -1 {
+        // Move to the first operation that consumes the reference, which a read with a
+        // reference length has. htslib only does this for a CIGAR of more than one operation,
+        // and reads `cigar[-1]` for a single deletion or skip.
         entry.qpos = 0;
+        s.x = b.pos;
+        s.y = 0;
+        let mut k = 0;
 
-        if n_cigar == 1 {
-            if is_match(op_at(0)) {
-                s.k = 0;
-                s.x = b.pos;
-                s.y = 0;
-            }
-        } else {
-            s.x = b.pos;
-            s.y = 0;
-            let mut k = 0;
+        while k < n_cigar {
+            let (op, l) = (op_at(k), len_at(k));
 
-            while k < n_cigar {
-                let (op, l) = (op_at(k), len_at(k));
-
-                if is_match(op) || op == CIGAR_DELETION || op == CIGAR_SKIP {
-                    break;
-                } else if op == CIGAR_INSERTION || op == CIGAR_SOFT_CLIP {
-                    s.y += l;
-                }
-
-                k += 1;
+            if is_match(op) || op == CIGAR_DELETION || op == CIGAR_SKIP {
+                break;
+            } else if op == CIGAR_INSERTION || op == CIGAR_SOFT_CLIP {
+                s.y += l;
             }
 
-            s.k = k;
+            k += 1;
         }
+
+        s.k = k;
     } else {
         let l = len_at(s.k);
 
@@ -941,6 +935,12 @@ impl<'a> Mate<'a> {
 /// `tweak_overlap_quality`: for overlapping mates `a` (left) and `b`, zeroes or combines the
 /// qualities of one of each pair of overlapping bases. Returns `false` on a malformed CIGAR.
 fn tweak_overlap_quality(a: &mut Read, b: &mut Read) -> bool {
+    // A mate without its sequence (`SEQ` `*`) has no bases to compare and no qualities to
+    // change, and the other mate's are kept (htslib reads past the record, or fails).
+    if a.l_seq == 0 || b.l_seq == 0 {
+        return true;
+    }
+
     let (a_pos, b_pos) = (a.pos, b.pos);
 
     // Which read's qualities are kept, chosen by a hash of the name.
@@ -1021,6 +1021,10 @@ fn tweak_overlap_quality(a: &mut Read, b: &mut Read) -> bool {
                 && b_cigar[b_ci - 1] & 0xf == CIGAR_DELETION
             {
                 loop {
+                    if a_iseq >= a_l {
+                        return a_iseq == a_l;
+                    }
+
                     let q = a.qual_mut(a_iseq as usize);
                     *q = if amul == 1 { scaled(*q) } else { 0 };
 
@@ -1037,6 +1041,10 @@ fn tweak_overlap_quality(a: &mut Read, b: &mut Read) -> bool {
                 }
             } else if a_ci > 0 && a_cigar[a_ci - 1] & 0xf == CIGAR_DELETION {
                 loop {
+                    if b_iseq >= b_l {
+                        return b_iseq == b_l;
+                    }
+
                     let q = b.qual_mut(b_iseq as usize);
                     *q = if bmul == 1 { scaled(*q) } else { 0 };
 
@@ -1122,4 +1130,205 @@ fn combine_overlap(a: &mut Mate<'_>, b: &mut Mate<'_>, ai: usize, bi: usize, amu
 /// `uint8 * 0.8` truncated back to a byte.
 fn scaled(q: u8) -> u8 {
     (f64::from(q) * 0.8) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pileup::read::tests::record;
+
+    fn unpaired(pos: i32, cigar: &str, seq: &[u8]) -> Read {
+        record(b"r", 0, pos, cigar, seq, -1, 0)
+    }
+
+    /// What a pileup position shows of one read: its base and quality, and the bases inserted
+    /// after it.
+    #[derive(Debug, PartialEq)]
+    struct Column {
+        pos: i64,
+        qpos: i64,
+        is_del: bool,
+        is_refskip: bool,
+        is_head: bool,
+        is_tail: bool,
+        indel: i32,
+        base: u8,
+        qual: u8,
+        inserted: Vec<u8>,
+    }
+
+    fn pileup(reads: Vec<Read>) -> Result<Vec<Column>, Error> {
+        let mut pileup = Pileup::new(8000, Overlaps::Adjust);
+        let mut columns = Vec::new();
+        let mut inserted = Vec::new();
+
+        for read in reads.into_iter().map(Some).chain([None]) {
+            pileup.push(read)?;
+
+            while pileup.next_position()? {
+                let (_, pos) = pileup.position();
+
+                for entry in pileup.entries() {
+                    let read = pileup.read(entry);
+                    let qpos = entry.qpos as usize;
+                    insertion(read, entry, &mut inserted);
+
+                    columns.push(Column {
+                        pos,
+                        qpos: entry.qpos,
+                        is_del: entry.is_del,
+                        is_refskip: entry.is_refskip,
+                        is_head: entry.is_head,
+                        is_tail: entry.is_tail,
+                        indel: entry.indel,
+                        base: read.base(qpos),
+                        qual: read.quality_score(qpos),
+                        inserted: inserted.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(columns)
+    }
+
+    fn deletion(pos: i64, qpos: i64, is_refskip: bool, base: u8, qual: u8) -> Column {
+        Column {
+            pos,
+            qpos,
+            is_del: true,
+            is_refskip,
+            is_head: false,
+            is_tail: false,
+            indel: 0,
+            base,
+            qual,
+            inserted: Vec::new(),
+        }
+    }
+
+    fn with_ends(mut columns: Vec<Column>) -> Vec<Column> {
+        columns.first_mut().expect("columns").is_head = true;
+        columns.last_mut().expect("columns").is_tail = true;
+        columns
+    }
+
+    #[test]
+    fn test_a_read_without_its_sequence_shows_unknown_bases() -> Result<(), Error> {
+        // SEQ `*` with a CIGAR that consumes the query is valid: each base is N (15), with a
+        // missing quality (0xff).
+        let columns = pileup(vec![unpaired(4, "2M1I1M", b"")])?;
+
+        let base = |pos, qpos, indel, inserted: &[u8]| Column {
+            pos,
+            qpos,
+            is_del: false,
+            is_refskip: false,
+            is_head: false,
+            is_tail: false,
+            indel,
+            base: 15,
+            qual: 0xff,
+            inserted: inserted.to_vec(),
+        };
+
+        assert_eq!(
+            columns,
+            with_ends(vec![
+                base(4, 0, 0, b""),
+                base(5, 1, 1, b"N"),
+                base(6, 3, 0, b""),
+            ])
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_read_whose_only_operation_is_a_deletion_or_skip() -> Result<(), Error> {
+        // Such a read covers its reference positions as a deletion (or skip) before its first
+        // query position, as a deletion that starts a longer CIGAR does.
+        for (cigar, is_refskip) in [("3D", false), ("3N", true)] {
+            assert_eq!(
+                pileup(vec![unpaired(5, cigar, b"")])?,
+                with_ends(
+                    (5..8)
+                        .map(|pos| deletion(pos, 0, is_refskip, 15, 0xff))
+                        .collect()
+                ),
+                "{cigar}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_degenerate_cigars() -> Result<(), Error> {
+        // The reference positions each read covers.
+        for (cigar, seq, positions) in [
+            ("2D3M", &b"ACG"[..], 5),
+            ("3M2D", b"ACG", 5),
+            ("3M2D", b"", 5),
+            ("2H3D", b"", 3),
+            ("2S3D", b"AC", 3),
+            ("3D2S", b"AC", 3),
+            ("1I3D", b"A", 3),
+            ("3D1I", b"A", 3),
+            ("3D1P1I", b"A", 3),
+            ("2P3D", b"", 3),
+            ("2D2N", b"", 4),
+            ("1M0D0D2M", b"ACG", 3),
+            ("5I", b"ACGTA", 0),
+            ("5S", b"ACGTA", 0),
+            ("5P", b"", 0),
+            ("5H", b"", 0),
+            ("", b"", 0),
+        ] {
+            let columns = pileup(vec![unpaired(5, cigar, seq)])?;
+            assert_eq!(columns.len(), positions, "{cigar}");
+        }
+
+        // A trailing deletion is at the query position after the last base.
+        assert_eq!(
+            pileup(vec![unpaired(5, "1M2D", b"A")])?[1..],
+            [
+                deletion(6, 1, false, 15, 0xff),
+                Column {
+                    is_tail: true,
+                    ..deletion(7, 1, false, 15, 0xff)
+                }
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_overlapping_mates_without_a_sequence() -> Result<(), Error> {
+        let paired =
+            |name, flag, pos, cigar, seq, mpos| record(name, flag, pos, cigar, seq, mpos, 0);
+
+        // Either mate without a sequence: there are no qualities to adjust, and the other's
+        // are kept.
+        for (a, b) in [
+            (("10M", &b""[..]), ("10M", &b"ACGTACGTAC"[..])),
+            (("2M3D5M", b"ACGTACG"), ("10M", b"")),
+            (("10M", b""), ("2M3D5M", b"ACGTACG")),
+        ] {
+            let columns = pileup(vec![
+                paired(b"p", 0x63, 0, a.0, a.1, 2),
+                paired(b"p", 0x93, 2, b.0, b.1, 0),
+            ])?;
+
+            assert!(
+                columns
+                    .iter()
+                    .all(|c| c.qual == if c.base == 15 { 0xff } else { 30 }),
+                "{a:?} {b:?}"
+            );
+        }
+
+        Ok(())
+    }
 }

@@ -5,6 +5,19 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- pasta: `pileup::Read::quality_score`, the quality of one base: 0xff (missing) past the stored
+  qualities, as for every base of a read whose `SEQ` is `*`.
+
+### Changed
+
+- pasta: `pileup::Read::base` gives 15 (`N`) past the stored sequence instead of panicking, so
+  a read whose `SEQ` is `*` and whose CIGAR consumes query bases piles up as unknown bases.
+- ntools: `calmd` and `mpileup` now fail with "CIGAR and query sequence lengths differ" on a
+  mapped read whose CIGAR and sequence differ in length, as samtools does, where they used to
+  write output for it. `ntools view` still reads such a read.
+
 ### Fixed
 
 - pasta: a BAI, CSI, or tabix index with a bin ID past the last bin of its depth (other than the
@@ -49,6 +62,19 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   before the rest of the record is read, as in HTSlib; it was read in full (up to 2 GiB) first,
   then the overrun was an `UnexpectedEof` error and an `l_read_name` of 0 was accepted.
   `ntools merge` checks its BAM inputs the same way.
+- pasta: the pileup no longer panics on a read whose CIGAR is a single deletion or skip (`5D`,
+  `5N`), which HTSlib reads from before its CIGAR; it covers its positions as a deletion or skip
+  at query position 0, as one that starts a longer CIGAR does.
+- pasta: overlapping mates of which one has no sequence (`SEQ` `*`) are left as they are,
+  instead of failing the pileup ("invalid CIGAR in overlapping mates") or panicking.
+- pasta: `pileup::baq::cap_mapq` (`mpileup -C`) no longer panics on a read without its
+  sequence; its bases are unknown and their qualities missing.
+- pasta: `pileup::Read::new` refuses a mapped read whose CIGAR and sequence differ in length
+  ("CIGAR and query sequence lengths differ", as HTSlib refuses to read it), on which
+  `vtools mpileup` panicked; a read without its sequence is still accepted.
+- vtools: `mpileup` no longer panics on a read with a zero-length match (`2M0M2D`, `0M2D` with
+  `SEQ` `*`), which puts it in the pileup just past its last base; the base there is an `N` of
+  quality 0, as samtools shows it, so the default `-Q 1` leaves it out.
 
 ## [0.9.0] - 2026-11-08
 

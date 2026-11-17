@@ -140,9 +140,37 @@ impl Plp<'_> {
         self.b.sequence_len() as i32
     }
 
+    /// The quality of base `i`, or 0 past the stored qualities. A zero-length match op after
+    /// the last query base (`2M0M2D`, or `0M2D` with `SEQ` `*`) gives an entry there; its base
+    /// is unknown (`seqi` gives `N`), and samtools prints its quality as 0. bcftools reads past
+    /// the end of the record.
     #[inline]
     pub fn qual(&self, i: i32) -> i32 {
-        i32::from(self.b.quality_scores()[i as usize])
+        match self.b.quality_scores().get(i as usize) {
+            Some(&q) => i32::from(q),
+            None => missing_quality(),
+        }
+    }
+
+    /// The quality of the base at `qpos`, at most `delta` above the quality of either
+    /// neighbour, as `bcf_call_glfgen` takes it; 0 past the stored qualities, as `qual` gives.
+    #[inline]
+    pub fn capped_qual(&self, delta: i32) -> i32 {
+        let quals = self.b.quality_scores();
+        let i = self.qpos as usize;
+        // Past this check `i - 1` is in bounds, so the compiler drops its check; calling `qual`
+        // for each neighbour, each with its fallback, made `mpileup` measurably slower.
+        let Some(&q) = quals.get(i) else {
+            return missing_quality();
+        };
+        let mut q = i32::from(q);
+        if i > 0 {
+            q = q.min(i32::from(quals[i - 1]) + delta);
+        }
+        if let Some(&next) = quals.get(i + 1) {
+            q = q.min(i32::from(next) + delta);
+        }
+        q
     }
 
     #[inline]
@@ -154,6 +182,13 @@ impl Plp<'_> {
     pub fn mapq(&self) -> i32 {
         i32::from(self.b.mapping_quality())
     }
+}
+
+/// The quality `Plp::qual` gives past the stored qualities, out of the hot path.
+#[cold]
+#[inline(never)]
+fn missing_quality() -> i32 {
+    0
 }
 
 /// `bcf_callaux_t`
@@ -650,13 +685,7 @@ pub fn glfgen(plps: &[Plp<'_>], ref_base: Option<u8>, bca: &mut CallAux, r: &mut
                 } as usize],
             );
             b = bb;
-            q = p.qual(p.qpos);
-            if p.qpos > 0 && q > p.qual(p.qpos - 1) + bca.delta_baseq {
-                q = p.qual(p.qpos - 1) + bca.delta_baseq;
-            }
-            if p.qpos + 1 < p.l_qseq() && q > p.qual(p.qpos + 1) + bca.delta_baseq {
-                q = p.qual(p.qpos + 1) + bca.delta_baseq;
-            }
+            q = p.capped_qual(bca.delta_baseq);
             if q < bca.min_baseq {
                 continue;
             }
