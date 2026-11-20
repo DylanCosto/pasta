@@ -74,12 +74,14 @@ CRAM references come from.
 
 ## Performance
 
-The largest speedups, as wall time on a 24-vCPU Intel Xeon VM against samtools and bcftools 1.24,
-with the same threads in both tools. The ntools rows were measured with ntools 0.2.0, which
-compressed with libdeflate as samtools does, and the vtools rows with vtools 0.9.0, which
-compresses with zflate, at a lower level by default ([Compression](#compression)):
+The largest speedups, as wall time on a 24-vCPU Intel Xeon VM: ntools and vtools against samtools
+and bcftools 1.24, with the same threads in both tools, and the pasta library against
+[noodles](https://github.com/zaeleus/noodles) 0.119.0, single-threaded. The ntools rows were
+measured with ntools 0.2.0, which compressed with libdeflate as samtools does, the vtools rows
+with vtools 0.9.0, which compresses with zflate, at a lower level by default
+([Compression](#compression)), and the pasta rows with pasta 0.9.1:
 
-| Tool | Command | Input | samtools/bcftools | ntools/vtools | Speedup |
+| Tool | Command | Input | samtools/bcftools/noodles | ntools/vtools/pasta | Speedup |
 |---|---|---|---:|---:|---:|
 | ntools | `stats -@ 16` | HG002 PacBio Revio, whole genome (63 GB BAM) | 2,170 s | 294 s | 7.38x |
 | ntools | `view -c -@ 16` | HG003 35x Illumina, whole genome (14 GB CRAM 3.1) | 23.5 s | 5.1 s | 4.64x |
@@ -91,30 +93,17 @@ compresses with zflate, at a lower level by default ([Compression](#compression)
 | vtools | `concat` 4 chunks `-Ob` | 1000 Genomes chr22, 500 samples | 8.3 s | 0.7 s | 11.62x |
 | vtools | `view` VCF.gz to BCF `--threads 4` | 1000 Genomes chr22, 3,202 samples | 66.9 s | 8.4 s | 7.93x |
 | vtools | `merge -Ob --threads 4` | 1000 Genomes chr22, 3,202 samples (sample halves) | 72.6 s | 29.8 s | 2.44x |
+| pasta | BCF to VCF | 1000 Genomes chr22, 3,202 samples (200,000 records) | 81.4 s | 5.6 s | 14.58x |
+| pasta | VCF.gz to BCF | 1000 Genomes chr22, 3,202 samples (200,000 records) | 124.1 s | 9.1 s | 13.70x |
+| pasta | Read VCF.gz, all genotypes | 1000 Genomes chr22, 3,202 samples (200,000 records) | 58.6 s | 6.6 s | 8.92x |
+| pasta | Read BCF, all genotypes | 1000 Genomes chr22, 3,202 samples (200,000 records) | 20.3 s | 3.7 s | 5.50x |
+| pasta | Read CRAM 3.1 | 2 M HG003 Illumina reads, chr20 (34 MB CRAM) | 11.2 s | 3.7 s | 3.05x |
+| pasta | BAM to CRAM 3.0 | 2 M HG003 Illumina reads, chr20 (109 MB BAM) | 15.4 s | 6.5 s | 2.37x |
 
 More rows, and the cases where samtools or bcftools is faster, are in the
-[ntools](ntools/README.md#performance) and [vtools](vtools/README.md#performance) READMEs.
-
-The pasta library itself, against [noodles](https://github.com/zaeleus/noodles) 0.119.0 on the
-same VM, single-threaded, as wall time. noodles compresses with zlib-rs, or with libdeflate when
-its optional `libdeflate` feature is on; the speedup is against the faster of the two:
-
-| Workload | Input | noodles | noodles + libdeflate | pasta | Speedup |
-|---|---|---:|---:|---:|---:|
-| Read BAM | HG003 Illumina 35x, chr20 (1.1 GB BAM) | 10.31 s | 6.67 s | 6.52 s | 1.02x |
-| Read BAM | HG002 PacBio Revio HiFi, chr20 (1.5 GB BAM) | 14.77 s | 9.62 s | 8.64 s | 1.11x |
-| Read BAM, decoding every field | HG002 PacBio Revio HiFi, chr20 | 34.10 s | | 27.74 s | 1.23x |
-| BAM to BAM | 2 M HG003 Illumina reads, chr20 (109 MB BAM) | 11.35 s | 8.33 s | 5.25 s | 1.59x |
-| Read CRAM 3.1 | the 2 M reads (34 MB CRAM) | 11.16 s | | 3.66 s | 3.05x |
-| BAM to CRAM 3.0 | the 2 M reads | 15.36 s | | 6.47 s | 2.37x |
-| Read BCF, all genotypes | 1000 Genomes chr22, 3,202 samples, 200,000 records | 20.28 s | | 3.69 s | 5.50x |
-| Read VCF.gz, all genotypes | the same records | 58.63 s | | 6.57 s | 8.92x |
-| VCF.gz to BCF | the same records | 124.10 s | | 9.06 s | 13.70x |
-| BCF to VCF | the same records | 81.35 s | | 5.58 s | 14.58x |
-
-Each library writes BAM at its default level, 5 in pasta and 6 in noodles, so pasta's BAM is 4–5%
-larger ([Compression](#compression)); pasta's CRAM is 28% smaller. All rows, with memory, output
-sizes, and eight threads, are in the [pasta README](pasta/README.md#performance).
+[ntools](ntools/README.md#performance) and [vtools](vtools/README.md#performance) READMEs, and
+every noodles row in the [pasta](pasta/README.md#performance) README, including reading BAM, where
+pasta is 1.02–1.11x as fast as noodles with its optional `libdeflate` feature.
 
 ## Commands
 
