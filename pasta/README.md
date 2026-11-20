@@ -13,6 +13,55 @@ It is one crate so that the compiler can inline across formats; both tools in th
 `variant` is the only variant API. The VCF/BCF modules that came from noodles (`vcf`, `bcf`, and
 `util::variant`) silently corrupted genotype and INFO data on ordinary writes and were removed.
 
+## Performance
+
+Against noodles 0.119.0 (noodles-bam 0.98, -cram 0.102, -vcf 0.96, -bcf 0.94, -bgzf 0.52) on a
+24-vCPU Intel Xeon Gold 5418Y VM, both built with fat LTO and one codegen unit into one benchmark
+program. Its alignment code is the same source for both libraries; its variant code uses each
+library's own API. Wall time, medians of three runs (one for runs over 30 s), pinned to one core;
+the two `-@ 8` rows give CPU time, as their wall time varied with other load on the machine.
+noodles was timed on 2026-11-08 and pasta 0.9.1 on 2026-11-20, with two noodles rows re-timed then
+as a check (within 1%). `+ libdeflate` is noodles with noodles-bgzf's optional `libdeflate`
+feature; without it, noodles uses zlib-rs. Every workload gives the same records and checksums
+with both libraries.
+
+Inputs: chr20 of GIAB HG003 Illumina NovaSeq PCR-free 35x (`ilmn`, 19.5 M records, 1.1 GB BAM)
+and of HG002 PacBio Revio HiFi (`hifi`, 221,258 records, 1.5 GB BAM); 2 M HG003 Illumina reads on
+chr20 (`2M`, 109 MB BAM), also as CRAM 3.0 and 3.1 written by samtools 1.24; and the first
+200,000 records of 1000 Genomes chr22 with 3,202 samples, as VCF.gz (79 MB) and BCF (59 MB).
+
+| Workload | noodles | + libdeflate | pasta | Speedup | vs + libdeflate |
+|---|---:|---:|---:|---:|---:|
+| Read BAM, fields on access (`ilmn`) | 10.31 s | 6.67 s | 6.52 s | 1.58x | 1.02x |
+| Read BAM, fields on access (`hifi`) | 14.77 s | 9.62 s | 8.64 s | 1.71x | 1.11x |
+| Read BAM, `-@ 8` (`ilmn`), CPU | 12.00 s | 8.42 s | 7.50 s | 1.60x | 1.12x |
+| Read BAM, every field decoded (`ilmn`) | 39.22 s | | 35.14 s | 1.12x | |
+| Read BAM, every field decoded (`hifi`) | 34.10 s | | 27.74 s | 1.23x | |
+| BAM to SAM (`2M`) | 2.07 s | | 1.56 s | 1.33x | |
+| BAM to BAM (`2M`) | 11.35 s | 8.33 s | 5.25 s | 2.16x | 1.59x |
+| BAM to BAM, `-@ 8` (`2M`), CPU | 12.53 s | 9.49 s | 5.96 s | 2.10x | 1.59x |
+| Read CRAM 3.1 (`2M`) | 11.16 s | | 3.66 s | 3.05x | |
+| Read CRAM 3.0 (`2M`) | 6.89 s | | 3.71 s | 1.86x | |
+| BAM to CRAM 3.0 (`2M`) | 15.36 s | | 6.47 s | 2.37x | |
+| Read BCF, positions and alleles | 0.82 s | | 0.59 s | 1.39x | |
+| Read BCF, all genotypes | 20.28 s | | 3.69 s | 5.50x | |
+| Read VCF.gz, positions and alleles | 11.69 s | 10.57 s | 3.54 s | 3.30x | 2.99x |
+| Read VCF.gz, all genotypes | 58.63 s | | 6.57 s | 8.92x | |
+| VCF.gz to BCF | 124.10 s | | 9.06 s | 13.70x | |
+| BCF to VCF | 81.35 s | | 5.58 s | 14.58x | |
+
+- Output sizes: BAM 109.0 MB (noodles, level 6), 110.5 MB (+ libdeflate, level 6), and 114.4 MB
+  (pasta, level 5); CRAM 3.0 53.4 MB (noodles) and 38.7 MB (pasta; samtools' is 38.6 MB); BCF
+  57.2 MB (noodles) and 59.9 MB (pasta).
+- noodles writes only CRAM 3.0. pasta's default, CRAM 3.1, takes 6.82 s and gives 33.8 MB
+  (samtools': 33.7 MB).
+- Memory: under 20 MB in both libraries for every BAM, VCF, and BCF workload. Reading CRAM takes
+  27 MB in pasta against 131 MB (3.0) and 159 MB (3.1) in noodles; writing CRAM 3.0, 98 MB
+  against 127 MB.
+- pasta's VCF reader parses every field of each line, genotypes included, as HTSlib does; noodles'
+  splits the line and decodes fields when they are read. The "positions and alleles" rows
+  therefore do more work in pasta.
+
 ## Changes from noodles
 
 pasta started from the noodles crates that ntools used (`noodles-core`, `-bgzf`, `-csi`, `-fasta`,

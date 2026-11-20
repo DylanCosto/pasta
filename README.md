@@ -95,6 +95,27 @@ compresses with zflate, at a lower level by default ([Compression](#compression)
 More rows, and the cases where samtools or bcftools is faster, are in the
 [ntools](ntools/README.md#performance) and [vtools](vtools/README.md#performance) READMEs.
 
+The pasta library itself, against [noodles](https://github.com/zaeleus/noodles) 0.119.0 on the
+same VM, single-threaded, as wall time. noodles compresses with zlib-rs, or with libdeflate when
+its optional `libdeflate` feature is on; the speedup is against the faster of the two:
+
+| Workload | Input | noodles | noodles + libdeflate | pasta | Speedup |
+|---|---|---:|---:|---:|---:|
+| Read BAM | HG003 Illumina 35x, chr20 (1.1 GB BAM) | 10.31 s | 6.67 s | 6.52 s | 1.02x |
+| Read BAM | HG002 PacBio Revio HiFi, chr20 (1.5 GB BAM) | 14.77 s | 9.62 s | 8.64 s | 1.11x |
+| Read BAM, decoding every field | HG002 PacBio Revio HiFi, chr20 | 34.10 s | | 27.74 s | 1.23x |
+| BAM to BAM | 2 M HG003 Illumina reads, chr20 (109 MB BAM) | 11.35 s | 8.33 s | 5.25 s | 1.59x |
+| Read CRAM 3.1 | the 2 M reads (34 MB CRAM) | 11.16 s | | 3.66 s | 3.05x |
+| BAM to CRAM 3.0 | the 2 M reads | 15.36 s | | 6.47 s | 2.37x |
+| Read BCF, all genotypes | 1000 Genomes chr22, 3,202 samples, 200,000 records | 20.28 s | | 3.69 s | 5.50x |
+| Read VCF.gz, all genotypes | the same records | 58.63 s | | 6.57 s | 8.92x |
+| VCF.gz to BCF | the same records | 124.10 s | | 9.06 s | 13.70x |
+| BCF to VCF | the same records | 81.35 s | | 5.58 s | 14.58x |
+
+Each library writes BAM at its default level, 5 in pasta and 6 in noodles, so pasta's BAM is 4–5%
+larger ([Compression](#compression)); pasta's CRAM is 28% smaller. All rows, with memory, output
+sizes, and eight threads, are in the [pasta README](pasta/README.md#performance).
+
 ## Commands
 
 Each tool's README lists every option: [ntools](ntools/README.md#commands) and
