@@ -23,7 +23,13 @@ pasta-v0.9.0-x86_64-linux/ntools --version
 The macOS binaries are not signed: after downloading the archive with a browser, run
 `xattr -d com.apple.quarantine pasta-v0.9.0-aarch64-macos.tar.gz` before unpacking it.
 
-To build from source, with Rust 1.91 or newer:
+To install from crates.io, with Rust 1.91 or newer:
+
+```sh
+cargo install --locked ntools vtools
+```
+
+To build from source:
 
 ```sh
 cargo install --locked --path ntools
@@ -162,8 +168,16 @@ certain of everywhere (x86-64 samtools sets it to 0, arm64 samtools keeps it).
 
 ## Library
 
-`pasta` shares its version with ntools and vtools and is not published to crates.io. Its
-[README](pasta/README.md) lists the modules and the changes from noodles.
+`pasta` shares its version with ntools and vtools. It is published to crates.io as
+[`pasta-hts`](https://crates.io/crates/pasta-hts) (the `pasta` name is taken) and is still imported
+as `pasta`:
+
+```toml
+[dependencies]
+pasta = { package = "pasta-hts", version = "0.9.1" }
+```
+
+Its [README](pasta/README.md) lists the modules and the changes from noodles.
 
 ## Contributing
 

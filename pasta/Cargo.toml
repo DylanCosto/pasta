@@ -1,12 +1,18 @@
 [package]
-name = "pasta"
+name = "pasta-hts"
 version = "0.9.1"
-license.workspace = true
+# The CRAM codecs are ported from htscodecs (BSD-3-Clause); the rest is MIT. See NOTICE.
+license = "MIT AND BSD-3-Clause"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 description = "Readers, writers, and algorithms for SAM, BAM, CRAM, VCF, BCF, BGZF, CSI, tabix, and FASTA"
-publish = false
+keywords = ["bioinformatics", "sam", "bam", "cram", "vcf"]
+categories = ["science::bioinformatics", "parser-implementations"]
+
+# Published as pasta-hts (the `pasta` name on crates.io is taken); the library is still `pasta`.
+[lib]
+name = "pasta"
 
 [dependencies]
 bit-vec = "0.10.1"

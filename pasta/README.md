@@ -10,6 +10,14 @@ alignment reader and writer (`util::alignment`), and an HTSlib-compatible pileup
 It is one crate so that the compiler can inline across formats; both tools in this repository,
 `ntools` and `vtools`, are built on it.
 
+On crates.io it is [`pasta-hts`](https://crates.io/crates/pasta-hts); the library is still named
+`pasta`:
+
+```toml
+[dependencies]
+pasta = { package = "pasta-hts", version = "0.9.1" }
+```
+
 `variant` is the only variant API. The VCF/BCF modules that came from noodles (`vcf`, `bcf`, and
 `util::variant`) silently corrupted genotype and INFO data on ordinary writes and were removed.
 

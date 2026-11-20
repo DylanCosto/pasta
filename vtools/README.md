@@ -11,8 +11,10 @@ for byte.
 ## Install
 
 ```sh
-cargo install --path vtools
+cargo install --locked vtools
 ```
+
+or, from a checkout of this repository, `cargo install --locked --path vtools`.
 
 ## Commands
 

@@ -6,8 +6,10 @@ produce the same results as samtools 1.24 while being faster, especially with th
 ## Install
 
 ```sh
-cargo install --path ntools
+cargo install --locked ntools
 ```
+
+or, from a checkout of this repository, `cargo install --locked --path ntools`.
 
 ## Commands
 
