@@ -44,6 +44,13 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   the same bytes: on one core of an Intel Core i5-12600K, 1 MB blocks of quality scores encode
   about 1.5 times as fast at order 0 (800 to 860 MB/s) and 1.4 times at order 1 (560 to
   610 MB/s).
+- pasta: fqzcomp chooses its parameters from the quality scores as htscodecs 1.6.7 does, and
+  writes what `fqz_compress` writes at its basic strategy, byte for byte, where it used one
+  fixed set. Scores of few values are mapped to a dense range, the position and delta contexts
+  are tabulated for the block's record lengths, records that repeat the one before are flagged,
+  and reads are split by average quality where that is estimated to help. In 1 MB blocks, 33 MB
+  of Illumina scores take 1,783 kB where they took 1,953 kB and 32 MB of HiFi scores 3,323 kB
+  where they took 3,558 kB; ONT scores take what they did.
 
 ### Fixed
 
