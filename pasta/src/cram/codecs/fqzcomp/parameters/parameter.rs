@@ -12,20 +12,23 @@ const QUALITIES_TABLE_SIZE: usize = 256;
 const POSITIONS_TABLE_SIZE: usize = 1024;
 const DELTAS_TABLE_SIZE: usize = 256;
 
+/// A parameter set, with its tables as the decoder's context takes them.
 pub struct Parameter {
     pub context: u16,
     flags: Flags,
     symbol_count: NonZero<usize>,
-    pub q_bits: u8,
+    /// The quality bits the context keeps, as a mask.
+    pub q_mask: u32,
     pub q_shift: u8,
     pub q_loc: u8,
     pub s_loc: u8,
-    pub p_loc: u8,
-    pub d_loc: u8,
-    quality_map: Option<Vec<u8>>,
-    qualities_table: Vec<u8>,
-    positions_table: Option<Vec<u8>>,
-    deltas_table: Option<Vec<u8>>,
+    /// The score each symbol stands for: itself, without a quality map.
+    pub quality_map: [u8; QUALITIES_TABLE_SIZE],
+    pub qualities_table: [u32; QUALITIES_TABLE_SIZE],
+    /// Shifted into place in the context, and zero without a positions table.
+    pub positions_table: [u32; POSITIONS_TABLE_SIZE],
+    /// Shifted into place in the context, and zero without a deltas table.
+    pub deltas_table: [u32; DELTAS_TABLE_SIZE],
 }
 
 impl Parameter {
@@ -35,22 +38,6 @@ impl Parameter {
 
     pub fn symbol_count(&self) -> NonZero<usize> {
         self.symbol_count
-    }
-
-    pub fn quality_map(&self) -> Option<&[u8]> {
-        self.quality_map.as_deref()
-    }
-
-    pub fn qualities_table(&self) -> &[u8] {
-        &self.qualities_table
-    }
-
-    pub fn positions_table(&self) -> Option<&[u8]> {
-        self.positions_table.as_deref()
-    }
-
-    pub fn deltas_table(&self) -> Option<&[u8]> {
-        self.deltas_table.as_deref()
     }
 }
 
@@ -63,40 +50,39 @@ pub fn fqz_decode_single_param(src: &mut &[u8]) -> io::Result<Parameter> {
     let (q_loc, s_loc) = read_u4x2(src)?;
     let (p_loc, d_loc) = read_u4x2(src)?;
 
-    let quality_map = if flags.has_quality_map() {
-        read_quality_map(src, max_symbol).map(Some)?
-    } else {
-        None
-    };
+    let mut quality_map = std::array::from_fn(|i| i as u8);
 
-    let qualities_table = if flags.has_qualities_table() {
-        read_qualities_table(src)?
-    } else {
-        build_default_qualities_table()
-    };
+    if flags.has_quality_map() {
+        let symbols = read_quality_map(src, max_symbol)?;
+        quality_map[..symbols.len()].copy_from_slice(symbols);
+    }
 
-    let positions_table = if flags.has_positions_table() {
-        read_positions_table(src).map(Some)?
-    } else {
-        None
-    };
+    let mut qualities_table = std::array::from_fn(|i| i as u32);
 
-    let deltas_table = if flags.has_deltas_table() {
-        read_deltas_table(src).map(Some)?
-    } else {
-        None
-    };
+    if flags.has_qualities_table() {
+        read_table(src, 0, &mut qualities_table)?;
+    }
+
+    let mut positions_table = [0; POSITIONS_TABLE_SIZE];
+
+    if flags.has_positions_table() {
+        read_table(src, p_loc, &mut positions_table)?;
+    }
+
+    let mut deltas_table = [0; DELTAS_TABLE_SIZE];
+
+    if flags.has_deltas_table() {
+        read_table(src, d_loc, &mut deltas_table)?;
+    }
 
     Ok(Parameter {
         context,
         flags,
         symbol_count: max_to_count(max_symbol),
-        q_bits,
+        q_mask: (1 << q_bits) - 1,
         q_shift,
         q_loc,
         s_loc,
-        p_loc,
-        d_loc,
         quality_map,
         qualities_table,
         positions_table,
@@ -113,7 +99,7 @@ fn read_max_symbol(src: &mut &[u8]) -> io::Result<u8> {
     read_u8(src)
 }
 
-fn read_quality_map(src: &mut &[u8], max_symbol: u8) -> io::Result<Vec<u8>> {
+fn read_quality_map<'a>(src: &mut &'a [u8], max_symbol: u8) -> io::Result<&'a [u8]> {
     let len = usize::from(max_symbol);
 
     let (buf, rest) = src
@@ -122,23 +108,18 @@ fn read_quality_map(src: &mut &[u8], max_symbol: u8) -> io::Result<Vec<u8>> {
 
     *src = rest;
 
-    Ok(buf.to_vec())
+    Ok(buf)
 }
 
-fn read_qualities_table(src: &mut &[u8]) -> io::Result<Vec<u8>> {
-    read_array(src, QUALITIES_TABLE_SIZE)
-}
+/// Reads a run-length encoded table into `table`, each value shifted left by `shift`.
+fn read_table(src: &mut &[u8], shift: u8, table: &mut [u32]) -> io::Result<()> {
+    let values = read_array(src, table.len())?;
 
-fn build_default_qualities_table() -> Vec<u8> {
-    (0..=u8::MAX).collect()
-}
+    for (entry, value) in table.iter_mut().zip(values) {
+        *entry = u32::from(value) << shift;
+    }
 
-fn read_positions_table(src: &mut &[u8]) -> io::Result<Vec<u8>> {
-    read_array(src, POSITIONS_TABLE_SIZE)
-}
-
-fn read_deltas_table(src: &mut &[u8]) -> io::Result<Vec<u8>> {
-    read_array(src, DELTAS_TABLE_SIZE)
+    Ok(())
 }
 
 fn max_to_count(n: u8) -> NonZero<usize> {
