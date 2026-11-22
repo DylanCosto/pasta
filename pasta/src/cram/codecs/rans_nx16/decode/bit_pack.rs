@@ -9,19 +9,6 @@ pub use self::context::read_context;
 const MAX_SYMBOL_COUNT: usize = 16;
 
 pub fn decode(src: &[u8], ctx: &Context<'_>) -> io::Result<Vec<u8>> {
-    let symbols_per_byte = match ctx.symbol_count.get() {
-        1 => 0,
-        2 => 8,
-        3..=4 => 4,
-        5..=MAX_SYMBOL_COUNT => 2,
-        n => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("expected bit pack symbol count to be <= {MAX_SYMBOL_COUNT}, got {n}"),
-            ));
-        }
-    };
-
     // As in htscodecs, a code past the symbols is 0.
     let mut mapping_table = [0; MAX_SYMBOL_COUNT];
 
@@ -29,32 +16,49 @@ pub fn decode(src: &[u8], ctx: &Context<'_>) -> io::Result<Vec<u8>> {
         *d = *s;
     }
 
-    if symbols_per_byte == 0 {
-        return Ok(vec![mapping_table[0]; ctx.uncompressed_size]);
+    match ctx.symbol_count.get() {
+        1 => Ok(vec![mapping_table[0]; ctx.uncompressed_size]),
+        2 => unpack::<8>(src, &mapping_table, ctx.uncompressed_size),
+        3..=4 => unpack::<4>(src, &mapping_table, ctx.uncompressed_size),
+        5..=MAX_SYMBOL_COUNT => unpack::<2>(src, &mapping_table, ctx.uncompressed_size),
+        n => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("expected bit pack symbol count to be <= {MAX_SYMBOL_COUNT}, got {n}"),
+        )),
     }
+}
 
-    if src.len() < ctx.uncompressed_size.div_ceil(symbols_per_byte) {
+/// Unpacks `len` symbols, `N` to a byte from its low bits.
+///
+/// A byte's symbols are looked up together, in a table of what each of the 256 bytes unpacks
+/// to.
+fn unpack<const N: usize>(
+    src: &[u8],
+    mapping_table: &[u8; MAX_SYMBOL_COUNT],
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    let bits = u8::BITS as usize / N;
+    let mask = (1 << bits) - 1;
+
+    if src.len() < len.div_ceil(N) {
         return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
     }
 
-    let mut dst = vec![0; ctx.uncompressed_size];
-    unpack(src, &mapping_table, symbols_per_byte, &mut dst);
+    let table: [[u8; N]; 256] =
+        std::array::from_fn(|b| std::array::from_fn(|i| mapping_table[(b >> (i * bits)) & mask]));
+
+    let mut dst = vec![0; len];
+    let (chunks, tail) = dst.as_chunks_mut::<N>();
+
+    for (chunk, &b) in chunks.iter_mut().zip(src) {
+        *chunk = table[usize::from(b)];
+    }
+
+    if let Some(&b) = src.get(chunks.len()) {
+        tail.copy_from_slice(&table[usize::from(b)][..tail.len()]);
+    }
 
     Ok(dst)
-}
-
-fn unpack(src: &[u8], mapping_table: &[u8; MAX_SYMBOL_COUNT], chunk_size: usize, dst: &mut [u8]) {
-    const BITS: usize = u8::BITS as usize;
-
-    let shift = BITS / chunk_size;
-    let mask = (1 << shift) - 1;
-
-    for (mut s, chunk) in src.iter().copied().zip(dst.chunks_mut(chunk_size)) {
-        for d in chunk {
-            *d = mapping_table[usize::from(s & mask)];
-            s >>= shift;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -62,24 +66,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_unpack() {
+    fn test_unpack() -> io::Result<()> {
         fn mapping_table(symbols: &[u8]) -> [u8; MAX_SYMBOL_COUNT] {
             let mut table = [0; MAX_SYMBOL_COUNT];
             table[..symbols.len()].copy_from_slice(symbols);
             table
         }
 
-        let mut dst = [0; 4];
-        unpack(&[0b00001100], &mapping_table(b"nd"), 8, &mut dst);
-        assert_eq!(&dst, b"nndd");
+        assert_eq!(
+            unpack::<8>(&[0b00001100], &mapping_table(b"nd"), 4)?,
+            b"nndd"
+        );
+        assert_eq!(
+            unpack::<8>(&[0b10001100, 0b101], &mapping_table(b"nd"), 11)?,
+            b"nnddnnnddnd"
+        );
 
-        let mut dst = [0; 4];
-        unpack(&[0b11100100], &mapping_table(b"ndls"), 4, &mut dst);
-        assert_eq!(&dst, b"ndls");
+        assert_eq!(
+            unpack::<4>(&[0b11100100], &mapping_table(b"ndls"), 4)?,
+            b"ndls"
+        );
+        assert_eq!(
+            unpack::<4>(&[0b11100100, 0b0110], &mapping_table(b"ndls"), 6)?,
+            b"ndlsld"
+        );
 
-        let mut dst = [0; 2];
-        unpack(&[0b00100000], &mapping_table(b"nodles"), 2, &mut dst);
-        assert_eq!(&dst, b"nd");
+        assert_eq!(
+            unpack::<2>(&[0b00100000], &mapping_table(b"nodles"), 2)?,
+            b"nd"
+        );
+        assert_eq!(
+            unpack::<2>(&[0x20, 0x45, 0x03], &mapping_table(b"nodles"), 5)?,
+            b"ndsel"
+        );
+
+        // Bytes past the symbols are not read.
+        assert_eq!(
+            unpack::<4>(&[0b11100100, 0xff], &mapping_table(b"ndls"), 3)?,
+            b"ndl"
+        );
+        assert!(unpack::<2>(&[], &mapping_table(b"nodles"), 0)?.is_empty());
+
+        Ok(())
     }
 
     fn context(mapping_table: &[u8], uncompressed_size: usize) -> Context<'_> {

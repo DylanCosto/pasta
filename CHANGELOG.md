@@ -56,6 +56,13 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   block. On one core of an Intel Core i5-12600K, 1 MB blocks of HiFi quality scores decode at
   106 MB/s where they took 59 and encode at 106 where they took 86; ONT scores decode at 52
   where they took 36 and encode at 50 where they took 40.
+- pasta: rANS Nx16 streams that are bit-packed or run-length encoded decode faster, as the
+  quality scores of PacBio Revio and ONT reads are in CRAM 3.1. A packed byte's symbols are
+  looked up together, and runs are expanded in a loop that branches on little the data
+  decides. On one core of an Intel Core i5-12600K, 1 MB blocks of Revio scores as HTSlib writes
+  them (order 1, packed, with run lengths) decode at 1,120 MB/s where they took 602, and ONT
+  scores (order 1, with run lengths) at 555 where they took 396. `ntools view` of a Revio
+  CRAM to SAM takes 1.27 s where it took 1.92 s, and of an ONT CRAM 1.21 s where it took 1.43 s.
 
 ### Fixed
 
