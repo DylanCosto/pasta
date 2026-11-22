@@ -34,3 +34,15 @@ including duplicates, a name that begins an earlier one, padded numbers and an
 empty name. `tok3-rans-formats-<level>.bin` are those names encoded by
 `tok3_encode_names` at levels 1 and 3 (the level HTSlib uses for names at its
 default level 5), with rANS Nx16.
+
+`names-uuid.bin` holds 64 NUL-terminated names of the form Oxford Nanopore
+basecallers write: 56 generated UUIDs, then a duplicate, a UUID before more
+text (twice), one in upper case, one after `@`, one after `>`, one with a
+letter that is not a hexadecimal digit, and one a byte short.
+`tok3-rans-uuid-<level>.bin` are those names encoded as the formats are.
+
+The name tokenizer's output changed in htscodecs 1.6.4, which codes a UUID as a
+character per byte and encodes a name of no known format against the last name
+sharing its longest prefix that ends in punctuation. The `formats` and `uuid`
+streams were written by the `tokenise_name3.c` of the 1.6.7 tag; 1.6.3 codes
+`names.bin` the same and the other two differently.
