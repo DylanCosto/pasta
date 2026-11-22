@@ -35,7 +35,12 @@ pub fn decode(mut src: &[u8], mut uncompressed_size: usize) -> io::Result<Vec<u8
     let mut dst = vec![0; uncompressed_size];
 
     if flags.is_uncompressed() {
-        dst.copy_from_slice(src);
+        // As in htscodecs, what follows the data is not read.
+        let data = src
+            .get(..dst.len())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+
+        dst.copy_from_slice(data);
     } else if flags.uses_external_codec() {
         decode_ext(&mut src, &mut dst)?;
     } else if flags.is_rle() {
@@ -187,6 +192,34 @@ mod tests {
             read_symbol_count(&mut &src[..]),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decode_uncompressed_with_too_few_bytes() {
+        let src = [
+            0x20, // flags = CAT
+            0x07, // uncompressed len = 7
+            0x6e, 0x6f, 0x6f, 0x64, 0x6c, 0x65,
+        ];
+
+        assert!(matches!(
+            decode(&src, 0),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn test_decode_uncompressed_with_trailing_bytes() -> io::Result<()> {
+        let src = [
+            0x20, // flags = CAT
+            0x07, // uncompressed len = 7
+            0x6e, 0x6f, 0x6f, 0x64, 0x6c, 0x65, 0x73, 0x21,
+        ];
+
+        // As in htscodecs, what follows the data is not read.
+        assert_eq!(decode(&src, 0)?, b"noodles");
 
         Ok(())
     }
