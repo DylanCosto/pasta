@@ -62,6 +62,15 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 - pasta: fqzcomp and the adaptive arithmetic coder fail with `InvalidData` on a corrupt
   payload (a symbol past a model's frequencies, a duplicate record with none before it or
   running past the block, or a parameter set the block does not have), instead of panicking.
+- pasta: more corrupt CRAM blocks are errors instead of panics. A stored rANS Nx16 or
+  arithmetic-coded stream shorter than the size it states, and bit-packed data shorter than
+  the symbols it states, fail with `UnexpectedEof`; a bit-packed code past the stream's symbols
+  decodes as 0, as in htscodecs; and an fqzcomp table with a run past its end, too many runs,
+  or a value past 255 is cut short or fails with `InvalidData`, as in htscodecs.
+- pasta: an fqzcomp table that does not begin with the value 0 (a selector, quality, position
+  or delta table whose first entry is not 0) is read as htscodecs writes it. Its first run
+  length, 0, was taken for a repeat of an earlier length, and the rest of the table misread.
+  htscodecs' own tables begin with 0, so files it wrote were not affected.
 - pasta: a BAI, CSI, or tabix index with a bin ID past the last bin of its depth (other than the
   metadata pseudo-bin) fails to load with `InvalidData` ("invalid bin ID"), instead of loading
   and then panicking on the first query of that reference sequence.
