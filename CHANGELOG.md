@@ -40,6 +40,10 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   - rANS 4x8 order 0 decodes 1.04 to 1.8 times as fast, from a table with a step per slot.
   - rANS 4x8 encodes 1.1 to 2 times as fast at both orders: a state's first byte is written
     without a branch.
+- pasta: rANS Nx16 with 32 states encodes with AVX2 where the CPU has it, at both orders, to
+  the same bytes: on one core of an Intel Core i5-12600K, 1 MB blocks of quality scores encode
+  about 1.5 times as fast at order 0 (800 to 860 MB/s) and 1.4 times at order 1 (560 to
+  610 MB/s).
 
 ### Fixed
 
