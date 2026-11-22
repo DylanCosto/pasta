@@ -79,8 +79,14 @@ fn count_symbols(src: &[u8]) -> NonZero<usize> {
 }
 
 fn write_symbol_count(dst: &mut Vec<u8>, symbol_count: NonZero<usize>) -> io::Result<()> {
-    let n = u8::try_from(usize::from(symbol_count))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // A full alphabet does not fit a byte and is stored as 0, which the decoder reads back
+    // as 256 (as htscodecs does).
+    const ALPHABET_SIZE: usize = 256;
+
+    let n = match symbol_count.get() {
+        ALPHABET_SIZE => 0,
+        n => u8::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+    };
 
     write_u8(dst, n)
 }
@@ -220,5 +226,44 @@ mod tests {
         t(&[0x00], NonZero::<usize>::MIN);
         t(&[0xff], const { NonZero::new(256).unwrap() });
         t(b"range_coder", const { NonZero::new(115).unwrap() });
+    }
+
+    #[test]
+    fn test_write_symbol_count() -> io::Result<()> {
+        let mut dst = Vec::new();
+
+        write_symbol_count(&mut dst, NonZero::<usize>::MIN)?;
+        assert_eq!(dst, [0x01]);
+
+        dst.clear();
+        write_symbol_count(&mut dst, const { NonZero::new(255).unwrap() })?;
+        assert_eq!(dst, [0xff]);
+
+        // The full alphabet does not fit a byte and is stored as 0.
+        dst.clear();
+        write_symbol_count(&mut dst, const { NonZero::new(256).unwrap() })?;
+        assert_eq!(dst, [0x00]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_encode_with_byte_255_round_trips() -> io::Result<()> {
+        use crate::cram::codecs::aac::decode;
+
+        let src: Vec<u8> = (0..=u8::MAX).cycle().take(1024).collect();
+
+        for flags in [
+            Flags::empty(),
+            Flags::ORDER,
+            Flags::RLE,
+            Flags::RLE | Flags::ORDER,
+        ] {
+            let encoded = encode(flags, &src)?;
+            let decoded = decode(&encoded, src.len())?;
+            assert_eq!(decoded, src, "flags {flags:?}");
+        }
+
+        Ok(())
     }
 }
