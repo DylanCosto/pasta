@@ -46,3 +46,13 @@ character per byte and encodes a name of no known format against the last name
 sharing its longest prefix that ends in punctuation. The `formats` and `uuid`
 streams were written by the `tokenise_name3.c` of the 1.6.7 tag; 1.6.3 codes
 `names.bin` the same and the other two differently.
+
+`qual-records-mixed.txt` and `qual-records-binned.txt` hold quality scores, a
+record per line, as in FASTQ (the score plus 33). `mixed` has 72 records of 30
+to 197 scores over 35 values, for which htscodecs stores each record's length.
+`binned` has 96 records of 75 scores over 4 values (2, 12, 22 and 37), 18 of
+them repeating the record before, for which it maps the scores to 0 to 3 and
+stores one length. `fqz-<records>-<strategy>.bin` are those records encoded by
+htscodecs 1.6.7's `fqz_compress(4, &slice, in, len, &out_len, strategy, NULL)`
+at strategies 0 to 3, with every record's flags 0. At strategies 0 and 1 both
+are split by average quality, with a selector; at 2 and 3 neither is.

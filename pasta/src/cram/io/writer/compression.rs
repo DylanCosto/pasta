@@ -261,7 +261,8 @@ impl MethodSets {
 
         let mut quality_scores = method;
 
-        // HTSlib also tries other fqzcomp parameter sets, which fqzcomp here does not have.
+        // HTSlib also tries fqzcomp's other strategies at level 7 and above, which this writer
+        // does not: it uses the basic one, HTSlib's below that level.
         if is_3_1 && options.use_fqz {
             quality_scores |= bit(FQZ);
         }
