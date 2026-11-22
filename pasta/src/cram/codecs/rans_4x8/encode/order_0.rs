@@ -33,10 +33,23 @@ pub fn encode(src: &[u8]) -> io::Result<Vec<u8>> {
     let mut buf = ReverseWriter::for_symbols(src.len());
     let mut states = [LOWER_BOUND; STATE_COUNT];
 
-    for (i, &sym) in src.iter().enumerate().rev() {
-        let state = &mut states[i % STATE_COUNT];
+    // Symbol `i` is encoded by state `i % STATE_COUNT`, last symbol first.
+    let (chunks, remainder) = src.as_chunks::<STATE_COUNT>();
+
+    for (state, &sym) in states.iter_mut().zip(remainder).rev() {
         *state = symbols[usize::from(sym)].put(*state, &mut buf);
     }
+
+    let [mut s0, mut s1, mut s2, mut s3] = states;
+
+    for &[sym0, sym1, sym2, sym3] in chunks.iter().rev() {
+        s3 = symbols[usize::from(sym3)].put(s3, &mut buf);
+        s2 = symbols[usize::from(sym2)].put(s2, &mut buf);
+        s1 = symbols[usize::from(sym1)].put(s1, &mut buf);
+        s0 = symbols[usize::from(sym0)].put(s0, &mut buf);
+    }
+
+    let states = [s0, s1, s2, s3];
 
     let mut dst = vec![0; header::SIZE];
 

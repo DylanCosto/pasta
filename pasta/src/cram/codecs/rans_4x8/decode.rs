@@ -202,6 +202,61 @@ mod tests {
         }
     }
 
+    /// Every way through `renormalize_states` reads the bytes a plain byte loop reads.
+    #[test]
+    fn test_renormalize_states_matches_a_byte_loop() {
+        let mut x = 0x9e37_79b9_u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+
+        let mut bytes = [0; 16];
+
+        for round in 0..200_000 {
+            // States of every size: those that take no byte, one, two, and (as only a
+            // malformed stream has) three or four.
+            let states: [u32; STATE_COUNT] = std::array::from_fn(|_| {
+                next() >> [0, 1, 8, 9, 16, 17, 24, 25, 31][next() as usize % 9]
+            });
+
+            for b in &mut bytes {
+                *b = next() as u8;
+            }
+
+            let src = &bytes[..round % (bytes.len() + 1)];
+
+            let mut expected_rest = src;
+            let expected: io::Result<Vec<u32>> = states
+                .iter()
+                .map(|&s| state_renormalize(s, &mut expected_rest))
+                .collect();
+
+            let mut actual = states;
+            let mut actual_rest = src;
+            let result = renormalize_states(&mut actual, &mut actual_rest);
+
+            match expected {
+                Ok(expected) => {
+                    assert!(result.is_ok(), "states = {states:x?}, src = {src:x?}");
+                    assert_eq!(
+                        actual[..],
+                        expected[..],
+                        "states = {states:x?}, src = {src:x?}"
+                    );
+                    assert_eq!(actual_rest, expected_rest, "states = {states:x?}");
+                }
+                Err(e) => assert_eq!(
+                    result.unwrap_err().kind(),
+                    e.kind(),
+                    "states = {states:x?}, src = {src:x?}"
+                ),
+            }
+        }
+    }
+
     #[test]
     fn test_decode_with_order_0() -> io::Result<()> {
         let expected = b"noodles";

@@ -79,8 +79,16 @@ impl EncodingSymbol {
     }
 
     /// Renormalizes `x` (writing bytes to `dst`) and encodes the symbol.
+    ///
+    /// Whether a state gives up a byte is close to a coin toss on data that compresses little,
+    /// so the first byte is written either way and kept only if it was due, without a branch
+    /// (as htscodecs' `RansEncPutSymbol` does). A second byte is rare.
     #[inline]
     fn put(&self, mut x: u32, dst: &mut ReverseWriter) -> u32 {
+        let due = x >= self.x_max;
+        dst.push_if(x as u8, due);
+        x >>= 8 * u32::from(due);
+
         while x >= self.x_max {
             dst.push(x as u8);
             x >>= 8;
@@ -123,6 +131,13 @@ impl ReverseWriter {
     fn push(&mut self, b: u8) {
         self.pos -= 1;
         self.buf[self.pos] = b;
+    }
+
+    /// Writes `b` where the next byte goes, and keeps it if `keep`.
+    #[inline]
+    fn push_if(&mut self, b: u8, keep: bool) {
+        self.buf[self.pos - 1] = b;
+        self.pos -= usize::from(keep);
     }
 
     fn as_slice(&self) -> &[u8] {
