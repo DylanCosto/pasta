@@ -107,6 +107,10 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   instead of skipping 8 or 1 bytes per element.
 - pasta: `cram::io::reader::Container::slices` and `compression_header` panicked on a container
   whose landmarks point past its end; they now return an error.
+- pasta: the CRAM arithmetic coder encodes data that contains byte 255. It failed with
+  `InvalidInput` on a symbol count of 256, which the format stores as 0; the CRAM writer then
+  chose another method for the block, so such blocks (ONT `ML` arrays, for one) were never
+  arithmetic-coded.
 
 ## [0.9.1] - 2026-11-10
 
