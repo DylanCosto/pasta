@@ -186,6 +186,16 @@ fn fast_log(a: f64) -> f64 {
 }
 
 pub fn encode(src: &[u8], ctx: &Context, state_count: usize, dst: &mut Vec<u8>) -> io::Result<()> {
+    encode_with::<true>(src, ctx, state_count, dst)
+}
+
+/// Encodes `src`, 32 states with SIMD where the CPU supports it if `SIMD` is set.
+fn encode_with<const SIMD: bool>(
+    src: &[u8],
+    ctx: &Context,
+    state_count: usize,
+    dst: &mut Vec<u8>,
+) -> io::Result<()> {
     let frequencies = &ctx.frequencies;
     let cumulative_frequencies = build_cumulative_frequencies(frequencies, &ctx.alphabet);
 
@@ -221,8 +231,8 @@ pub fn encode(src: &[u8], ctx: &Context, state_count: usize, dst: &mut Vec<u8>) 
     let mut buf = ReverseWriter::for_symbols(src.len());
 
     match state_count {
-        4 => write_states(dst, &encode_states::<4>(src, &rows, &mut buf))?,
-        32 => write_states(dst, &encode_states::<32>(src, &rows, &mut buf))?,
+        4 => write_states(dst, &encode_states::<4, false>(src, &rows, &mut buf))?,
+        32 => write_states(dst, &encode_states::<32, SIMD>(src, &rows, &mut buf))?,
         _ => unreachable!("state count is 4 or 32"),
     }
 
@@ -232,8 +242,9 @@ pub fn encode(src: &[u8], ctx: &Context, state_count: usize, dst: &mut Vec<u8>) 
 }
 
 /// Encodes `src` on `N` states, each a chunk of it, the last also taking the rest, returning the
-/// final states.
-fn encode_states<const N: usize>(
+/// final states. The chunks are encoded with SIMD where the CPU supports it for `N` states, if
+/// `SIMD` is set.
+fn encode_states<const N: usize, const SIMD: bool>(
     src: &[u8],
     rows: &[&[EncodingSymbol; ALPHABET_SIZE]; ALPHABET_SIZE],
     buf: &mut ReverseWriter,
@@ -258,9 +269,11 @@ fn encode_states<const N: usize>(
 
     // The decoder interleaves the states at each position, reading from a single stream, so
     // encode positions in reverse with the states in reverse at each one.
-    for k in (0..chunk_size - 1).rev() {
-        for (state, chunk) in states.iter_mut().zip(&chunks).rev() {
-            put(state, chunk[k], chunk[k + 1], buf);
+    if !(SIMD && try_encode_simd(&chunks, rows, &mut states, buf)) {
+        for k in (0..chunk_size - 1).rev() {
+            for (state, chunk) in states.iter_mut().zip(&chunks).rev() {
+                put(state, chunk[k], chunk[k + 1], buf);
+            }
         }
     }
 
@@ -269,6 +282,44 @@ fn encode_states<const N: usize>(
     }
 
     states
+}
+
+/// Encodes every symbol of the chunks but each one's first with SIMD, if the CPU supports it
+/// for `N` states, and returns whether it did.
+#[cfg(target_arch = "x86_64")]
+fn try_encode_simd<const N: usize>(
+    chunks: &[&[u8]; N],
+    rows: &[&[EncodingSymbol; ALPHABET_SIZE]; ALPHABET_SIZE],
+    states: &mut [u32; N],
+    buf: &mut ReverseWriter,
+) -> bool {
+    use super::avx2;
+
+    let (Ok(chunks), Ok(states)) = (
+        <&[&[u8]; avx2::STATE_COUNT]>::try_from(chunks.as_slice()),
+        <&mut [u32; avx2::STATE_COUNT]>::try_from(states.as_mut_slice()),
+    ) else {
+        return false;
+    };
+
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return false;
+    }
+
+    // SAFETY: AVX2 is available.
+    unsafe { avx2::encode_order_1(chunks, rows, states, buf) };
+
+    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn try_encode_simd<const N: usize>(
+    _chunks: &[&[u8]; N],
+    _rows: &[&[EncodingSymbol; ALPHABET_SIZE]; ALPHABET_SIZE],
+    _states: &mut [u32; N],
+    _buf: &mut ReverseWriter,
+) -> bool {
+    false
 }
 
 fn write_frequencies(
@@ -454,5 +505,51 @@ mod tests {
             split_chunks(b"ndls", 2),
             (vec![&b"nd"[..], &b"ls"[..]], &[][..])
         );
+    }
+
+    /// With and without SIMD, 32 states are encoded to the same bytes, which decode to the input.
+    #[test]
+    fn test_encode_32_states_with_and_without_simd() -> io::Result<()> {
+        use crate::cram::codecs::rans_nx16::{Flags, decode, encode as encode_stream};
+
+        let mut state = 1u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            state >> 8
+        };
+
+        // Quality-like runs, uniform bytes that renormalize nearly every state every round, and
+        // one symbol, whose frequency is the whole table.
+        let qualities: Vec<u8> = (0..100_003)
+            .scan(30u8, |q, _| {
+                let r = next();
+                if r % 7 == 0 {
+                    *q = 2 + (r % 40) as u8;
+                }
+                Some(*q + 33)
+            })
+            .collect();
+        let uniform: Vec<u8> = (0..50_001).map(|_| next() as u8).collect();
+        let constant = vec![b'#'; 5_000];
+
+        for data in [&qualities[..], &uniform[..], &constant[..]] {
+            for len in [32, 33, 63, 64, 65, 95, 96, 97, 1_000, 4_097, data.len()] {
+                let src = &data[..len];
+                let ctx = build_context(src, 32)?;
+
+                let mut scalar = Vec::new();
+                encode_with::<false>(src, &ctx, 32, &mut scalar)?;
+
+                let mut simd = Vec::new();
+                encode_with::<true>(src, &ctx, 32, &mut simd)?;
+
+                assert_eq!(simd, scalar, "len = {len}");
+
+                let encoded = encode_stream(Flags::ORDER | Flags::N32, src)?;
+                assert_eq!(decode(&encoded, len)?, src, "len = {len}");
+            }
+        }
+
+        Ok(())
     }
 }

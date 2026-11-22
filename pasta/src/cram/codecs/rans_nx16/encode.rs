@@ -1,3 +1,5 @@
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 pub mod bit_pack;
 mod order_0;
 mod order_1;
@@ -177,8 +179,10 @@ fn write_alphabet(dst: &mut Vec<u8>, alphabet: &[bool; ALPHABET_SIZE]) -> io::Re
 /// dividing (ryg_rans' `RansEncSymbol`, which htscodecs also uses). It gives the same states as
 /// [`state_renormalize`] and [`state_step`].
 ///
-/// It is 16 bytes, as htscodecs' is, so that an order-1 table's steps do not straddle cache lines.
+/// It is 16 bytes, as htscodecs' is, so that an order-1 table's steps do not straddle cache lines,
+/// with its fields in this order, which the AVX2 encoder loads it by.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub(super) struct EncodingSymbol {
     x_max: u32,
     rcp_freq: u32,
@@ -266,6 +270,16 @@ impl ReverseWriter {
     fn push_if(&mut self, is_written: bool, n: u16) {
         self.buf[self.pos - 2..self.pos].copy_from_slice(&n.to_le_bytes());
         self.pos -= 2 * usize::from(is_written);
+    }
+
+    /// Writes the last `count` of the eight little-endian words of `words`, in order. All eight
+    /// go before the last word written, which the slack of [`Self::for_symbols`] has room for,
+    /// and only those `count` count.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn push_last_words(&mut self, words: &[u8; 16], count: usize) {
+        self.buf[self.pos - 16..self.pos].copy_from_slice(words);
+        self.pos -= 2 * count;
     }
 
     pub(super) fn as_slice(&self) -> &[u8] {
