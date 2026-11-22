@@ -27,6 +27,12 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 - ntools: `calmd` and `mpileup` now fail with "CIGAR and query sequence lengths differ" on a
   mapped read whose CIGAR and sequence differ in length, as samtools does, where they used to
   write output for it. `ntools view` still reads such a read.
+- pasta: the CRAM name tokenizer writes what htscodecs 1.6.7 writes, byte for byte, where it
+  wrote what 1.6.3 does. A read name that begins with a UUID, as Oxford Nanopore's do, is coded
+  as a character per byte, and a name of no known format is encoded against the last name
+  sharing its longest prefix that ends in punctuation or whitespace. The 62,714 names of an ONT
+  run take 958 kB where they took 1,398 kB, and encode twice as fast; 220,000 Illumina names
+  are coded as before.
 
 ### Fixed
 

@@ -19,7 +19,7 @@ struct Node<'a> {
     last: u32,
 }
 
-/// The last names through two nodes of a name's path, before the name itself.
+/// The last names through three nodes of a name's path, before the name itself.
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Visit {
     /// The last name through the node of the whole name: an equal name or one that the name
@@ -28,6 +28,10 @@ pub(super) struct Visit {
     /// The last name through the node `prefix_len` bytes in, as for [`Self::full`]. `None` if the
     /// name is shorter.
     pub(super) prefix: Option<u32>,
+    /// The last earlier name through the deepest node that a punctuation or whitespace byte
+    /// leads into and an earlier name passed (htscodecs' `from_punct`). `None` if no earlier
+    /// name shares a prefix that ends in one.
+    pub(super) separator: Option<u32>,
 }
 
 impl Visit {
@@ -41,6 +45,27 @@ impl Visit {
             self.full = Some(last);
         }
     }
+
+    /// As [`Self::reach`], for nodes an earlier name, `last`, passed.
+    fn reach_shared(
+        &mut self,
+        start: usize,
+        end: usize,
+        name: &[u8],
+        prefix_len: usize,
+        last: u32,
+    ) {
+        self.reach(start, end, name, prefix_len, last);
+
+        if name[start..end].iter().copied().any(is_separator) {
+            self.separator = Some(last);
+        }
+    }
+}
+
+/// Whether C's `ispunct` or `isspace` holds for `b` in the "C" locale.
+fn is_separator(b: u8) -> bool {
+    b.is_ascii_punctuation() || matches!(b, b' ' | b'\t'..=b'\r')
 }
 
 impl<'a> Trie<'a> {
@@ -77,7 +102,7 @@ impl<'a> Trie<'a> {
             let child = child as usize;
             let label = self.nodes[child].label;
             let len = common_prefix_len(label, rest);
-            visit.reach(depth, depth + len, name, prefix_len, self.nodes[child].last);
+            visit.reach_shared(depth, depth + len, name, prefix_len, self.nodes[child].last);
 
             if len == label.len() {
                 self.nodes[child].last = n;
@@ -157,6 +182,22 @@ mod tests {
         })
     }
 
+    /// The last name before `n` that shares the longest prefix of `names[n]` that ends in a
+    /// separator and that any earlier name shares.
+    fn last_through_separator(names: &[&[u8]], n: usize) -> Option<u32> {
+        let name = names[n];
+
+        (1..=name.len())
+            .rev()
+            .filter(|&depth| is_separator(name[depth - 1]))
+            .find_map(|depth| {
+                names[..n]
+                    .iter()
+                    .rposition(|other| other.starts_with(&name[..depth]))
+            })
+            .map(|m| m as u32)
+    }
+
     #[test]
     fn test_visit() {
         let mut names: Vec<Vec<u8>> = [
@@ -200,6 +241,7 @@ mod tests {
                 let expected = Visit {
                     full: last_through(&names, n, name.len()),
                     prefix: last_through(&names, n, prefix_len),
+                    separator: last_through_separator(&names, n),
                 };
 
                 let actual = trie.visit(name, n as u32, prefix_len);

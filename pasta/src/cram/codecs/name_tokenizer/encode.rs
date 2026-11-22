@@ -131,8 +131,9 @@ impl<'a> Encoder<'a> {
     }
 
     /// Encodes a name as htscodecs' `encode_name` does: against the last name equal to it or that
-    /// it begins, if any; otherwise the last name sharing the prefix its format suggests, if any;
-    /// otherwise the name before it.
+    /// it begins, if any; otherwise the last name sharing the prefix its format suggests, if the
+    /// name is that long; otherwise the last name sharing its longest prefix that ends in
+    /// punctuation or whitespace, if any; otherwise the name before it.
     fn push(&mut self, name: &'a [u8]) -> io::Result<()> {
         let n = self.names.len();
         let id = u32::try_from(n).map_err(invalid_input)?;
@@ -143,6 +144,7 @@ impl<'a> Encoder<'a> {
 
         let m = exact
             .or(visit.prefix)
+            .or(visit.separator)
             .map_or(n.saturating_sub(1), |m| m as usize);
 
         let distance = (n - m) as u32;
@@ -176,27 +178,40 @@ impl<'a> Encoder<'a> {
             (k < prev.tokens.end).then(|| tokens[k])
         };
 
-        // The prefix of a known format is one token.
-        if format.is_fixed {
-            let prefix = &name[..format.prefix_len];
-            let position = position(&mut self.positions, pos)?;
+        match format.prefix {
+            Prefix::Split => {}
+            Prefix::String => {
+                let prefix = &name[..format.prefix_len];
+                let position = position(&mut self.positions, pos)?;
 
-            match prev_token(&self.tokens, pos) {
-                Some(Token::Alpha { len, .. })
-                    if len == prefix.len() && prev.name.starts_with(prefix) =>
-                {
-                    position.push_type(Type::Match);
+                match prev_token(&self.tokens, pos) {
+                    Some(Token::Alpha { len, .. })
+                        if len == prefix.len() && prev.name.starts_with(prefix) =>
+                    {
+                        position.push_type(Type::Match);
+                    }
+                    _ => position.push_string(prefix),
                 }
-                _ => position.push_string(prefix),
+
+                self.tokens.push(Token::Alpha {
+                    start: 0,
+                    len: prefix.len(),
+                });
+
+                i = prefix.len();
+                pos += 1;
             }
+            // Each byte is stored, whatever the previous name has there: the digits of a UUID
+            // are random, and a stream per position holds 16 symbols.
+            Prefix::Chars => {
+                for &c in &name[..format.prefix_len] {
+                    position(&mut self.positions, pos)?.push_char(c);
+                    self.tokens.push(Token::Char(c));
+                    pos += 1;
+                }
 
-            self.tokens.push(Token::Alpha {
-                start: 0,
-                len: prefix.len(),
-            });
-
-            i = prefix.len();
-            pos += 1;
+                i = format.prefix_len;
+            }
         }
 
         while i < name.len() {
@@ -435,41 +450,57 @@ impl Position {
     }
 }
 
+/// The length of a UUID as text: 32 hexadecimal digits in five groups.
+const UUID_LEN: usize = 36;
+
 /// What htscodecs guesses of a name's format from its shape (in `search_trie`): how long a prefix
-/// to look for an earlier name sharing, and whether it is a token of its own.
+/// to look for an earlier name sharing, and how that prefix is tokenized.
 #[derive(Debug, Eq, PartialEq)]
 struct Format {
     prefix_len: usize,
-    is_fixed: bool,
+    prefix: Prefix,
+}
+
+/// How the prefix of a name's format is tokenized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Prefix {
+    /// Split into tokens, like the rest of the name.
+    Split,
+    /// One string.
+    String,
+    /// One character for each byte.
+    Chars,
 }
 
 impl Format {
     fn guess(name: &[u8]) -> Self {
         let d = name.strip_prefix(b"@").unwrap_or(name);
         let f = usize::from(name.first() == Some(&b'>'));
-        let is_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
 
         if d.len() > 70 && d[f] == b'm' && d[7] == b'_' && d[f + 14] == b'_' && d[f + 61] == b'/' {
             // PacBio
             Self {
                 prefix_len: 60,
-                is_fixed: false,
+                prefix: Prefix::Split,
             }
         } else if d.len() == 17 && d[f + 5] == b':' && d[f + 11] == b':' {
             // Ion Torrent
             Self {
                 prefix_len: 6,
-                is_fixed: true,
+                prefix: Prefix::String,
             }
-        } else if d.len() > 37
-            && [8, 13, 18, 23].iter().all(|&i| d[f + i] == b'-')
-            && is_hex(d[f])
-            && is_hex(d[f + 35])
+        } else if d.len() >= UUID_LEN
+            && [8, 13, 18, 23].iter().all(|&i| d.get(f + i) == Some(&b'-'))
+            && [0, 7, 9, 12, 14, 17, 19, 22, 24, 35]
+                .iter()
+                .all(|&i| d.get(f + i).is_some_and(u8::is_ascii_hexdigit))
         {
-            // Oxford Nanopore: a UUID.
+            // Oxford Nanopore: a UUID, alone or before more (htscodecs checks the ends of its
+            // five groups). The prefix is the first 36 bytes of the name, as in htscodecs, even
+            // where a leading `@` or `>` shifts the UUID by one.
             Self {
-                prefix_len: 37,
-                is_fixed: true,
+                prefix_len: UUID_LEN,
+                prefix: Prefix::Chars,
             }
         } else {
             // Illumina: the prefix before the lane, tile and coordinates.
@@ -485,11 +516,11 @@ impl Format {
             match fourth_last_colon {
                 Some(i) => Self {
                     prefix_len: i + 1,
-                    is_fixed: true,
+                    prefix: Prefix::String,
                 },
                 None => Self {
                     prefix_len: usize::MAX,
-                    is_fixed: false,
+                    prefix: Prefix::Split,
                 },
             }
         }
@@ -700,66 +731,152 @@ mod tests {
     /// the same tokens, and the same ways of coding their streams.
     #[test]
     fn test_encode_matches_htscodecs() -> std::io::Result<()> {
-        let src = include_bytes!("../fixtures/names-formats.bin");
+        let formats = &include_bytes!("../fixtures/names-formats.bin")[..];
+        let uuids = &include_bytes!("../fixtures/names-uuid.bin")[..];
 
-        for (level, expected) in [
+        for (names, src, level, expected) in [
             (
+                "formats",
+                formats,
                 1,
                 &include_bytes!("../fixtures/tok3-rans-formats-1.bin")[..],
             ),
             (
+                "formats",
+                formats,
                 3,
                 &include_bytes!("../fixtures/tok3-rans-formats-3.bin")[..],
             ),
+            (
+                "uuid",
+                uuids,
+                1,
+                &include_bytes!("../fixtures/tok3-rans-uuid-1.bin")[..],
+            ),
+            (
+                "uuid",
+                uuids,
+                3,
+                &include_bytes!("../fixtures/tok3-rans-uuid-3.bin")[..],
+            ),
         ] {
-            assert_eq!(super::encode(src, level)?, expected, "level {level}");
+            let actual = super::encode(src, level)?;
+            assert_eq!(actual, expected, "{names} names, level {level}");
+            assert_eq!(
+                super::super::decode(&actual)?,
+                src,
+                "{names} names, level {level}"
+            );
         }
+
+        Ok(())
+    }
+
+    /// A UUID is a character per byte, however the names before it were tokenized: as bare
+    /// UUIDs once were, a number or a string wherever its digits happened to allow.
+    #[test]
+    fn test_uuid_names_take_four_bits_a_digit() -> std::io::Result<()> {
+        let mut src = Vec::new();
+        let mut x = 0x9e37_79b9_u32;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+
+        const NAMES: usize = 4000;
+
+        for _ in 0..NAMES {
+            let name = format!(
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:08x}{:04x}",
+                next(),
+                next() as u16,
+                next() as u16,
+                next() as u16,
+                next(),
+                next() as u16
+            );
+
+            src.extend_from_slice(name.as_bytes());
+            src.push(0);
+        }
+
+        let encoded = super::encode(&src, 3)?;
+        assert_eq!(super::super::decode(&encoded)?, src);
+
+        // 32 random hexadecimal digits are 16 bytes; the rest is tables.
+        assert!(encoded.len() < NAMES * 16 + 4000, "{} bytes", encoded.len());
 
         Ok(())
     }
 
     #[test]
     fn test_format_guess() {
-        use super::Format;
+        use super::{Format, Prefix};
 
-        let fixed = |prefix_len| Format {
+        let string = |prefix_len| Format {
             prefix_len,
-            is_fixed: true,
+            prefix: Prefix::String,
+        };
+
+        let split = |prefix_len| Format {
+            prefix_len,
+            prefix: Prefix::Split,
+        };
+
+        let uuid = Format {
+            prefix_len: 36,
+            prefix: Prefix::Chars,
         };
 
         assert_eq!(
             Format::guess(b"A00744:46:HV3C3DSXX:2:1131:20076:26021"),
-            fixed(20)
+            string(20)
         );
-        assert_eq!(Format::guess(b"A:1:2:3:4"), fixed(2));
-        assert_eq!(Format::guess(b"ZEN10:00027:00321"), fixed(6));
+        assert_eq!(Format::guess(b"A:1:2:3:4"), string(2));
+        assert_eq!(Format::guess(b"ZEN10:00027:00321"), string(6));
+
+        assert_eq!(Format::guess(b"f33d30d5-6eb8-4115-8f46-154c2620a5da"), uuid);
         assert_eq!(
             Format::guess(b"f33d30d5-6eb8-4115-8f46-154c2620a5da_Basecall_1D_template"),
-            fixed(37)
+            uuid
+        );
+        assert_eq!(Format::guess(b"F33D30D5-6EB8-4115-8F46-154C2620A5DA"), uuid);
+        assert_eq!(
+            Format::guess(b"@f33d30d5-6eb8-4115-8f46-154c2620a5da"),
+            uuid
         );
         assert_eq!(
+            Format::guess(b">f33d30d5-6eb8-4115-8f46-154c2620a5da"),
+            uuid
+        );
+
+        // One byte short, and a letter where htscodecs looks for a digit.
+        assert_eq!(
+            Format::guess(b"f33d30d5-6eb8-4115-8f46-154c2620a5d"),
+            split(usize::MAX)
+        );
+        assert_eq!(
+            Format::guess(b"f33d30dg-6eb8-4115-8f46-154c2620a5da"),
+            split(usize::MAX)
+        );
+        assert_eq!(
+            Format::guess(b">f33d30d5-6eb8-4115-8f46-154c2620a5d"),
+            split(usize::MAX)
+        );
+
+        assert_eq!(
             Format::guess(b"m64011_190830_220126/1/ccs"),
-            Format {
-                prefix_len: usize::MAX,
-                is_fixed: false
-            }
+            split(usize::MAX)
         );
         assert_eq!(
             Format::guess(
                 b"m140415_143853_42175_c100635972550000001823121909121417_s1_p0/553/3100_11230"
             ),
-            Format {
-                prefix_len: 60,
-                is_fixed: false
-            }
+            split(60)
         );
-        assert_eq!(
-            Format::guess(b""),
-            Format {
-                prefix_len: usize::MAX,
-                is_fixed: false
-            }
-        );
+        assert_eq!(Format::guess(b""), split(usize::MAX));
     }
 
     #[test]
