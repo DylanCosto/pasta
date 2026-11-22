@@ -55,10 +55,15 @@ pub struct Cell {
     pub touched: bool,
 }
 
-/// Reference skips (`N`) at least this long are kept as ranges rather than per-position cells,
-/// and the rest of the read is counted when the window reaches it, so a long intron does not
-/// grow the window.
-const LONG_SKIP: usize = 1 << 16;
+/// Gaps (deletions and reference skips) at least this long are kept as ranges rather than
+/// per-position cells, and the rest of the read is counted when the window reaches it, so a
+/// long intron or deletion does not grow the window.
+const LONG_GAP: usize = 1 << 16;
+
+/// The reference span a read (or the part of one after a gap kept as a range) may have in
+/// per-position cells before its next gap, however short, is kept as a range too. The cells of
+/// a read are then about as many as its bases, whatever its CIGAR says of the reference.
+const MAX_DENSE_SPAN: usize = 1 << 22;
 
 /// The most positions a reader thread of `depth` or `coverage` sends per message.
 const MAX_BATCH_LEN: usize = 1 << 16;
@@ -74,7 +79,25 @@ pub fn batch_len(inputs: usize) -> usize {
     (4 * MAX_BATCH_LEN / inputs.max(1)).clamp(MIN_BATCH_LEN, MAX_BATCH_LEN)
 }
 
-/// The part of a read after a long reference skip, counted once the window reaches its start.
+/// A gap kept as a range, which adds to the cells it covers.
+#[derive(Clone, Copy, Debug)]
+struct LongGap {
+    /// 1-based, and half-open with `end`.
+    start: usize,
+    end: usize,
+    /// Whether it counts in [`Cell::gaps`]: not where a counted deletion overlaps the mate.
+    is_gap: bool,
+    /// Whether it counts in [`Cell::depth`].
+    is_counted: bool,
+}
+
+impl LongGap {
+    fn contains(&self, position: usize) -> bool {
+        (self.start..self.end).contains(&position)
+    }
+}
+
+/// The part of a read after a gap kept as a range, counted once the window reaches its start.
 #[derive(Debug)]
 struct Segment {
     /// 1-based reference position of its first operation.
@@ -89,17 +112,19 @@ struct Segment {
 ///
 /// Records must arrive sorted by reference sequence and start, so positions before a record's
 /// start are final and can be emitted.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DepthWindow {
     reference_sequence_id: Option<usize>,
     /// 1-based position of `cells[0]`.
     start: usize,
     cells: VecDeque<Cell>,
-    /// Long reference skips as 1-based half-open ranges, which add to the cells they cover.
-    skips: Vec<(usize, usize)>,
-    /// Read parts after long skips, not yet counted.
+    /// The gaps kept as ranges.
+    long_gaps: Vec<LongGap>,
+    /// Read parts after those gaps, not yet counted.
     segments: Vec<Segment>,
     options: CountOptions,
+    /// [`MAX_DENSE_SPAN`], or less in tests.
+    max_dense_span: usize,
     /// Reused per record: the CIGAR, BAM-encoded (length << 4 | operation).
     ops: Vec<u32>,
     quality_scores: Vec<u8>,
@@ -107,6 +132,24 @@ pub struct DepthWindow {
     /// HTSlib's pileup reference sequence and 0-based position, as far as adding reads goes:
     /// the last added read's.
     pileup: (usize, usize),
+}
+
+impl Default for DepthWindow {
+    fn default() -> Self {
+        Self {
+            reference_sequence_id: None,
+            start: 0,
+            cells: VecDeque::new(),
+            long_gaps: Vec::new(),
+            segments: Vec::new(),
+            options: CountOptions::default(),
+            max_dense_span: MAX_DENSE_SPAN,
+            ops: Vec::new(),
+            quality_scores: Vec::new(),
+            cap: None,
+            pileup: (0, 0),
+        }
+    }
 }
 
 impl DepthWindow {
@@ -181,7 +224,11 @@ impl DepthWindow {
 
         let needs_quality = self.load_record(record, raw.as_ref())?;
 
-        let reach = Reach::of(&self.ops);
+        let reach = Reach::of(&self.ops, self.max_dense_span);
+
+        if !self.ops.is_empty() {
+            check_query_length(reach.query_len, record, raw.as_ref())?;
+        }
         let span = reach.span;
 
         if let Some(cap) = &mut self.cap
@@ -260,7 +307,7 @@ impl DepthWindow {
     }
 
     /// Counts the bases of `ops` (BAM-encoded CIGAR operations), which start at the 1-based
-    /// `start`, up to the first long reference skip; the rest of the read becomes a [`Segment`].
+    /// `start`, up to the first gap kept as a range; the rest of the read becomes a [`Segment`].
     fn count(
         &mut self,
         start: usize,
@@ -277,11 +324,12 @@ impl DepthWindow {
             ..
         } = self.options;
 
-        // Operations from the first long skip on are set aside after the others are counted.
-        let (ops, deferred) = ops.split_at(reach.long_skip);
+        // Operations from the first gap kept as a range on are set aside after the others are
+        // counted.
+        let (ops, deferred) = ops.split_at(reach.long_gap);
         let span = reach.near_span;
 
-        // Size the window once for the reference span up to the first long skip (at least one
+        // Size the window once for the reference span up to that gap (at least one
         // position, as `bam_endpos` gives a read without reference bases).
         let needed = start + span.max(1) - self.start;
         if needed > self.cells.len() {
@@ -390,10 +438,10 @@ impl DepthWindow {
             }
         }
 
-        if let Some((&skip, rest)) = deferred.split_first() {
+        if let Some((&gap, rest)) = deferred.split_first() {
             self.defer(
                 reference_position,
-                (skip >> 4) as usize,
+                gap,
                 rest,
                 quality_scores,
                 read_position,
@@ -403,8 +451,8 @@ impl DepthWindow {
         }
     }
 
-    /// Keeps a long reference skip at `start` as a range, and the operations after it as a
-    /// [`Segment`] (with the qualities from `read_position` on).
+    /// Keeps the gap `gap` (a BAM-encoded deletion or reference skip) at `start` as a range, and
+    /// the operations after it as a [`Segment`] (with the qualities from `read_position` on).
     #[expect(
         clippy::too_many_arguments,
         reason = "the state of a record being counted"
@@ -413,15 +461,56 @@ impl DepthWindow {
     fn defer(
         &mut self,
         start: usize,
-        len: usize,
+        gap: u32,
         rest: &[u32],
         quality_scores: &[u8],
         read_position: usize,
         needs_quality: bool,
         clip: usize,
     ) {
+        let len = (gap >> 4) as usize;
         let end = start + len;
-        self.skips.push((start, end));
+
+        if gap & 0xf == CIGAR_SKIP {
+            self.long_gaps.push(LongGap {
+                start,
+                end,
+                is_gap: true,
+                is_counted: self.options.include_skips,
+            });
+        } else if self.options.include_deletions {
+            // As in `count`: the deletion takes the quality of the base after it, and where it
+            // overlaps the mate it is reported but not counted.
+            let passes = !needs_quality
+                || quality_scores
+                    .get(read_position)
+                    .is_none_or(|&q| q == 0xff || q >= self.options.min_base_quality);
+
+            let clipped = clip.saturating_sub(start).min(len);
+
+            let parts = [
+                (start, start + clipped, false, false),
+                (start + clipped, end, true, passes),
+            ];
+
+            for (start, end, is_gap, is_counted) in parts {
+                if start < end {
+                    self.long_gaps.push(LongGap {
+                        start,
+                        end,
+                        is_gap,
+                        is_counted,
+                    });
+                }
+            }
+        } else {
+            self.long_gaps.push(LongGap {
+                start,
+                end,
+                is_gap: true,
+                is_counted: false,
+            });
+        }
 
         if !rest.is_empty() {
             self.segments.push(Segment {
@@ -448,7 +537,7 @@ impl DepthWindow {
             self.count(
                 segment.start,
                 &segment.ops,
-                Reach::of(&segment.ops),
+                Reach::of(&segment.ops, self.max_dense_span),
                 &segment.quality_scores,
                 segment.needs_quality,
                 segment.clip,
@@ -456,25 +545,23 @@ impl DepthWindow {
         }
     }
 
-    /// Adds the long reference skips that cover `position` to its cell.
-    fn add_skips(&self, position: usize, cell: &mut Cell) {
-        for &(start, end) in &self.skips {
-            if (start..end).contains(&position) {
+    /// Adds the gaps kept as ranges that cover `position` to its cell.
+    fn add_long_gaps(&self, position: usize, cell: &mut Cell) {
+        for gap in &self.long_gaps {
+            if gap.contains(position) {
                 cell.touched = true;
-                cell.gaps += 1;
-
-                if self.options.include_skips {
-                    cell.depth += 1;
-                }
+                cell.gaps += u32::from(gap.is_gap);
+                cell.depth += u32::from(gap.is_counted);
             }
         }
     }
 
-    /// The next position after the window's first where a long skip or a read part starts.
+    /// The next position after the window's first where a gap kept as a range or a read part
+    /// starts.
     fn next_event(&self) -> Option<usize> {
-        let skips = self.skips.iter().map(|&(start, _)| start);
+        let gaps = self.long_gaps.iter().map(|gap| gap.start);
         let segments = self.segments.iter().map(|segment| segment.start);
-        skips.chain(segments).filter(|&p| p > self.start).min()
+        gaps.chain(segments).filter(|&p| p > self.start).min()
     }
 
     fn flush_before<F>(&mut self, position: usize, emit: &mut F) -> io::Result<()>
@@ -485,8 +572,8 @@ impl DepthWindow {
             return Ok(());
         };
 
-        // Without long skips (almost always), cells are emitted directly.
-        if self.skips.is_empty() && self.segments.is_empty() {
+        // Without gaps kept as ranges (almost always), cells are emitted directly.
+        if self.long_gaps.is_empty() && self.segments.is_empty() {
             while self.start < position {
                 match self.cells.pop_front() {
                     Some(cell) => {
@@ -505,14 +592,19 @@ impl DepthWindow {
             return Ok(());
         }
 
-        self.flush_with_skips(id, position, emit)
+        self.flush_with_long_gaps(id, position, emit)
     }
 
-    /// [`Self::flush_before`] while long skips or read parts after them are pending: kept apart so
-    /// that the usual loop stays small enough to inline `emit`.
+    /// [`Self::flush_before`] while gaps kept as ranges or read parts after them are pending:
+    /// kept apart so that the usual loop stays small enough to inline `emit`.
     #[cold]
     #[inline(never)]
-    fn flush_with_skips<F>(&mut self, id: usize, position: usize, emit: &mut F) -> io::Result<()>
+    fn flush_with_long_gaps<F>(
+        &mut self,
+        id: usize,
+        position: usize,
+        emit: &mut F,
+    ) -> io::Result<()>
     where
         F: FnMut(usize, usize, Cell) -> io::Result<()>,
     {
@@ -523,25 +615,21 @@ impl DepthWindow {
 
             let cell = match self.cells.pop_front() {
                 Some(cell) => Some(cell),
-                // Only long skips cover this position, if anything.
-                None if self
-                    .skips
-                    .iter()
-                    .any(|&(s, e)| (s..e).contains(&self.start)) =>
-                {
+                // Only gaps kept as ranges cover this position, if anything.
+                None if self.long_gaps.iter().any(|gap| gap.contains(self.start)) => {
                     Some(Cell::default())
                 }
                 None => None,
             };
 
             let Some(mut cell) = cell else {
-                // Nothing until the next skip or read part (or ever).
+                // Nothing until the next gap or read part (or ever).
                 self.start = self.next_event().map_or(position, |p| p.min(position));
                 continue;
             };
 
-            if !self.skips.is_empty() {
-                self.add_skips(self.start, &mut cell);
+            if !self.long_gaps.is_empty() {
+                self.add_long_gaps(self.start, &mut cell);
             }
 
             if cell.touched {
@@ -550,9 +638,9 @@ impl DepthWindow {
 
             self.start += 1;
 
-            if !self.skips.is_empty() {
+            if !self.long_gaps.is_empty() {
                 let start = self.start;
-                self.skips.retain(|&(_, end)| end > start);
+                self.long_gaps.retain(|gap| gap.end > start);
             }
         }
 
@@ -719,45 +807,110 @@ fn kind_code(kind: Kind) -> u32 {
     }
 }
 
-/// Whether a BAM CIGAR operation code consumes the reference.
 /// How far a read's operations reach on the reference.
 #[derive(Clone, Copy, Debug)]
 struct Reach {
     /// The reference span of all operations.
     span: usize,
-    /// The index of the first long reference skip, or the number of operations.
-    long_skip: usize,
-    /// The reference span of the operations before `long_skip`.
+    /// The index of the first gap kept as a range, or the number of operations.
+    long_gap: usize,
+    /// The reference span of the operations before `long_gap`.
     near_span: usize,
+    /// The bases of the read that all operations take (HTSlib's `bam_cigar2qlen`).
+    query_len: u64,
 }
 
 impl Reach {
-    fn of(ops: &[u32]) -> Self {
+    /// A gap is kept as a range if it is long, or if the span would pass `max_dense_span` with
+    /// it.
+    fn of(ops: &[u32], max_dense_span: usize) -> Self {
         let mut span = 0;
-        let mut long_skip = None;
+        let mut long_gap = None;
+        let mut query_len = 0;
 
         for (i, &op) in ops.iter().enumerate() {
             let (code, len) = (op & 0xf, (op >> 4) as usize);
 
+            if consumes_query(code) {
+                query_len += u64::from(op >> 4);
+            }
+
             if consumes_reference(code) {
-                if code == CIGAR_SKIP && len >= LONG_SKIP && long_skip.is_none() {
-                    long_skip = Some((i, span));
+                if matches!(code, CIGAR_DELETION | CIGAR_SKIP)
+                    && long_gap.is_none()
+                    && (len >= LONG_GAP || span + len > max_dense_span)
+                {
+                    long_gap = Some((i, span));
                 }
 
                 span += len;
             }
         }
 
-        let (long_skip, near_span) = long_skip.unwrap_or((ops.len(), span));
+        let (long_gap, near_span) = long_gap.unwrap_or((ops.len(), span));
 
         Self {
             span,
-            long_skip,
+            long_gap,
             near_span,
+            query_len,
         }
     }
 }
 
+/// Fails if a record's CIGAR, which takes `query_len` bases, and its sequence differ in length,
+/// as HTSlib's `bam_read1` does for a mapped record that has both. `raw` is the record's raw
+/// view if it is BAM.
+fn check_query_length(
+    query_len: u64,
+    record: &Rec<'_>,
+    raw: Option<&Record<'_>>,
+) -> io::Result<()> {
+    let r = record.as_dyn();
+
+    let sequence_len = match raw {
+        Some(raw) => raw.sequence_len(),
+        None => r.sequence().len(),
+    };
+
+    // A read without its sequence has none to compare.
+    if query_len == sequence_len as u64 || sequence_len == 0 {
+        return Ok(());
+    }
+
+    let is_unmapped = match raw {
+        Some(raw) => Flags::from(raw.flags()).is_unmapped(),
+        None => r.flags()?.is_unmapped(),
+    };
+
+    if is_unmapped {
+        return Ok(());
+    }
+
+    let name = match raw {
+        Some(raw) => String::from_utf8_lossy(raw.name()).into_owned(),
+        None => r.name().map(|name| name.to_string()).unwrap_or_default(),
+    };
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("CIGAR and query sequence lengths differ for {name}"),
+    ))
+}
+
+/// Whether a BAM CIGAR operation code consumes the read.
+fn consumes_query(code: u32) -> bool {
+    matches!(
+        code,
+        CIGAR_MATCH
+            | CIGAR_INSERTION
+            | CIGAR_SOFT_CLIP
+            | CIGAR_SEQUENCE_MATCH
+            | CIGAR_SEQUENCE_MISMATCH
+    )
+}
+
+/// Whether a BAM CIGAR operation code consumes the reference.
 fn consumes_reference(code: u32) -> bool {
     matches!(
         code,
@@ -812,7 +965,218 @@ fn trim_fraction(s: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZero;
+
+    use pasta::{
+        core::Position,
+        sam::{
+            alignment::{RecordBuf, record::cigar::Op},
+            header::record::value::{Map, map::ReferenceSequence},
+        },
+    };
+
     use super::*;
+
+    fn header() -> sam::Header {
+        sam::Header::builder()
+            .add_reference_sequence(
+                "c",
+                Map::<ReferenceSequence>::new(NonZero::new(1 << 28).unwrap()),
+            )
+            .build()
+    }
+
+    /// A read at `start` whose bases, as many as `cigar` says, have quality `quality`.
+    fn record(start: usize, cigar: &[(Kind, usize)], quality: u8) -> RecordBuf {
+        let ops: Vec<_> = cigar
+            .iter()
+            .map(|&(kind, len)| Op::new(kind, len))
+            .collect();
+        let len = query_length(&ops);
+
+        RecordBuf::builder()
+            .set_name("r")
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::new(start).unwrap())
+            .set_cigar(ops.into_iter().collect())
+            .set_sequence(vec![b'A'; len].into())
+            .set_quality_scores(vec![quality; len].into())
+            .build()
+    }
+
+    /// The cells a window emits for `records`, each with the position its mate overlap ends at.
+    fn cells(
+        options: CountOptions,
+        max_dense_span: usize,
+        records: &[(RecordBuf, usize)],
+    ) -> io::Result<Vec<(usize, Cell)>> {
+        let header = header();
+        let mut window = DepthWindow::new(options);
+        window.max_dense_span = max_dense_span;
+
+        let mut cells = Vec::new();
+        let mut emit = |_, position, cell| {
+            cells.push((position, cell));
+            Ok(())
+        };
+
+        for (record, clip) in records {
+            window.add_clipped(&Rec::Buf(record), &header, *clip, &mut emit)?;
+        }
+
+        window.finish(&mut emit)?;
+
+        Ok(cells)
+    }
+
+    /// Every way the options count a deletion.
+    fn all_options() -> Vec<CountOptions> {
+        let mut options = Vec::new();
+
+        for include_deletions in [false, true] {
+            for min_base_quality in [0, 20, 40] {
+                for track_quality in [false, true] {
+                    options.push(CountOptions {
+                        min_base_quality,
+                        include_deletions,
+                        track_quality,
+                        include_skips: include_deletions,
+                    });
+                }
+            }
+        }
+
+        options
+    }
+
+    #[test]
+    fn test_add_counts_a_long_deletion_as_shorter_ones() -> io::Result<()> {
+        use Kind::{Deletion, Insertion, Match, Skip, SoftClip};
+
+        // The same alignments with a deletion of 70,000 whole, kept as a range, and in two
+        // halves, counted in cells; with reads before, within, across and after it, one of
+        // quality below the thresholds, and a mate overlap that ends within it.
+        let reads = |deletion: &[(Kind, usize)]| {
+            let mut long = vec![(SoftClip, 3), (Match, 10)];
+            long.extend_from_slice(deletion);
+            long.extend([
+                (Match, 5),
+                (Insertion, 2),
+                (Match, 5),
+                (Skip, 4),
+                (Match, 3),
+            ]);
+
+            let mut poor = vec![(Match, 8)];
+            poor.extend_from_slice(deletion);
+            poor.push((Match, 8));
+
+            [
+                (record(90, &[(Match, 20)], 30), 0),
+                (record(100, &long, 30), 0),
+                (record(102, &poor, 10), 0),
+                (record(105, &long, 30), 40_000),
+                (record(30_000, &[(Match, 50)], 30), 0),
+                (record(70_100, &[(Match, 30)], 30), 0),
+                (record(140_500, &[(Match, 30)], 30), 0),
+            ]
+        };
+
+        let whole = reads(&[(Deletion, 70_000)]);
+        let halves = reads(&[(Deletion, 35_000), (Deletion, 35_000)]);
+
+        for options in all_options() {
+            let actual = cells(options, MAX_DENSE_SPAN, &whole)?;
+            let expected = cells(options, MAX_DENSE_SPAN, &halves)?;
+
+            // Positions 90 to 70,131, and 140,500 to 140,529.
+            assert_eq!(actual.len(), 70_042 + 30, "{options:?}");
+            assert!(actual == expected, "{options:?}");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_with_a_dense_span_limit() -> io::Result<()> {
+        use Kind::{Deletion, Insertion, Match, Skip};
+
+        // Reads of many gaps: with a limit below their spans, gaps become ranges wherever the
+        // span would pass it, and the cells are those of a window without a limit.
+        let gapped: Vec<_> = (0..40)
+            .flat_map(|i| {
+                [
+                    (Match, 3 + i % 4),
+                    (if i % 3 == 0 { Skip } else { Deletion }, 5 + i % 7),
+                    (Insertion, i % 2),
+                ]
+            })
+            .filter(|&(_, len)| len > 0)
+            .chain([(Match, 6)])
+            .collect();
+
+        let reads = [
+            (record(10, &[(Match, 40)], 30), 0),
+            (record(20, &gapped, 30), 0),
+            (record(25, &gapped, 10), 0),
+            (record(31, &gapped, 30), 200),
+            (record(300, &[(Match, 100)], 30), 0),
+            (record(700, &gapped, 30), 0),
+        ];
+
+        for options in all_options() {
+            let expected = cells(options, usize::MAX, &reads)?;
+
+            for max_dense_span in [1, 7, 50, 300] {
+                let actual = cells(options, max_dense_span, &reads)?;
+                assert!(actual == expected, "{options:?}, {max_dense_span}");
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_rejects_cigar_and_sequence_lengths_that_differ() -> io::Result<()> {
+        let options = CountOptions::default();
+
+        // A CIGAR of 300 bases and a sequence of 4, as a corrupt record has.
+        let mut corrupt = record(10, &[(Kind::Match, 4)], 30);
+        *corrupt.cigar_mut() = [Op::new(Kind::Match, 300)].into_iter().collect();
+
+        let Err(error) = cells(options, MAX_DENSE_SPAN, &[(corrupt.clone(), 0)]) else {
+            panic!("the record was counted");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "CIGAR and query sequence lengths differ for r"
+        );
+
+        // A CIGAR that takes no bases differs from a sequence too.
+        let mut deletion = record(10, &[(Kind::Match, 4)], 30);
+        *deletion.cigar_mut() = [Op::new(Kind::Deletion, 5)].into_iter().collect();
+        assert!(cells(options, MAX_DENSE_SPAN, &[(deletion, 0)]).is_err());
+
+        // A read without a CIGAR has none to compare.
+        let mut bare = record(10, &[(Kind::Match, 4)], 30);
+        *bare.cigar_mut() = Default::default();
+        assert!(cells(options, MAX_DENSE_SPAN, &[(bare, 0)]).is_ok());
+
+        // HTSlib does not compare the lengths of an unmapped read.
+        *corrupt.flags_mut() = Flags::UNMAPPED;
+        assert_eq!(cells(options, MAX_DENSE_SPAN, &[(corrupt, 0)])?.len(), 300);
+
+        // A read without its sequence has none to compare.
+        let mut bare = record(10, &[(Kind::Match, 4)], 30);
+        *bare.sequence_mut() = Vec::new().into();
+        *bare.quality_scores_mut() = Vec::new().into();
+
+        assert_eq!(cells(options, MAX_DENSE_SPAN, &[(bare, 0)])?.len(), 4);
+
+        Ok(())
+    }
 
     #[test]
     fn test_pileup_cap() {

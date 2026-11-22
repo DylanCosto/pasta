@@ -66,6 +66,16 @@ Notable changes to pasta, ntools, and vtools. The format is based on
 
 ### Fixed
 
+- ntools: `depth`, `coverage` and `bedcov` fail with "CIGAR and query sequence lengths differ"
+  on a mapped read whose CIGAR and sequence differ in length, as samtools does, where they
+  counted it. A corrupt CIGAR of 134 Mb on one read took 3.1 GB of memory and was reported past
+  the end of its reference sequence.
+- ntools: `depth`, `coverage` and `bedcov` keep a long deletion as a range, as they did a long
+  reference skip, and no more than 4 Mb of a read's span in per-position cells before its next
+  gap, so the memory a read takes follows its bases and not what its CIGAR spans. A read with
+  a deletion of 200 Mb takes 20 MB in `depth` where, at 24 bytes a position, it needed 4.8 GB
+  (samtools 1.24: 785 MB), and one with 2,000 deletions of 60 kb 117 MB where it needed 2.9 GB
+  (samtools: 472 MB). The output is unchanged.
 - pasta: fqzcomp and the adaptive arithmetic coder fail with `InvalidData` on a corrupt
   payload (a symbol past a model's frequencies, a duplicate record with none before it or
   running past the block, or a parameter set the block does not have), instead of panicking.

@@ -277,6 +277,80 @@ fn test_depth_reports_positions_past_the_reference_end() -> io::Result<()> {
     Ok(())
 }
 
+/// `depth`, `coverage` and `bedcov` fail on a mapped read whose CIGAR and sequence differ in
+/// length, as samtools does when it reads one. Such a CIGAR can span any length of the
+/// reference: a corrupt one of 134 Mb took 3 GB of memory, and was reported past `@SQ LN`.
+#[test]
+fn test_depth_coverage_and_bedcov_reject_cigar_and_sequence_lengths_that_differ() -> io::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let dir = dir.path();
+
+    let header = "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:c\tLN:1000\n";
+    let sam = |cigar: &str| {
+        format!(
+            "{header}r1\t0\tc\t10\t30\t4M\t*\t0\t0\tACGT\tIIII\n\
+             r2\t0\tc\t20\t30\t{cigar}\t*\t0\t0\tACGT\tIIII\n"
+        )
+    };
+
+    // A CIGAR of 300 bases and a sequence of 4.
+    fs::write(dir.join("bad.sam"), sam("300M"))?;
+
+    // The same in BAM, which is not written with such a record: r2's `4M` is changed in the
+    // uncompressed bytes.
+    fs::write(dir.join("in.sam"), sam("4M"))?;
+    ntools(dir, &["view", "-b", "-o", "in.bam", "in.sam"])?;
+
+    let output = run(dir, &["bgzip", "-d", "-c", "in.bam"])?;
+    assert!(output.status.success());
+
+    let mut bam = output.stdout;
+    let name_end = bam
+        .windows(3)
+        .position(|name| name == b"r2\0")
+        .map(|i| i + 3)
+        .expect("r2 is in the BAM");
+    assert_eq!(bam[name_end..name_end + 4], (4u32 << 4).to_le_bytes());
+    bam[name_end..name_end + 4].copy_from_slice(&(300u32 << 4).to_le_bytes());
+
+    fs::write(dir.join("bad.raw"), bam)?;
+    let output = run(dir, &["bgzip", "-c", "bad.raw"])?;
+    assert!(output.status.success());
+    fs::write(dir.join("bad.bam"), output.stdout)?;
+    ntools(dir, &["index", "bad.bam"])?;
+
+    fs::write(dir.join("a.bed"), "c\t0\t500\n")?;
+
+    let commands: &[&[&str]] = &[
+        &["depth", "bad.sam"],
+        &["depth", "bad.bam"],
+        &["coverage", "bad.sam"],
+        &["coverage", "bad.bam"],
+        &["bedcov", "a.bed", "bad.bam"],
+    ];
+
+    for args in commands {
+        let output = run(dir, args)?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            stderr.contains("CIGAR and query sequence lengths differ for r2"),
+            "{args:?}: {stderr}"
+        );
+    }
+
+    // A read without its sequence has none to compare.
+    fs::write(
+        dir.join("bare.sam"),
+        format!("{header}r1\t0\tc\t10\t30\t300M\t*\t0\t0\t*\t*\n"),
+    )?;
+    assert_eq!(ntools(dir, &["depth", "bare.sam"])?.lines().count(), 300);
+
+    Ok(())
+}
+
 /// `collate` writes READ1 before READ2 within a template, as samtools does. `collate -f`
 /// keeps every primary record; samtools also drops those without exactly one of READ1 and READ2,
 /// such as single-end reads, which its usage does not say (README).
