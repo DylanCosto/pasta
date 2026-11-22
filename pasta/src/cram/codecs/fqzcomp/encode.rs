@@ -198,7 +198,9 @@ pub(super) fn encode_with(strategy: Strategy, lens: &[usize], src: &[u8]) -> io:
 
         for (&score, pos) in scores.iter().zip((1..=len).rev()) {
             let q = parameters.q_map[usize::from(score)];
-            models.qual[ctx as usize].encode(&mut dst, &mut range_coder, q)?;
+            models
+                .qual
+                .encode(ctx as usize, &mut dst, &mut range_coder, q)?;
 
             // The qualities table is the identity: htscodecs never writes another.
             q_ctx = (q_ctx << parameters.q_shift).wrapping_add(u32::from(q));

@@ -26,11 +26,13 @@ impl RangeCoder {
         })
     }
 
+    #[inline]
     pub fn range_get_freq(&mut self, tot_freq: u32) -> u32 {
         self.range /= tot_freq;
         self.code / self.range
     }
 
+    #[inline]
     pub fn range_decode(&mut self, src: &mut &[u8], sym_low: u32, sym_freq: u32) -> io::Result<()> {
         self.code -= sym_low * self.range;
         self.range *= sym_freq;

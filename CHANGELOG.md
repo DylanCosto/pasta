@@ -51,9 +51,17 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   and reads are split by average quality where that is estimated to help. In 1 MB blocks, 33 MB
   of Illumina scores take 1,783 kB where they took 1,953 kB and 32 MB of HiFi scores 3,323 kB
   where they took 3,558 kB; ONT scores take what they did.
+- pasta: fqzcomp is faster, with the same output: its 65,536 quality models are one table
+  where each was two allocations, and the decoder's contexts come from tables made once per
+  block. On one core of an Intel Core i5-12600K, 1 MB blocks of HiFi quality scores decode at
+  106 MB/s where they took 59 and encode at 106 where they took 86; ONT scores decode at 52
+  where they took 36 and encode at 50 where they took 40.
 
 ### Fixed
 
+- pasta: fqzcomp and the adaptive arithmetic coder fail with `InvalidData` on a corrupt
+  payload (a symbol past a model's frequencies, a duplicate record with none before it or
+  running past the block, or a parameter set the block does not have), instead of panicking.
 - pasta: a BAI, CSI, or tabix index with a bin ID past the last bin of its depth (other than the
   metadata pseudo-bin) fails to load with `InvalidData` ("invalid bin ID"), instead of loading
   and then panicking on the first query of that reference sequence.
