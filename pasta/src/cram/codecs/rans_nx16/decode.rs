@@ -1,3 +1,5 @@
+#[cfg(target_arch = "x86_64")]
+mod avx2;
 pub mod bit_pack;
 mod order_0;
 mod order_1;

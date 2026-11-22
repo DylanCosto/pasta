@@ -33,6 +33,13 @@ Notable changes to pasta, ntools, and vtools. The format is based on
   sharing its longest prefix that ends in punctuation or whitespace. The 62,714 names of an ONT
   run take 958 kB where they took 1,398 kB, and encode twice as fast; 220,000 Illumina names
   are coded as before.
+- pasta: CRAM's rANS codecs are faster, with the same output. Timed on one core of an Intel
+  Core i5-12600K, on 1 MB blocks of ONT, HiFi and Illumina quality scores and ONT `ML` values:
+  - rANS Nx16 with 32 states, order 0, decodes at about 1,300 MB/s where it took about 690, on
+    CPUs with AVX2 (as order 1 already did).
+  - rANS 4x8 order 0 decodes 1.04 to 1.8 times as fast, from a table with a step per slot.
+  - rANS 4x8 encodes 1.1 to 2 times as fast at both orders: a state's first byte is written
+    without a branch.
 
 ### Fixed
 
